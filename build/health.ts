@@ -73,6 +73,7 @@ export function createHealthService(directory:string,options:{addresses?:()=>str
       if(path==="/"&&req.method==="GET")return send(res,200,view(await read()));
       if(req.method!=="POST")throw new HealthError("Method not allowed.",405);const input=await body(req,10000);
       const result=await exclusive(async()=>{const s=await read();
+        if(path==="/open-companion"){await promisify(execFile)("/usr/bin/open",[join(process.cwd(),"companion/WorkspaceHealth.xcodeproj")]);return {opened:true};}
         if(path==="/enable"){
           const {address}=z.object({address:z.string()}).strict().parse(input);if(!addresses().includes(address))throw new HealthError("Choose this Mac’s current Wi-Fi address.");if(s.enabled)throw new HealthError("Disable the existing iPhone connection before setting it up again.",409);
           await generateCertificate(address);s.address=address;s.enabled=true;delete s.tokenHash;delete s.pairing;await start(s);await write(s);return view(s);
