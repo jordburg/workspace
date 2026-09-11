@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, writeFile, open, unlink } from "node:fs/promis
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Plugin } from "vite";
-import { emptyWorkspace, workspaceSchema, type Workspace } from "../lib/workspace";
+import { emptyWorkspace, workspaceSchema, type Workspace } from "../lib/workspace.ts";
 
 export function localWorkspace(): Plugin {
   const directory = process.env.WORKSPACE_DATA_DIR || join(homedir(), "Data", "personal-workspace");
@@ -37,8 +37,8 @@ export function localWorkspace(): Plugin {
             const tempPath = join(directory, `workspace.${process.pid}.tmp`);
             try {
               await mkdir(directory, { recursive: true, mode: 0o700 });
-              try { lock = await open(lockPath, "wx", 0o600); }
-              catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") { send(409, { error: "Another save is in progress. Please try again." }); return; } throw error; }
+              try { lock = await open(lockPath, "wx", 0o600); await lock.writeFile(String(process.pid)); }
+              catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") { send(409, { error: "The workspace is busy. Try again. If a save was interrupted and this continues, follow the recovery steps in the project README." }); return; } throw error; }
               const current = await read();
               if (next.revision !== current.revision) { send(409, { error: "Your workspace changed in another window. The latest version is loaded; your draft is still here. Save again to apply it." }); return; }
               next.revision = current.revision + 1;

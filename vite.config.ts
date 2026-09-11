@@ -1,4 +1,5 @@
 import vinext from "vinext";
+import { integrations } from "./build/integrations";
 import { localWorkspace } from "./build/local-workspace";
 import { defineConfig } from "vite";
 import hostingConfig from "./.openai/hosting.json";
@@ -59,7 +60,7 @@ export default defineConfig(async () => {
       ...(isCodexSeatbeltSandbox ? { watch: { useFsEvents: false, usePolling: true } } : {}),
     },
     plugins: [
-      ...(!managedLinux ? [localWorkspace()] : []),
+      ...(!managedLinux ? [localWorkspace(), integrations()] : []),
       vinext(),
       sites({ mockAuth: !managedLinux }),
       cloudflare({

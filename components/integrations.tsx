@@ -1,0 +1,103 @@
+"use client";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { CalendarDays, Check, ExternalLink, Link2, LoaderCircle, Plus, RefreshCw, Settings2, Trash2, X } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import { dateKey, dateFromKey } from "@/lib/workspace";
+import { emptySync, eventOnDay, PERSONAL_CALENDAR, type Provider, type SyncView, type RemoteTask, type RemoteEvent } from "@/lib/integrations/model";
+
+type Draft = { provider:Provider; item?:RemoteTask|RemoteEvent; day:string };
+type IntegrationContextType={view:SyncView;busy:boolean;error:string;date:string;setDate:(date:string)=>void;openSettings:()=>void;openEditor:(draft:Draft)=>void;refresh:()=>Promise<void>;perform:(path:string,body:unknown)=>Promise<unknown>};
+const IntegrationContext=createContext<IntegrationContextType|null>(null);
+export function useIntegrations(){const context=useContext(IntegrationContext);if(!context)throw new Error("Integration provider missing");return context;}
+const zone=()=>Intl.DateTimeFormat().resolvedOptions().timeZone;
+const message=(error:unknown)=>error instanceof Error?error.message:"The connection could not be updated.";
+const providerName=(provider:Provider)=>provider==="todoist"?"Todoist":"Google Calendar";
+
+export function IntegrationProvider({children}:{children:ReactNode}) {
+  const [view,setView]=useState<SyncView>(emptySync);
+  const [busy,setBusy]=useState(false);const busyRef=useRef(false);
+  const [error,setError]=useState("");const [date,setDate]=useState("");
+  const [settings,setSettings]=useState(false);const [draft,setDraft]=useState<Draft|null>(null);
+  const opener=useRef<HTMLElement|null>(null);
+  async function load(){const response=await fetch("/api/integrations",{cache:"no-store"});if(!response.ok)throw new Error("Connections could not be loaded. Your local plans are still available.");setView(await response.json() as SyncView);}
+  useEffect(()=>{void load().catch(err=>setError(message(err)));},[]);
+  const perform=useCallback(async(path:string,body:unknown)=>{
+    if(busyRef.current)throw new Error("Wait for the current sync to finish.");
+    busyRef.current=true;setBusy(true);setError("");
+    try{const response=await fetch(`/api/integrations${path}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const result=await response.json() as {error?:string}&SyncView;
+      if(!response.ok){if(response.status===409)await load().catch(()=>{});throw new Error(result.error||"The service could not apply this change.");}
+      if(result.todoist && result.google)setView(result);return result;
+    }catch(err){setError(message(err));throw err;}finally{busyRef.current=false;setBusy(false);}
+  },[]);
+  const refresh=useCallback(async()=>{if(!date || busyRef.current)return;try{await perform("/sync",{date,timeZone:zone()});}catch{}},[date,perform]);
+  const connected=view.todoist.connected||view.google.connected;
+  useEffect(()=>{if(!connected||!date)return;void refresh();const timer=setInterval(()=>{if(document.visibilityState==="visible")void refresh();},300000);return()=>clearInterval(timer);},[connected,date,refresh]);
+  useEffect(()=>{if(!settings)return;const timer=setInterval(()=>{if(!busyRef.current)void load().catch(()=>{});},5000);return()=>clearInterval(timer);},[settings]);
+  function captureFocus(){opener.current=document.activeElement instanceof HTMLElement?document.activeElement:null;}
+  const context={view,busy,error,date,setDate,refresh,perform,openSettings:()=>{captureFocus();setError("");setSettings(true);},openEditor:(next:Draft)=>{captureFocus();setError("");setDraft(next);}};
+  const restoreFocus=(event:Event)=>{event.preventDefault();if(opener.current?.isConnected)opener.current.focus();else document.getElementById("connection-settings")?.focus();};
+  return <IntegrationContext.Provider value={context}>{children}
+    <Dialog open={settings} onOpenChange={open=>{if(!busy){setSettings(open);setError("");}}}><DialogContent className="editor-dialog connection-dialog" onCloseAutoFocus={restoreFocus}><ConnectionSettings onClose={()=>setSettings(false)}/></DialogContent></Dialog>
+    <Dialog open={!!draft} onOpenChange={open=>{if(!open&&!busy){setDraft(null);setError("");}}}><DialogContent className="editor-dialog" onCloseAutoFocus={restoreFocus} onInteractOutside={event=>event.preventDefault()}>{draft&&<RemoteEditor key={`${draft.provider}:${draft.item?.id||"new"}`} draft={draft} onClose={()=>setDraft(null)}/>}</DialogContent></Dialog>
+  </IntegrationContext.Provider>;
+}
+export function ConnectionsBar({date}:{date:string}) {
+  const {view,busy,error,setDate,openSettings,refresh}=useIntegrations();
+  useEffect(()=>{if(date)setDate(date);},[date,setDate]);
+  const connected=view.todoist.connected||view.google.connected;
+  const providerErrors=[view.todoist.error,view.google.error].filter(Boolean);
+  return <section className="connections-wrap" aria-label="App connections"><div className="connections-bar"><span><Link2 size={16}/>{connected?"Your connected apps":"Bring your plans together"}</span><div className="connection-actions">{connected&&<button disabled={busy} onClick={()=>void refresh()}><RefreshCw size={15} className={busy?"spin":""}/>{busy?"Syncing…":"Sync now"}</button>}<button id="connection-settings" onClick={openSettings}><Settings2 size={15}/>{connected?"Connections":"Connect your apps"}</button></div></div>{connected&&<p className="sync-caption">Personal sources only · Two-way sync · Refreshes every 5 minutes while open</p>}{(error||providerErrors.length>0)&&<div className="sync-error" role="status">{error||providerErrors.join(" ")}<button onClick={openSettings}>Review connection</button></div>}</section>;
+}
+function ConnectionSettings({onClose}:{onClose:()=>void}) {
+  const {view,busy,error,perform,refresh}=useIntegrations();const [token,setToken]=useState("");const [authUrl,setAuthUrl]=useState("");const [localError,setLocalError]=useState("");
+  const connectTodoist=async()=>{setLocalError("");try{await perform("/todoist/connect",{token});setToken("");void refresh();}catch{}};
+  const uploadGoogle=async(file?:File)=>{if(!file)return;setLocalError("");try{if(file.size>64000)throw new Error("Choose the small Desktop OAuth client JSON file.");await perform("/google/configure",JSON.parse(await file.text()));}catch(err){setLocalError(message(err));}};
+  const connectGoogle=async()=>{try{const result=await perform("/google/start",{}) as {url:string};setAuthUrl(result.url);}catch{}};
+  return <><DialogTitle>Your connected apps</DialogTitle><DialogDescription>Sync your personal plans without bringing your work workspace along.</DialogDescription>
+    <div className="connection-card"><div className="connection-card-heading"><span className="service-symbol todoist-symbol"><Check size={20}/></span><div><h3>Todoist</h3><p>Personal project and its subprojects</p></div><span className={`connection-state ${view.todoist.connected?"connected":""}`}>{view.todoist.connected?"Connected":"Not connected"}</span></div>
+      {view.todoist.connected?<><p className="connection-detail">{view.todoist.sources.map(source=>source.name).join(" · ")}</p><p className="connection-detail">{view.todoist.lastSynced?`Last synced ${new Date(view.todoist.lastSynced).toLocaleString()}`:"Ready for the first sync"}</p><button className="text-button" disabled={busy} onClick={()=>void perform("/disconnect",{provider:"todoist"}).catch(()=>{})}>Disconnect Todoist</button></>:<><p className="connection-detail">Paste your personal API token from <a href="https://app.todoist.com/app/settings/integrations/developer" target="_blank" rel="noreferrer">Todoist’s developer settings <ExternalLink size={12}/></a>. It stays on this Mac. This enables creating, editing, completing, and deleting tasks in Personal.</p><label className="connection-label" htmlFor="todoist-token">Todoist API token</label><div className="token-row"><Input id="todoist-token" type="password" autoComplete="off" value={token} disabled={busy} onChange={e=>setToken(e.target.value)}/><Button disabled={busy||token.trim().length<20} onClick={()=>void connectTodoist()}>Connect</Button></div><p className="connection-detail">A Personal project must exist. The Inbox and Artek project tree are excluded.</p></>}
+    </div>
+    <div className="connection-card"><div className="connection-card-heading"><span className="service-symbol calendar-symbol"><CalendarDays size={20}/></span><div><h3>Google Calendar</h3><p>{PERSONAL_CALENDAR}</p></div><span className={`connection-state ${view.google.connected?"connected":""}`}>{view.google.connected?"Connected":"Not connected"}</span></div>
+      {view.google.connected?<><p className="connection-detail">{view.google.lastSynced?`Last synced ${new Date(view.google.lastSynced).toLocaleString()}`:"Ready for the first sync"}</p><button className="text-button" disabled={busy} onClick={()=>void perform("/disconnect",{provider:"google"}).catch(()=>{})}>Disconnect Google Calendar</button></>:<><p className="connection-detail">Use a <a href="https://developers.google.com/workspace/calendar/api/quickstart/nodejs" target="_blank" rel="noreferrer">Google Desktop OAuth client <ExternalLink size={12}/></a> with Calendar API enabled. Choose its downloaded JSON file, then authorize your Gmail account in your browser.</p><label className="connection-label" htmlFor="google-client">Google OAuth client file</label><input id="google-client" type="file" accept=".json,application/json" disabled={busy} onChange={e=>void uploadGoogle(e.target.files?.[0])}/><Button className="google-connect" disabled={busy||!view.google.configured} onClick={()=>void connectGoogle()}>Connect Google Calendar</Button>{authUrl&&<p className="connection-detail">Finish authorization in your default browser. <a href={authUrl} target="_blank" rel="noreferrer">Open authorization again</a></p>}<p className="connection-detail">Sign in as {PERSONAL_CALENDAR}. A Google app left in Testing may need reconnection after 7 days.</p></>}
+    </div>
+    <p className="connection-detail">Solo calendar events can be edited here. Meetings with guests stay in Google Calendar. Local priorities and notes remain local until you create an item in a connected app.</p>
+    {(localError||error)&&<p className="form-error" role="alert">{localError||error}</p>}
+    <div className="connection-close"><Button variant="outline" disabled={busy} onClick={onClose}>Done</Button></div>
+  </>;
+}
+export function TodoistTasks({day,area,inbox=false}:{day:string;area:string;inbox?:boolean}) {
+  const {view,busy,openEditor,perform}=useIntegrations();if(!view.todoist.connected||area==="independent")return null;
+  const today=dateKey(new Date());const tasks=view.tasks.filter(task=>inbox?!task.dueDate:task.dueDate===day||(day===today&&!!task.dueDate&&task.dueDate<day)).sort((a,b)=>(a.dueDate||"").localeCompare(b.dueDate||"")||b.priority-a.priority);
+  return <section className="agenda-panel remote-tasks"><div className="section-heading"><div><h2>{inbox?"Unscheduled in Todoist":"From Todoist"}</h2><p>Personal · {tasks.length} {tasks.length===1?"task":"tasks"}{view.todoist.error?" · Last saved sync":""}</p></div><button className="text-button" disabled={busy||!!view.todoist.error} onClick={()=>openEditor({provider:"todoist",day})}><Plus size={16}/> Add task</button></div>{tasks.length?<div className="remote-task-list">{tasks.map(task=><div className="remote-task-row" key={task.id}><button className="check-button" disabled={busy||!!view.todoist.error} aria-label={`Complete ${task.title} in Todoist`} onClick={()=>void perform("/mutate",{provider:"todoist",action:"complete",id:task.id,version:task.version,requestId:crypto.randomUUID(),timeZone:zone()}).catch(()=>{})}/><button className="remote-task-title" disabled={busy} onClick={()=>openEditor({provider:"todoist",item:task,day})}><strong>{task.title}</strong><span>{task.sourceName}{task.dueDate&&task.dueDate<day?` · Overdue ${task.dueDate}`:""}{task.dueTime?` · ${task.dueTime}`:""}{task.recurring?" · Recurring":""}{task.deadline?` · Deadline ${task.deadline}`:""}</span></button><a href={task.url} target="_blank" rel="noreferrer" aria-label={`Open ${task.title} in Todoist`}><ExternalLink size={15}/></a></div>)}</div>:<p className="remote-empty">{inbox?"No unscheduled tasks in Personal.":"No Todoist tasks due on this day."}</p>}</section>;
+}
+export function GoogleEvents({day,area}:{day:string;area:string}) {
+  const {view,busy,openEditor}=useIntegrations();if(!view.google.connected||area==="independent")return null;
+  const events=view.events.filter(event=>eventOnDay(event,day)).sort((a,b)=>Number(b.allDay)-Number(a.allDay)||(a.startTime||"").localeCompare(b.startTime||""));
+  return <div className="google-events"><div className="google-events-heading"><span><CalendarDays size={15}/> Google Calendar{view.google.error?" · Last saved sync":""}</span><button className="text-button" disabled={busy||!!view.google.error} onClick={()=>openEditor({provider:"google",day})}><Plus size={15}/> Add event</button></div>{events.length?events.map(event=><div className="plan-row" key={`${event.sourceId}:${event.id}`}><div className="plan-time"><strong>{event.allDay?"All day":event.startDate<day?"Continues":event.startTime}</strong>{!event.allDay&&<span>{event.endDate>day?"Next day":event.endTime}</span>}</div><button className="plan-content" disabled={busy} onClick={()=>openEditor({provider:"google",item:event,day})}><strong>{event.title}</strong><span className="remote-event-meta">{event.location||"Personal calendar"}{event.recurring?" · This occurrence":""}</span></button><a className="remote-link" href={event.url} target="_blank" rel="noreferrer" aria-label={`Open ${event.title} in Google Calendar`}><ExternalLink size={15}/></a></div>):<p className="remote-empty">No calendar events for this day.</p>}</div>;
+}
+function RemoteEditor({draft,onClose}:{draft:Draft;onClose:()=>void}) {
+  const {view,busy,error,perform}=useIntegrations();const item=draft.item;const task=draft.provider==="todoist"?item as RemoteTask|undefined:undefined;const event=draft.provider==="google"?item as RemoteEvent|undefined:undefined;
+  const [title,setTitle]=useState(item?.title||"");const [date,setDate]=useState(task?task.dueDate||"":event?.startDate||draft.day);
+  const [endDate,setEndDate]=useState(event?.endDate||draft.day);const [time,setTime]=useState(event?.startTime||"09:00");const [endTime,setEndTime]=useState(event?.endTime||"10:00");const [allDay,setAllDay]=useState(event?.allDay||false);
+  const [sourceId,setSourceId]=useState(task?.sourceId||view.todoist.sources.find(s=>/^personal$/i.test(s.name.trim()))?.id||"");
+  const [confirmDelete,setConfirmDelete]=useState(false);const [localError,setLocalError]=useState("");const request=useRef({id:crypto.randomUUID(),payload:""});
+  const editable=draft.provider==="todoist"||!event||event.editable;
+  async function submit(action:"create"|"update"|"delete") {
+    setLocalError("");
+    const body={provider:draft.provider,action,...(item?{id:item.id,version:item.version}:{}),timeZone:zone(),...(action!=="delete"?{title,date:date||null,...(draft.provider==="todoist"?{sourceId}:{endDate,time:allDay?null:time,endTime:allDay?null:endTime,allDay})}:{})};
+    const serialized=JSON.stringify(body);request.current.payload=serialized;
+    try{await perform("/mutate",{...body,requestId:request.current.id});onClose();}catch(err){setLocalError(message(err));}
+  }
+  function changeAllDay(value:boolean){setAllDay(value);if(value&&endDate<=date){const next=dateFromKey(date);next.setDate(next.getDate()+1);setEndDate(dateKey(next));}}
+  return <><DialogTitle>{item?"Edit":"Add to"} {providerName(draft.provider)}</DialogTitle><DialogDescription>{draft.provider==="todoist"?"Changes save to your Personal project in Todoist.":event?.recurring?"Changes apply only to this occurrence in your personal calendar.":"Changes save to your personal Gmail calendar."}</DialogDescription>
+    {!editable?<div className="remote-readonly"><h3>{event?.title}</h3><p>This event has guests, belongs to another organizer, or uses a special calendar format. Edit it in Google Calendar to manage those details.</p><a href={event?.url} target="_blank" rel="noreferrer">Open in Google Calendar <ExternalLink size={15}/></a><Button variant="outline" onClick={onClose}>Close</Button></div>:<form className="editor-form" onSubmit={e=>{e.preventDefault();void submit(item?"update":"create");}}>
+      <label htmlFor="remote-title">Title</label><textarea id="remote-title" autoFocus rows={3} required maxLength={2000} value={title} disabled={busy} onChange={e=>setTitle(e.target.value)}/>
+      {draft.provider==="todoist"?<><div className="form-row"><div><label htmlFor="remote-project">Project</label><select id="remote-project" value={sourceId} disabled={busy||!!item} onChange={e=>setSourceId(e.target.value)}>{view.todoist.sources.map(source=><option key={source.id} value={source.id}>{source.name}</option>)}</select></div><div><label htmlFor="remote-date">Due date <span className="optional">(optional)</span></label><Input id="remote-date" type="date" disabled={busy||task?.recurring||!!task?.dueTime} value={date} onChange={e=>setDate(e.target.value)}/></div></div>{task?.recurring&&<p className="connection-detail">Edit recurrence and due dates in Todoist. Completing this task advances to its next occurrence.</p>}{task?.dueTime&&<p className="connection-detail">Change the date and time in Todoist to preserve its time zone and reminders. Title edits work here.</p>}</>:<><label className="all-day-control"><input type="checkbox" checked={allDay} disabled={busy} onChange={e=>changeAllDay(e.target.checked)}/> All-day event</label><div className="form-row"><div><label htmlFor="remote-date">Starts on</label><Input id="remote-date" required type="date" value={date} disabled={busy} onChange={e=>setDate(e.target.value)}/></div><div><label htmlFor="remote-end-date">{allDay?"Ends before":"Ends on"}</label><Input id="remote-end-date" required type="date" value={endDate} disabled={busy} onChange={e=>setEndDate(e.target.value)}/></div></div>{allDay?<p className="connection-detail">The end date is exclusive. For one day, choose the following date.</p>:<div className="form-row"><div><label htmlFor="remote-start">Start time</label><Input id="remote-start" required type="time" value={time} disabled={busy} onChange={e=>setTime(e.target.value)}/></div><div><label htmlFor="remote-end">End time</label><Input id="remote-end" required type="time" value={endTime} disabled={busy} onChange={e=>setEndTime(e.target.value)}/></div></div>}<p className="connection-detail">Times use {zone()}. Events created here have no guests.</p></>}
+      {(localError||error)&&<p className="form-error" role="alert">{localError||error}</p>}
+      {confirmDelete&&<div className="form-error">Delete this {draft.provider==="todoist"?"task":event?.recurring?"occurrence":"event"} from {providerName(draft.provider)}? This also removes it from the source app.{draft.provider === "todoist" ? " Todoist also deletes any completed subtasks belonging to this task." : ""}<div className="delete-confirm"><Button variant="outline" type="button" disabled={busy} onClick={()=>setConfirmDelete(false)}>Keep it</Button><Button variant="destructive" type="button" disabled={busy} onClick={()=>void submit("delete")}>Delete from {draft.provider==="todoist"?"Todoist":"Calendar"}</Button></div></div>}
+      <div className="editor-actions">{item&&<button className="delete-button" type="button" disabled={busy} onClick={()=>setConfirmDelete(true)}><Trash2 size={16}/> Delete</button>}<div><Button variant="ghost" type="button" disabled={busy} onClick={onClose}>Cancel</Button><Button type="submit" disabled={busy||!title.trim()}>{busy?<><LoaderCircle className="spin" size={15}/> Saving…</>:"Save to app"}</Button></div></div>
+    </form>}
+  </>;
+}
