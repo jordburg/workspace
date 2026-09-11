@@ -24,7 +24,7 @@ export function createFinanceService(directory:string,remoteFetch:typeof fetch=f
   async function plaid(config:Config|undefined,path:string,body:object={}){
     if(!config)throw new FinanceError("Set up your Plaid connection first.");
     let response:Response;try{response=await remoteFetch(`https://${config.environment}.plaid.com${path}`,{method:"POST",headers:{"Content-Type":"application/json","Plaid-Version":"2020-09-14"},body:JSON.stringify({client_id:config.clientId,secret:config.secret,...body}),signal:AbortSignal.timeout(30000)});}catch{throw new FinanceError("Plaid could not confirm the request. Your saved connection has been kept.",502);}
-    const data=await response.json();if(!response.ok){const code=typeof data.error_code==="string"?data.error_code:"";
+    const data=z.record(z.unknown()).parse(await response.json());if(!response.ok){const code=typeof data.error_code==="string"?data.error_code:"";
       const text=code==="ITEM_LOGIN_REQUIRED"?"Your bank needs you to reconnect. Choose Repair connection.":code==="TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION"?"Bank transactions changed during sync. Try syncing again.":code==="PRODUCT_NOT_READY"?"The bank is still preparing transactions. Sync again in a few minutes.":code==="INVALID_CREDENTIALS"||code==="INVALID_API_KEYS"?"Check the Plaid client ID, secret, and environment.":"Plaid could not complete this request. Check your Plaid access and try again.";
       throw new FinanceError(text,502,code);
     }return data;
@@ -76,13 +76,13 @@ export function createFinanceService(directory:string,remoteFetch:typeof fetch=f
         }
         if(path==="/link"){
           const input=z.object({itemId:z.string().optional()}).strict().parse(body);const item=input.itemId?s.items.find(i=>i.id===input.itemId):undefined;if(input.itemId&&!item)throw new FinanceError("This bank is no longer connected.",404);
-          const data=await plaid(s.config,"/link/token/create",{user:{client_user_id:s.userId},client_name:"Personal Workspace",country_codes:["US"],language:"en",...(item?{access_token:item.token}:{products:["transactions"],transactions:{days_requested:90}})});await write(s);return {linkToken:data.link_token};
+          const data=await plaid(s.config,"/link/token/create",{user:{client_user_id:s.userId},client_name:"Personal Workspace",country_codes:["US"],language:"en",...(item?{access_token:item.token}:{products:["transactions"],transactions:{days_requested:90}})});await write(s);return {linkToken:z.string().parse(data.link_token)};
         }
         if(path==="/exchange"){
           const input=z.object({publicToken:z.string().min(1).max(1000)}).strict().parse(body);const hash=createHash("sha256").update(input.publicToken).digest("hex");if(s.exchanges[hash])return view(s);
           const data=await plaid(s.config,"/item/public_token/exchange",{public_token:input.publicToken});const exchange=z.object({access_token:z.string(),item_id:z.string()}).parse(data);
           const existing=s.items.find(i=>i.id===exchange.item_id);if(existing){existing.token=exchange.access_token;}else{s.items.push({id:exchange.item_id,token:exchange.access_token,name:"Bank connection",accounts:[],selected:[],cursors:{},transactions:[],lastSynced:null,error:null,updateStatus:null});}s.exchanges[hash]=exchange.item_id;await write(s);
-          const item=s.items.find(i=>i.id===exchange.item_id)!;try{const info=await plaid(s.config,"/item/get",{access_token:item.token});if(info.item?.institution_id){item.institutionId=info.item.institution_id;const institution=await plaid(s.config,"/institutions/get_by_id",{institution_id:info.item.institution_id,country_codes:["US"]});item.name=String(institution.institution?.name||"Bank connection").slice(0,200);}await accounts(s,item);}catch(e){item.error=message(e);}await write(s);return view(s);
+          const item=s.items.find(i=>i.id===exchange.item_id)!;try{const info=z.object({item:z.object({institution_id:z.string().nullable()})}).parse(await plaid(s.config,"/item/get",{access_token:item.token}));if(info.item?.institution_id){item.institutionId=info.item.institution_id;const institution=z.object({institution:z.object({name:z.string()})}).parse(await plaid(s.config,"/institutions/get_by_id",{institution_id:info.item.institution_id,country_codes:["US"]}));item.name=String(institution.institution?.name||"Bank connection").slice(0,200);}await accounts(s,item);}catch(e){item.error=message(e);}await write(s);return view(s);
         }
         if(path==="/accounts"){
           const input=z.object({itemId:z.string(),accountIds:z.array(z.string()).max(100)}).strict().parse(body);const item=s.items.find(i=>i.id===input.itemId);if(!item)throw new FinanceError("This bank is no longer connected.",404);
