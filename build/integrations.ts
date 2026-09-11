@@ -15,10 +15,10 @@ const SCOPES = ["https://www.googleapis.com/auth/calendar.calendarlist.readonly"
 const tokenSchema=z.object({access_token:z.string().min(1),refresh_token:z.string().optional(),expires_in:z.number().positive(),scope:z.string().optional()});
 const clientSchema=z.object({installed:z.object({client_id:z.string().endsWith(".apps.googleusercontent.com"),client_secret:z.string().min(1)})});
 const timeSchema=z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
-const mutationSchema=z.object({provider:z.enum(["todoist","google"]),action:z.enum(["create","update","delete","complete"]),id:z.string().max(500).optional(),version:z.string().max(10000).optional(),requestId:z.string().uuid(),sourceId:z.string().max(500).optional(),title:z.string().trim().min(1).max(2000).optional(),date:daySchema.nullable().optional(),endDate:daySchema.optional(),time:timeSchema.nullable().optional(),endTime:timeSchema.nullable().optional(),allDay:z.boolean().optional(),timeZone:z.string().max(100)}).strict();
+const mutationSchema=z.object({provider:z.enum(["todoist","google"]),action:z.enum(["create","update","delete","complete"]),id:z.string().max(500).optional(),version:z.string().max(10000).optional(),requestId:z.string().uuid(),sourceId:z.string().max(500).optional(),anchorDate:daySchema.optional(),title:z.string().trim().min(1).max(2000).optional(),date:daySchema.nullable().optional(),endDate:daySchema.optional(),time:timeSchema.nullable().optional(),endTime:timeSchema.nullable().optional(),allDay:z.boolean().optional(),timeZone:z.string().max(100)}).strict();
 type Mutation=z.infer<typeof mutationSchema>;
 type SecretState={version:1;view:SyncView;todoistToken?:string;googleClient?:{client_id:string;client_secret:string};googleTokens?:{accessToken:string;refreshToken:string;expiresAt:number};receipts:Record<string,{provider:string;id?:string}>;requests:Record<string,string>};
-class PublicError extends Error { constructor(message:string,readonly status=400){super(message);} }
+class PublicError extends Error { readonly status:number; constructor(message:string,status=400){super(message);this.status=status;} }
 const cleanError=(err:unknown)=>err instanceof PublicError?err.message:"The service could not be reached. Your last successful sync is still available. Try again.";
 
 export function createIntegrationService(directory:string, remoteFetch:typeof fetch=fetch) {
@@ -54,10 +54,10 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
     const toDate=new Date(`${date}T12:00:00Z`);toDate.setUTCDate(toDate.getUTCDate()+35);
     const from=fromDate.toISOString().slice(0,10);const to=toDate.toISOString().slice(0,10);
     if(state.todoistToken)try{
-      const sources=await personalTodoist(state.todoistToken);const tasks:RemoteTask[]=[];
+      const sources=await personalTodoist(state.todoistToken);const allowed=new Set(sources.map(source=>source.id));state.view.tasks=state.view.tasks.filter(task=>allowed.has(task.sourceId));state.view.todoist.sources=sources;state.view.todoist.selected=sources.map(source=>({id:source.id,area:source.area}));const tasks:RemoteTask[]=[];
       for(const source of sources){const raw=await todoistPages(`/tasks?project_id=${encodeURIComponent(source.id)}`,state.todoistToken);for(const row of raw){const task=normalizeTask(row,source,timeZone);if(task)tasks.push(task);}}
       state.view.tasks=tasks;state.view.todoist={connected:true,configured:true,sources,selected:sources.map(s=>({id:s.id,area:s.area})),lastSynced:new Date().toISOString(),error:null};
-    }catch(err){state.view.todoist.error=cleanError(err);}
+    }catch(err){if(err instanceof PublicError && err.message.startsWith("No Personal project")){state.view.tasks=[];state.view.todoist.sources=[];state.view.todoist.selected=[];}state.view.todoist.error=cleanError(err);}
     if(state.googleTokens)try{
       const token=await googleToken(state);const source=await personalGoogle(token);
       // Extra UTC margin covers all IANA offsets; display filtering uses local date parts.
@@ -165,7 +165,10 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
           const sources=await personalTodoist(token);state.todoistToken=token;state.view.todoist={connected:true,configured:true,sources,selected:sources.map(s=>({id:s.id,area:s.area})),lastSynced:null,error:null};state.view.tasks=[];await write(state);return state.view;
         }
         if(path==="/google/configure"){
-          const client=clientSchema.parse(body).installed;state.googleClient=client;delete state.googleTokens;state.view.google={...emptySync().google,configured:true};state.view.events=[];await write(state);return state.view;
+          if(body && typeof body==="object" && "web" in body)throw new PublicError("This file is for a Web application client. Create an OAuth client with application type Desktop app in your personal Google Cloud project, then upload its JSON file. Your previously saved client has not been replaced.");
+          const parsed=clientSchema.safeParse(body);
+          if(!parsed.success)throw new PublicError("Choose the downloaded JSON file for a Google Desktop app OAuth client. This file was not saved; any previous client is still configured.");
+          const client=parsed.data.installed;state.googleClient=client;delete state.googleTokens;state.view.google={...emptySync().google,configured:true};state.view.events=[];await write(state);pending.clear();return state.view;
         }
         if(path==="/google/start"){
           if(!state.googleClient)throw new PublicError("Choose your Google Desktop OAuth client file first.");
@@ -186,7 +189,7 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
           const input=syncRequestSchema.parse(body);await syncState(state,input.date,input.timeZone);await write(state);return state.view;
         }
         if(path==="/mutate"){
-          const input=mutationSchema.parse(body);await mutate(state,input);await write(state);await syncState(state,input.date||new Date().toISOString().slice(0,10),input.timeZone);await write(state);return state.view;
+          const input=mutationSchema.parse(body);await mutate(state,input);await write(state);await syncState(state,input.anchorDate||input.date||new Date().toISOString().slice(0,10),input.timeZone);await write(state);return state.view;
         }
         throw new PublicError("Unknown connection action.",404);
       });send(200,result);
