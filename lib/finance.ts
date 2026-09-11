@@ -25,7 +25,7 @@ export function spendingByCurrency(view:FinanceView,month:string) {
   const result:Record<string,number>={};
   for(const t of view.transactions){
     const note=view.annotations[t.id];
-    if(!t.date.startsWith(month)||t.pending||note?.excludeFromSpending||/^(TRANSFER|LOAN_PAYMENTS|INCOME)/.test(t.category))continue;
+    if(!t.date.startsWith(month)||t.pending||note?.excludeFromSpending||/^(TRANSFER|LOAN_PAYMENTS|LOAN_DISBURSEMENTS|INCOME)/.test(t.category))continue;
     const currency=t.currency||"Unknown currency";result[currency]=(result[currency]||0)+t.amount;
   }
   return result;

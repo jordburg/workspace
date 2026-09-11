@@ -62,39 +62,7 @@ struct HealthHome: View {
     @State private var confirmUnpair = false
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    Label("Your health, in your workspace", systemImage: "heart.text.square.fill").font(.headline).foregroundStyle(.teal)
-                    Text("Share steps, sleep, workouts, resting heart rate, and weight with your Mac. Only accessible data is included.")
-                    Button("Review Health permissions") { Task { await model.authorize() } }
-                }
-                Section("Your Mac") {
-                    if let credentials = model.credentials {
-                        Label(credentials.url.host ?? "Paired Mac", systemImage: "desktopcomputer")
-                        Text(model.status)
-                        Button("Sync now", systemImage: "arrow.triangle.2.circlepath") { Task { await model.sync() } }
-                        Button("Forget this pairing", role: .destructive) { confirmUnpair = true }
-                    } else {
-                        Text("On your Mac, open Workspace → Health → iPhone setup. Enable sync and AirDrop the pairing file to this iPhone, then select it below.")
-                        Button("Import pairing file", systemImage: "link") { importing = true }
-                    }
-                } footer: { Text("The Mac must be awake with Workspace running, and both devices must be on the same Wi-Fi. Sync runs while this app is open. No background delivery is promised.") }
-                if model.dayCount > 0 { Section { Text("Latest snapshot: \(model.dayCount) calendar days. Missing values mean no accessible data, not zero.") } }
-                if !model.commands.isEmpty {
-                    Section("Review entries from your Mac") {
-                        ForEach(model.commands) { command in
-                            Button { selected = command } label: {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text("Weight · \(command.kg, specifier: "%.2f") kg")
-                                    Text(command.measuredAt.formatted()).font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    } footer: { Text("Each measurement is saved only after you review and confirm it here.") }
-                }
-                if let error = model.error { Section { Text(error).foregroundStyle(.red) } }
-                if model.busy { ProgressView("Working…") }
-            }
+            healthList
             .navigationTitle("Workspace Health")
             .disabled(model.busy)
             .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
@@ -109,4 +77,49 @@ struct HealthHome: View {
             .task { if UserDefaults.standard.bool(forKey: "healthPermissionsRequested") { await model.sync() } }
         }.tint(.teal)
     }
+    private var healthList: some View {
+        List {
+            permissionsSection
+            macSection
+            if model.dayCount > 0 { Section { Text("Latest snapshot: \(model.dayCount) calendar days. Missing values mean no accessible data, not zero.") } }
+            entriesSection
+            if let error = model.error { Section { Text(error).foregroundStyle(.red) } }
+            if model.busy { ProgressView("Working…") }
+        }
+    }
+    private var permissionsSection: some View {
+        Section {
+            Label("Your health, in your workspace", systemImage: "heart.text.square.fill").font(.headline).foregroundStyle(.teal)
+            Text("Share steps, sleep, workouts, resting heart rate, and weight with your Mac. Only accessible data is included.")
+            Button("Review Health permissions") { Task { await model.authorize() } }
+        }
+    }
+    private var macSection: some View {
+        Section {
+            if let credentials = model.credentials {
+                Label(credentials.url.host ?? "Paired Mac", systemImage: "desktopcomputer")
+                Text(model.status)
+                Button("Sync now", systemImage: "arrow.triangle.2.circlepath") { Task { await model.sync() } }
+                Button("Forget this pairing", role: .destructive) { confirmUnpair = true }
+            } else {
+                Text("On your Mac, open Workspace → Health → iPhone setup. Enable sync and AirDrop the pairing file to this iPhone, then select it below.")
+                Button("Import pairing file", systemImage: "link") { importing = true }
+            }
+        } header: { Text("Your Mac") } footer: { Text("The Mac must be awake with Workspace running, and both devices must be on the same Wi-Fi. Sync runs while this app is open. No background delivery is promised.") }
+    }
+    @ViewBuilder private var entriesSection: some View {
+        if !model.commands.isEmpty {
+            Section {
+                ForEach(model.commands) { command in
+                    Button { selected = command } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Weight · \(command.kg, specifier: "%.2f") kg")
+                            Text(command.measuredAt.formatted()).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } header: { Text("Review entries from your Mac") } footer: { Text("Each measurement is saved only after you review and confirm it here.") }
+        }
+    }
+
 }

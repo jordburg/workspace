@@ -11,7 +11,7 @@ import { emptyFinance, normalizeAccount, normalizeTransaction, noteSchema, type 
 type Config={clientId:string;secret:string;environment:"production"|"sandbox"};
 type Item={institutionId?:string;id:string;token:string;name:string;accounts:BankConnection["accounts"];selected:string[];cursors:Record<string,string>;transactions:Transaction[];lastSynced:string|null;error:string|null;updateStatus:string|null};
 type State={version:1;userId:string;config?:Config;items:Item[];annotations:Record<string,TransactionNote>;exchanges:Record<string,string>};
-class FinanceError extends Error {constructor(message:string,readonly status=400,readonly code=""){super(message);}}
+class FinanceError extends Error {readonly status:number;readonly code:string;constructor(message:string,status=400,code=""){super(message);this.status=status;this.code=code;}}
 const message=(e:unknown)=>e instanceof FinanceError||e instanceof StoreBusyError?e.message:"The bank connection could not be refreshed. Your last saved data is still available.";
 const configSchema=z.object({clientId:z.string().trim().min(10).max(100),secret:z.string().trim().min(10).max(200),environment:z.enum(["production","sandbox"])}).strict();
 
@@ -30,7 +30,7 @@ export function createFinanceService(directory:string,remoteFetch:typeof fetch=f
     }return data;
   }
   function prune(s:State,item:Item){const selected=new Set(item.accounts.filter(a=>a.selected&&!a.blocked).map(a=>a.id));item.selected=[...selected];const removed=item.transactions.filter(t=>!selected.has(t.accountId));item.transactions=item.transactions.filter(t=>selected.has(t.accountId));for(const t of removed)delete s.annotations[t.id];for(const id of Object.keys(item.cursors))if(!selected.has(id))delete item.cursors[id];}
-  async function accounts(s:State,item:Item){const data=await plaid(s.config,"/accounts/get",{access_token:item.token});item.accounts=z.array(z.unknown()).parse(data.accounts).map(a=>normalizeAccount(a,new Set(item.selected)));prune(s,item);}
+  async function accounts(s:State,item:Item){const data=await plaid(s.config,"/accounts/get",{access_token:item.token});if(!item.institutionId){const metadata=data.item||(await plaid(s.config,"/item/get",{access_token:item.token})).item;item.institutionId=z.object({institution_id:z.string().min(1)}).parse(metadata).institution_id;}item.accounts=z.array(z.unknown()).parse(data.accounts).map(a=>normalizeAccount(a,new Set(item.selected)));prune(s,item);}
   async function syncItem(s:State,item:Item){
     try{
       await accounts(s,item);
@@ -86,7 +86,9 @@ export function createFinanceService(directory:string,remoteFetch:typeof fetch=f
         }
         if(path==="/accounts"){
           const input=z.object({itemId:z.string(),accountIds:z.array(z.string()).max(100)}).strict().parse(body);const item=s.items.find(i=>i.id===input.itemId);if(!item)throw new FinanceError("This bank is no longer connected.",404);
+          const kept=item.selected.filter(id=>input.accountIds.includes(id));if(kept.length!==item.selected.length){item.accounts=item.accounts.map(a=>({...a,selected:kept.includes(a.id),current:kept.includes(a.id)?a.current:null,available:kept.includes(a.id)?a.available:null}));prune(s,item);await write(s);}
           const additions=input.accountIds.filter(id=>!item.selected.includes(id));if(additions.length)await accounts(s,item);if(new Set(input.accountIds).size!==input.accountIds.length||input.accountIds.some(id=>!item.accounts.some(a=>a.id===id&&!a.blocked&&["depository","credit"].includes(a.type))))throw new FinanceError("Choose personal checking, savings, or credit card accounts from this connection.");
+          if(input.accountIds.length&&!item.institutionId)throw new FinanceError("Sync this bank’s account details before selecting accounts.",409);
           if(input.accountIds.length&&item.institutionId&&s.items.some(other=>other.id!==item.id&&other.institutionId===item.institutionId&&other.selected.length))throw new FinanceError("Accounts from this bank are already selected in another connection. Use Repair connection, or deselect the old connection before selecting a replacement.",409);
           item.selected=input.accountIds;item.accounts=item.accounts.map(a=>({...a,selected:input.accountIds.includes(a.id),current:null,available:null}));prune(s,item);await write(s);if(item.selected.length){await syncItem(s,item);await write(s);}return view(s);
         }

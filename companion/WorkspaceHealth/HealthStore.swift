@@ -20,7 +20,7 @@ struct HealthDay: Encodable {
 struct WorkoutSummary: Encodable { let id: UUID; let name: String; let start: Date; let end: Date; let minutes: Double }
 struct HealthSnapshot: Encodable { let version = 1; let id = UUID(); let generatedAt = Date(); let timeZone: String; let from: String; let to: String; let days: [HealthDay]; let workouts: [WorkoutSummary] }
 
-final class HealthStore {
+final class HealthStore: @unchecked Sendable {
     let store = HKHealthStore()
     let steps = HKQuantityType(.stepCount)
     let sleep = HKCategoryType(.sleepAnalysis)
@@ -47,7 +47,7 @@ final class HealthStore {
                 if let error { continuation.resume(throwing: error); return }
                 var result: [String: Double] = [:]
                 collection?.enumerateStatistics(from: from, to: to.addingTimeInterval(-1)) { statistics, _ in
-                    if let sum = statistics.sumQuantity() { result[key(statistics.startDate)] = sum.doubleValue(for: .count()) }
+                    if let sum = statistics.sumQuantity() { result[self.key(statistics.startDate)] = sum.doubleValue(for: .count()) }
                 }
                 continuation.resume(returning: result)
             }

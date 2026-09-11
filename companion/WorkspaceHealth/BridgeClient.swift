@@ -22,6 +22,7 @@ struct WeightCommand: Decodable, Identifiable {
     let measuredAt: Date
     let payloadHash: String
 }
+struct BridgeErrorResponse: Decodable { let error: String }
 enum BridgeError: LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let value) = self { return value }; return nil }
@@ -112,8 +113,7 @@ final class BridgeClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, 
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         let (data, response) = try await session.data(for: request)
         guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else {
-            struct ErrorResponse: Decodable { let error: String }
-            throw BridgeError.message((try? bridgeDecoder().decode(ErrorResponse.self, from: data).error) ?? "The Mac did not accept this request. Check its Health connection.")
+            throw BridgeError.message((try? bridgeDecoder().decode(BridgeErrorResponse.self, from: data).error) ?? "The Mac did not accept this request. Check its Health connection.")
         }
         return try bridgeDecoder().decode(T.self, from: data)
     }

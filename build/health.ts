@@ -12,7 +12,7 @@ import { healthSnapshotSchema, weightInputSchema, type HealthView, type HealthSn
 import { withPrivateLock, writePrivateJson, StoreBusyError } from "./private-store.ts";
 
 type State={version:1;enabled:boolean;address?:string;tokenHash?:string;pairing?:{hash:string;expires:number};snapshot:HealthSnapshot|null;lastSynced:string|null;commands:WeightCommand[]};
-class HealthError extends Error {constructor(message:string,readonly status=400){super(message);}}
+class HealthError extends Error {readonly status:number;constructor(message:string,status=400){super(message);this.status=status;}}
 const hash=(value:string)=>createHash("sha256").update(value).digest("hex");
 const matches=(value:string,expected?:string)=>!!expected&&expected.length===64&&timingSafeEqual(Buffer.from(hash(value),"hex"),Buffer.from(expected,"hex"));
 export const lanAddresses=()=>Object.values(networkInterfaces()).flatMap(entries=>entries||[]).filter(a=>a.family==="IPv4"&&!a.internal&&/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address)).map(a=>a.address).filter((a,i,all)=>all.indexOf(a)===i);
@@ -28,7 +28,7 @@ export function createHealthService(directory:string,options:{addresses?:()=>str
   function view(s:State):HealthView{return {enabled:s.enabled,online:!!server?.listening,paired:!!s.tokenHash,endpoint,addresses:addresses(),error:runtimeError,lastSynced:s.lastSynced,snapshot:s.snapshot,commands:s.commands};}
   async function generateCertificate(address:string){
     await mkdir(directory,{recursive:true,mode:0o700});const suffix=randomUUID();const key=`${privateKey}.${suffix}.tmp`;const cert=`${certificate}.${suffix}.tmp`;
-    try{await promisify(execFile)("openssl",["req","-x509","-newkey","rsa:2048","-sha256","-nodes","-keyout",key,"-out",cert,"-days","365","-subj","/CN=Personal Workspace Health","-addext",`subjectAltName=IP:${address}`],{timeout:20000});await chmod(key,0o600);await chmod(cert,0o600);await rename(key,privateKey);await rename(cert,certificate);}catch{throw new HealthError("The private health certificate could not be created. OpenSSL is required on this Mac.",500);}finally{await unlink(key).catch(()=>{});await unlink(cert).catch(()=>{});}
+    try{await promisify(execFile)("openssl",["req","-x509","-newkey","rsa:2048","-sha256","-nodes","-keyout",key,"-out",cert,"-days","365","-subj","/CN=Personal Workspace Health","-addext",`subjectAltName=IP:${address}`,"-addext","extendedKeyUsage=serverAuth","-addext","keyUsage=critical,digitalSignature,keyEncipherment"],{timeout:20000});await chmod(key,0o600);await chmod(cert,0o600);await rename(key,privateKey);await rename(cert,certificate);}catch{throw new HealthError("The private health certificate could not be created. OpenSSL is required on this Mac.",500);}finally{await unlink(key).catch(()=>{});await unlink(cert).catch(()=>{});}
   }
   const send=(res:ServerResponse,code:number,data:unknown)=>{res.statusCode=code;res.setHeader("Content-Type","application/json");res.setHeader("Cache-Control","no-store");res.end(JSON.stringify(data));};
   async function body(req:IncomingMessage,max=2_000_000){if(!req.headers["content-type"]?.startsWith("application/json"))throw new HealthError("JSON is required.",415);let size=0;const chunks:Buffer[]=[];for await(const part of req){const b=Buffer.from(part);size+=b.length;if(size>max)throw new HealthError("Health snapshot is too large.",413);chunks.push(b);}return JSON.parse(Buffer.concat(chunks).toString("utf8")||"{}");}
