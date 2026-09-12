@@ -12,6 +12,7 @@ enum WorkspaceTab: Hashable {
 }
 
 private enum MoreRoute: Hashable {
+    case mail
     case pairing
 }
 
@@ -23,46 +24,55 @@ struct WorkspaceRootView: View {
     @State private var morePath: [MoreRoute] = []
 
     var body: some View {
-        TabView(selection: $tab) {
-            NavigationStack {
-                TodayView(
-                    selectedDay: $selectedDay,
-                    openClimbing: { tab = .climbing },
-                    openHealth: { tab = .health },
-                    openPairing: openPairing
-                )
-            }
-            .tabItem { Label("Today", systemImage: "sun.max") }
-            .tag(WorkspaceTab.today)
+        ZStack {
+            TabView(selection: $tab) {
+                NavigationStack {
+                    TodayView(
+                        selectedDay: $selectedDay,
+                        openClimbing: { tab = .climbing },
+                        openHealth: { tab = .health },
+                        openMail: openMail,
+                        openPairing: openPairing
+                    )
+                }
+                .tabItem { Label("Today", systemImage: "sun.max") }
+                .tag(WorkspaceTab.today)
 
-            NavigationStack {
-                InboxView(selectedDay: $selectedDay, openPairing: openPairing)
-            }
-            .tabItem { Label("Inbox", systemImage: "tray") }
-            .tag(WorkspaceTab.inbox)
+                NavigationStack {
+                    InboxView(selectedDay: $selectedDay, openPairing: openPairing)
+                }
+                .tabItem { Label("Inbox", systemImage: "tray") }
+                .tag(WorkspaceTab.inbox)
 
-            NavigationStack {
-                ClimbingView(selectedDay: $selectedDay, openPairing: openPairing)
-            }
-            .tabItem { Label("Climbing", systemImage: "mountain.2") }
-            .tag(WorkspaceTab.climbing)
+                NavigationStack {
+                    ClimbingView(selectedDay: $selectedDay, openPairing: openPairing)
+                }
+                .tabItem { Label("Climbing", systemImage: "mountain.2") }
+                .tag(WorkspaceTab.climbing)
 
-            NavigationStack {
-                HealthWorkspaceView(selectedDay: $selectedDay, openPairing: openPairing)
-            }
-            .tabItem { Label("Health", systemImage: "heart") }
-            .tag(WorkspaceTab.health)
+                NavigationStack {
+                    HealthWorkspaceView(selectedDay: $selectedDay, openPairing: openPairing)
+                }
+                .tabItem { Label("Health", systemImage: "heart") }
+                .tag(WorkspaceTab.health)
 
-            NavigationStack(path: $morePath) {
-                MoreView()
-                    .navigationDestination(for: MoreRoute.self) { route in
-                        switch route {
-                        case .pairing: PairingSyncView()
+                NavigationStack(path: $morePath) {
+                    MoreView()
+                        .navigationDestination(for: MoreRoute.self) { route in
+                            switch route {
+                            case .mail: MailWorkspaceView()
+                            case .pairing: PairingSyncView()
+                            }
                         }
-                    }
+                }
+                .tabItem { Label("More", systemImage: "ellipsis") }
+                .tag(WorkspaceTab.more)
             }
-            .tabItem { Label("More", systemImage: "ellipsis") }
-            .tag(WorkspaceTab.more)
+            if scenePhase != .active {
+                WorkspacePrivacyCover()
+                    .transition(.opacity)
+                    .zIndex(10)
+            }
         }
         .tint(.teal)
         .task {
@@ -85,6 +95,33 @@ struct WorkspaceRootView: View {
     private func openPairing() {
         morePath = [.pairing]
         tab = .more
+    }
+
+    private func openMail() {
+        morePath = [.mail]
+        tab = .more
+    }
+}
+
+private struct WorkspacePrivacyCover: View {
+    var body: some View {
+        ZStack {
+            Color(uiColor: .systemBackground).ignoresSafeArea()
+            VStack(spacing: 12) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 36))
+                    .foregroundStyle(.teal)
+                Text("Workspace")
+                    .font(.title2.weight(.semibold))
+                Text("Return to the app to view your private workspace.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .multilineTextAlignment(.center)
+            .padding()
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Workspace content hidden")
     }
 }
 
@@ -254,6 +291,7 @@ struct TodayView: View {
     @Binding var selectedDay: Date
     let openClimbing: () -> Void
     let openHealth: () -> Void
+    let openMail: () -> Void
     let openPairing: () -> Void
 
     @State private var area: MobileAreaFilter = .all
@@ -415,6 +453,9 @@ struct TodayView: View {
             }
 
             Section("A wider view") {
+                Button(action: openMail) {
+                    SummaryRow(icon: "envelope.fill", color: .blue, title: "Mail", detail: mailSummary)
+                }
                 Button(action: openHealth) {
                     SummaryRow(icon: "heart.fill", color: .pink, title: "Apple Health", detail: healthSummary)
                 }
@@ -492,6 +533,17 @@ struct TodayView: View {
     }
 
     private var defaultArea: LifeArea { area == .independent ? .independent : .personal }
+
+    private var mailSummary: String {
+        let gmail = store.integrations.gmail
+        guard gmail.connected else {
+            return gmail.configured ? "Connect Gmail on your Mac" : "Set up Gmail on your Mac"
+        }
+        if gmail.unreadCount == 0 { return "Recent inbox clear" }
+        let label = gmail.unreadCount == 1 ? "1 unread in recent inbox" : "\(gmail.unreadCount) unread in recent inbox"
+        let first = store.integrations.messages.first(where: \.unread)?.subject.nilIfEmpty
+        return [label, first].compactMap { $0 }.joined(separator: " · ")
+    }
 
     private func presentExistingItem(id: String) {
         let openingState = store.workspace
@@ -2574,6 +2626,9 @@ struct MoreView: View {
         List {
             WorkspaceStatusBanner(openPairing: nil)
             Section("Workspace") {
+                NavigationLink { MailWorkspaceView() } label: {
+                    MoreDestinationRow(icon: "envelope.fill", color: .blue, title: "Email", detail: mailDetail)
+                }
                 NavigationLink { FinanceWorkspaceView() } label: {
                     MoreDestinationRow(icon: "wallet.bifold.fill", color: .green, title: "Finances", detail: financeDetail)
                 }
@@ -2602,13 +2657,19 @@ struct MoreView: View {
         guard store.finance.configured else { return "Set up Plaid on your Mac" }
         return "\(store.finance.banks.count) institutions · \(store.finance.transactions.count) recent transactions"
     }
+    private var mailDetail: String {
+        let gmail = store.integrations.gmail
+        guard gmail.connected else { return gmail.configured ? "Connect Gmail on your Mac" : "Set up Gmail on your Mac" }
+        let unread = gmail.unreadCount == 1 ? "1 unread recently" : "\(gmail.unreadCount) unread recently"
+        return [gmail.account?.nilIfEmpty, unread].compactMap { $0 }.joined(separator: " · ")
+    }
     private var writingDetail: String {
         guard store.writing.available else { return "Connect the site repository on your Mac" }
         return "\(store.writing.drafts.count) drafts · \(store.writing.entries.count) site entries"
     }
     private var connectionsDetail: String {
-        let count = [store.integrations.google.connected, store.integrations.todoist.connected].filter { $0 }.count
-        return count == 0 ? "Google Calendar and Todoist" : "\(count) of 2 connected"
+        let count = [store.integrations.google.connected, store.integrations.gmail.connected, store.integrations.todoist.connected].filter { $0 }.count
+        return count == 0 ? "Google Calendar, Gmail, and Todoist" : "\(count) of 3 connected"
     }
 }
 
@@ -2624,6 +2685,547 @@ private struct MoreDestinationRow: View {
                 Text(title).foregroundStyle(.primary)
                 Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
+        }
+    }
+}
+
+// MARK: - Mail
+
+private struct MailComposeDraft: Identifiable {
+    let id = UUID()
+    var to = ""
+    var cc = ""
+    var bcc = ""
+    var subject = ""
+    var body = ""
+    var replyToId: String?
+
+    static func reply(to message: RemoteMail) -> MailComposeDraft {
+        var draft = MailComposeDraft()
+        draft.to = message.replyTo
+        draft.subject = message.subject.lowercased().hasPrefix("re:")
+            ? message.subject
+            : "Re: \(message.subject.nilIfEmpty ?? "(no subject)")"
+        draft.replyToId = message.id
+        return draft
+    }
+}
+
+private struct MailSubmissionPayload: Equatable {
+    let to: [String]
+    let cc: [String]
+    let bcc: [String]
+    let subject: String
+    let body: String
+    let replyToId: String?
+}
+
+private struct MailSubmissionAttempt {
+    let payload: MailSubmissionPayload
+    let requestId: String
+}
+
+private struct MailWorkspaceView: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    @State private var composeDraft: MailComposeDraft?
+    @State private var messageToTrash: RemoteMail?
+    @State private var search = ""
+
+    private var messages: [RemoteMail] {
+        store.integrations.messages
+            .filter { message in
+                search.isEmpty
+                    || message.from.localizedCaseInsensitiveContains(search)
+                    || message.subject.localizedCaseInsensitiveContains(search)
+                    || message.snippet.localizedCaseInsensitiveContains(search)
+            }
+            .sorted { left, right in
+                if left.receivedAt != right.receivedAt { return left.receivedAt > right.receivedAt }
+                return left.id > right.id
+            }
+    }
+
+    var body: some View {
+        List {
+            WorkspaceStatusBanner(openPairing: nil)
+            EditorErrorSection(area: .integrations)
+
+            if !store.integrations.gmail.connected {
+                Section {
+                    Label(
+                        store.integrations.gmail.configured ? "Connect Gmail in Workspace on your Mac" : "Set up Gmail in Workspace on your Mac",
+                        systemImage: "desktopcomputer"
+                    )
+                    .font(.headline)
+                    Text("Google authorization stays on your Mac. Once connected, this iPhone receives only the mail view and actions through the private paired bridge.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Personal Gmail")
+                }
+            } else {
+                Section {
+                    if messages.isEmpty {
+                        EmptyRow(
+                            icon: "envelope.open",
+                            title: search.isEmpty ? "No messages in this view" : "No matching messages",
+                            detail: search.isEmpty ? "Pull to refresh when you want to check again." : "Try a sender, subject, or different phrase."
+                        )
+                    } else {
+                        ForEach(messages) { message in
+                            NavigationLink {
+                                MailMessageView(messageID: message.id) { current in
+                                    composeDraft = .reply(to: current)
+                                }
+                            } label: {
+                                MailMessageRow(message: message)
+                            }
+                            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                                Button {
+                                    mutate(message, message.unread ? .read : .unread)
+                                } label: {
+                                    Label(message.unread ? "Read" : "Unread", systemImage: message.unread ? "envelope.open" : "envelope.badge")
+                                }
+                                .tint(.blue)
+                                Button {
+                                    mutate(message, message.starred ? .unstar : .star)
+                                } label: {
+                                    Label(message.starred ? "Unstar" : "Star", systemImage: message.starred ? "star.slash" : "star")
+                                }
+                                .tint(.yellow)
+                            }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button {
+                                    mutate(message, .archive)
+                                } label: {
+                                    Label("Archive", systemImage: "archivebox")
+                                }
+                                .tint(.indigo)
+                                Button(role: .destructive) {
+                                    messageToTrash = message
+                                } label: {
+                                    Label("Trash", systemImage: "trash")
+                                }
+                            }
+                            .contextMenu {
+                                Button {
+                                    composeDraft = .reply(to: message)
+                                } label: {
+                                    Label("Reply", systemImage: "arrowshape.turn.up.left")
+                                }
+                                if let url = safeGmailURL(message.url) {
+                                    Link(destination: url) {
+                                        Label("Open in Gmail", systemImage: "arrow.up.right.square")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    HStack {
+                        Text("Inbox")
+                        Spacer()
+                        Text(unreadLabel)
+                    }
+                } footer: {
+                    if let account = store.integrations.gmail.account?.nilIfEmpty {
+                        Text(account)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Mail")
+        .searchable(text: $search, prompt: "Search loaded mail")
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    composeDraft = MailComposeDraft()
+                } label: {
+                    Label("Compose", systemImage: "square.and.pencil")
+                }
+                .disabled(!store.integrations.gmail.connected || store.isLoading(.integrations))
+
+                Button {
+                    Task { await store.refreshIntegrations() }
+                } label: {
+                    if store.isLoading(.integrations) { ProgressView() }
+                    else { Image(systemName: "arrow.clockwise") }
+                }
+                .disabled(!store.hasWorkspaceAccess || store.isLoading(.integrations))
+            }
+        }
+        .refreshable { await store.refreshIntegrations() }
+        .task { await store.load(.integrations) }
+        .sheet(item: $composeDraft) { draft in
+            MailComposeView(draft: draft)
+        }
+        .confirmationDialog(
+            messageToTrash.map { "Move “\($0.subject.nilIfEmpty ?? "this message")” to Trash?" } ?? "Move this message to Trash?",
+            isPresented: Binding(get: { messageToTrash != nil }, set: { if !$0 { messageToTrash = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Move to Gmail Trash", role: .destructive) {
+                guard let message = messageToTrash else { return }
+                messageToTrash = nil
+                mutate(message, .trash, confirm: true)
+            }
+            Button("Keep message", role: .cancel) { messageToTrash = nil }
+        } message: {
+            Text("This removes the message from the Inbox and moves it to Gmail Trash. Gmail controls when items in Trash are permanently deleted.")
+        }
+        .privacySensitive()
+    }
+
+    private var unreadLabel: String {
+        let count = store.integrations.gmail.unreadCount
+        return count == 1 ? "1 unread recently" : "\(count) unread recently"
+    }
+
+    private func mutate(_ message: RemoteMail, _ action: GmailMutationAction, confirm: Bool? = nil) {
+        Task {
+            await store.mutateGmail(GmailMutationRequest(
+                id: message.id,
+                version: message.version,
+                action: action,
+                confirm: confirm
+            ))
+        }
+    }
+}
+
+private struct MailMessageRow: View {
+    let message: RemoteMail
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Circle()
+                .fill(message.unread ? Color.blue : Color.clear)
+                .frame(width: 8, height: 8)
+                .padding(.top, 7)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(message.from.nilIfEmpty ?? "Unknown sender")
+                        .font(message.unread ? .subheadline.weight(.semibold) : .subheadline)
+                        .lineLimit(1)
+                    Spacer()
+                    Text(displayTimestamp(message.receivedAt))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 5) {
+                    Text(message.subject.nilIfEmpty ?? "(No subject)")
+                        .font(message.unread ? .body.weight(.semibold) : .body)
+                        .lineLimit(1)
+                    if message.important {
+                        Image(systemName: "tag.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                    if message.starred {
+                        Image(systemName: "star.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.yellow)
+                    }
+                }
+                Text(message.snippet.nilIfEmpty ?? "No preview available")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(message.unread ? "Unread" : "Read") message from \(message.from), subject \(message.subject)")
+    }
+}
+
+private struct MailMessageView: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    @Environment(\.dismiss) private var dismiss
+    let messageID: String
+    let reply: (RemoteMail) -> Void
+    @State private var confirmTrash = false
+
+    private var message: RemoteMail? {
+        store.integrations.messages.first { $0.id == messageID }
+    }
+
+    var body: some View {
+        Group {
+            if let message {
+                List {
+                    EditorErrorSection(area: .integrations)
+                    Section {
+                        LabeledContent("From", value: message.from.nilIfEmpty ?? "Unknown sender")
+                        LabeledContent("Received", value: displayTimestamp(message.receivedAt))
+                        LabeledContent("Status", value: message.unread ? "Unread" : "Read")
+                    } header: {
+                        Text(message.subject.nilIfEmpty ?? "(No subject)")
+                    }
+                    Section("Preview") {
+                        Text(message.snippet.nilIfEmpty ?? "No preview is available for this message.")
+                            .textSelection(.enabled)
+                    }
+                    Section("Actions") {
+                        Button {
+                            mutate(message, message.unread ? .read : .unread)
+                        } label: {
+                            Label(message.unread ? "Mark read" : "Mark unread", systemImage: message.unread ? "envelope.open" : "envelope.badge")
+                        }
+                        Button {
+                            mutate(message, message.starred ? .unstar : .star)
+                        } label: {
+                            Label(message.starred ? "Remove star" : "Add star", systemImage: message.starred ? "star.slash" : "star")
+                        }
+                        Button {
+                            Task {
+                                if await store.mutateGmail(GmailMutationRequest(id: message.id, version: message.version, action: .archive)) {
+                                    dismiss()
+                                }
+                            }
+                        } label: {
+                            Label("Archive", systemImage: "archivebox")
+                        }
+                        Button(role: .destructive) { confirmTrash = true } label: {
+                            Label("Move to Trash", systemImage: "trash")
+                        }
+                    }
+                    if let url = safeGmailURL(message.url) {
+                        Section {
+                            Link(destination: url) {
+                                Label("Open full message in Gmail", systemImage: "arrow.up.right.square")
+                            }
+                        } footer: {
+                            Text("Workspace keeps this view concise. Use Gmail for the full message, attachments, forwarding, and other mail tools.")
+                        }
+                    }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            reply(message)
+                        } label: {
+                            Label("Reply", systemImage: "arrowshape.turn.up.left")
+                        }
+                        .disabled(store.isLoading(.integrations))
+                    }
+                }
+            } else {
+                ContentUnavailableView(
+                    "Message no longer in Inbox",
+                    systemImage: "tray",
+                    description: Text("It may have been archived or moved to Trash. Refresh Mail to load the current Inbox.")
+                )
+            }
+        }
+        .navigationTitle("Message")
+        .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("Move this message to Trash?", isPresented: $confirmTrash, titleVisibility: .visible) {
+            Button("Move to Gmail Trash", role: .destructive) {
+                guard let message else { return }
+                Task {
+                    if await store.mutateGmail(GmailMutationRequest(
+                        id: message.id,
+                        version: message.version,
+                        action: .trash,
+                        confirm: true
+                    )) {
+                        dismiss()
+                    }
+                }
+            }
+            Button("Keep message", role: .cancel) { }
+        } message: {
+            Text("Gmail controls when items in Trash are permanently deleted.")
+        }
+        .privacySensitive()
+    }
+
+    private func mutate(_ message: RemoteMail, _ action: GmailMutationAction) {
+        Task {
+            await store.mutateGmail(GmailMutationRequest(id: message.id, version: message.version, action: action))
+        }
+    }
+}
+
+private struct MailComposeView: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var value: MailComposeDraft
+    @State private var confirmSend = false
+    @State private var lastSubmission: MailSubmissionAttempt?
+
+    init(draft: MailComposeDraft) {
+        _value = State(initialValue: draft)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                EditorErrorSection(area: .integrations)
+                Section {
+                    mailAddressField("To", text: $value.to)
+                        .disabled(value.replyToId != nil)
+                    mailAddressField("Cc", text: $value.cc)
+                    mailAddressField("Bcc", text: $value.bcc)
+                } header: {
+                    Text("Recipients")
+                } footer: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Separate addresses with commas. Up to 20 per field and 32 total.")
+                        if let recipientError {
+                            Text(recipientError).foregroundStyle(.orange)
+                        }
+                    }
+                }
+                Section {
+                    TextField("Subject", text: $value.subject, axis: .vertical)
+                        .lineLimit(1...4)
+                        .disabled(value.replyToId != nil)
+                } header: {
+                    Text("Subject")
+                } footer: {
+                    HStack {
+                        if let subjectError {
+                            Text(subjectError).foregroundStyle(.orange)
+                        }
+                        Spacer()
+                        Text("\(subjectLength.formatted()) / 998")
+                    }
+                }
+                Section {
+                    TextEditor(text: $value.body)
+                        .frame(minHeight: 220)
+                } header: {
+                    Text("Message")
+                } footer: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack {
+                            Text(value.replyToId == nil ? "This sends from your connected personal Gmail account." : "This reply stays in the original Gmail thread.")
+                            Spacer()
+                            Text("\(bodyLength.formatted()) / 50,000")
+                        }
+                        if let bodyError {
+                            Text(bodyError).foregroundStyle(.orange)
+                        }
+                    }
+                }
+            }
+            .disabled(store.isLoading(.integrations))
+            .navigationTitle(value.replyToId == nil ? "New Email" : "Reply")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(store.isLoading(.integrations))
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Send") { confirmSend = true }
+                        .fontWeight(.semibold)
+                        .disabled(!canSend || store.isLoading(.integrations))
+                }
+            }
+            .confirmationDialog("Send this email?", isPresented: $confirmSend, titleVisibility: .visible) {
+                Button("Send email") { send() }
+                Button("Keep editing", role: .cancel) { }
+            } message: {
+                Text("To: \(toRecipients.joined(separator: ", "))\nSubject: \(trimmedSubject)")
+            }
+            .interactiveDismissDisabled(store.isLoading(.integrations))
+        }
+        .privacySensitive()
+        .overlay {
+            if scenePhase != .active { WorkspacePrivacyCover() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { confirmSend = false }
+        }
+    }
+
+    @ViewBuilder
+    private func mailAddressField(_ label: String, text: Binding<String>) -> some View {
+        LabeledContent(label) {
+            TextField("email@example.com", text: text, axis: .vertical)
+                .multilineTextAlignment(.trailing)
+                .textInputAutocapitalization(.never)
+                .keyboardType(.emailAddress)
+                .autocorrectionDisabled()
+        }
+    }
+
+    private var toRecipients: [String] { parseMailRecipients(value.to) }
+    private var ccRecipients: [String] { parseMailRecipients(value.cc) }
+    private var bccRecipients: [String] { parseMailRecipients(value.bcc) }
+    private var trimmedSubject: String { value.subject.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var subjectLength: Int { trimmedSubject.utf16.count }
+    private var bodyLength: Int { value.body.utf16.count }
+
+    private var recipientError: String? {
+        if toRecipients.isEmpty { return "Add at least one To address." }
+        if toRecipients.count > 20 || ccRecipients.count > 20 || bccRecipients.count > 20 {
+            return "Each recipient field can contain at most 20 addresses."
+        }
+        let recipients = toRecipients + ccRecipients + bccRecipients
+        if recipients.count > 32 { return "A message can have at most 32 recipients." }
+        if recipients.contains(where: { !mailAddressIsValid($0) }) {
+            return "Check that every recipient is a complete email address."
+        }
+        if recipients.contains(where: { mailAddressUsesArtekDomain($0) }) {
+            return "Artek addresses are outside this personal workspace."
+        }
+        if Set(recipients.map { $0.lowercased() }).count != recipients.count {
+            return "List each recipient only once."
+        }
+        return nil
+    }
+
+    private var subjectError: String? {
+        if trimmedSubject.isEmpty { return "Add a subject." }
+        if value.subject.contains("\n") || value.subject.contains("\r") {
+            return "The subject must stay on one line."
+        }
+        if subjectLength > 998 { return "Shorten the subject to 998 characters." }
+        return nil
+    }
+
+    private var bodyError: String? {
+        bodyLength > 50_000 ? "Shorten the message to 50,000 characters." : nil
+    }
+
+    private var canSend: Bool {
+        recipientError == nil && subjectError == nil && bodyError == nil
+    }
+
+    private func send() {
+        let payload = MailSubmissionPayload(
+            to: toRecipients,
+            cc: ccRecipients,
+            bcc: bccRecipients,
+            subject: trimmedSubject,
+            body: value.body,
+            replyToId: value.replyToId
+        )
+        let requestId: String
+        if let lastSubmission, lastSubmission.payload == payload {
+            requestId = lastSubmission.requestId
+        } else {
+            requestId = UUID().uuidString.lowercased()
+            lastSubmission = MailSubmissionAttempt(payload: payload, requestId: requestId)
+        }
+        let request = GmailSendRequest(
+            requestId: requestId,
+            to: payload.to,
+            cc: payload.cc,
+            bcc: payload.bcc,
+            subject: payload.subject,
+            body: payload.body,
+            replyToId: payload.replyToId
+        )
+        Task {
+            if await store.sendGmail(request) { dismiss() }
         }
     }
 }
@@ -2898,6 +3500,7 @@ private struct ConnectionsView: View {
         List {
             Section("Providers") {
                 ConnectionProviderRow(name: "Google Calendar", symbol: "calendar", color: .blue, state: store.integrations.google)
+                GmailConnectionProviderRow(state: store.integrations.gmail)
                 ConnectionProviderRow(name: "Todoist", symbol: "checkmark.circle.fill", color: .red, state: store.integrations.todoist)
             }
             if !store.integrations.links.isEmpty {
@@ -2922,7 +3525,7 @@ private struct ConnectionsView: View {
                 }
             }
             Section {
-                Text("Connect providers, change credentials, and choose the Personal calendar and Todoist project from Workspace on your Mac.")
+                Text("Connect providers, change credentials, and choose the Personal calendar, Gmail account, and Todoist project from Workspace on your Mac.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -2952,6 +3555,31 @@ private struct ConnectionsView: View {
         case .goal: return store.climbing.goals.first(where: { $0.id == link.entityId })?.title ?? "Climbing goal"
         case .plan: return store.climbing.plans.first(where: { $0.id == link.entityId })?.title ?? "Climbing plan"
         }
+    }
+}
+
+private struct GmailConnectionProviderRow: View {
+    let state: GmailState
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "envelope.fill").foregroundStyle(.blue).frame(width: 24)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Gmail")
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(state.error == nil ? Color.secondary : Color.orange)
+            }
+            Spacer()
+            Image(systemName: state.connected ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(state.connected ? Color.green : Color.secondary)
+        }
+    }
+
+    private var detail: String {
+        if let error = state.error?.nilIfEmpty { return error }
+        if state.connected { return state.account?.nilIfEmpty ?? "Connected" }
+        return state.configured ? "Ready to connect on Mac" : "Set up on Mac"
     }
 }
 
@@ -3053,6 +3681,33 @@ private func displayTimestamp(_ value: String) -> String {
         date = formatter.date(from: value)
     }
     return date?.formatted(date: .abbreviated, time: .shortened) ?? value
+}
+
+private func safeGmailURL(_ value: String) -> URL? {
+    guard let url = URL(string: value),
+          url.scheme?.lowercased() == "https",
+          url.host?.lowercased() == "mail.google.com" else { return nil }
+    return url
+}
+
+private func parseMailRecipients(_ value: String) -> [String] {
+    value.components(separatedBy: CharacterSet(charactersIn: ",;\n"))
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+}
+
+private func mailAddressIsValid(_ value: String) -> Bool {
+    guard (3...320).contains(value.utf16.count),
+          !value.contains("\r"),
+          !value.contains("\n") else { return false }
+    let pattern = #"^(?!\.)(?!.*\.\.)([A-Z0-9_'+\-\.]*)[A-Z0-9_+-]@([A-Z0-9][A-Z0-9\-]*\.)+[A-Z]{2,}$"#
+    return value.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+}
+
+private func mailAddressUsesArtekDomain(_ value: String) -> Bool {
+    guard let at = value.lastIndex(of: "@") else { return false }
+    let domain = value[value.index(after: at)...].lowercased()
+    return domain == "artek.energy" || domain.hasSuffix(".artek.energy")
 }
 
 private func slugify(_ value: String) -> String {

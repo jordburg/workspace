@@ -270,7 +270,7 @@ final class WorkspaceStore: ObservableObject {
             integrations = try await client.send("v1/integrations/sync", input: request)
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
-            status = "Calendar and Todoist refreshed."
+            status = "Connected services refreshed."
             return true
         } catch {
             record(error, area: .integrations)
@@ -566,6 +566,47 @@ final class WorkspaceStore: ObservableObject {
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
             status = mutation.provider == .google ? "Calendar updated." : "Todoist updated."
+            return true
+        } catch {
+            record(error, area: .integrations)
+            return false
+        }
+    }
+
+    @discardableResult
+    func mutateGmail(_ mutation: GmailMutationRequest) async -> Bool {
+        guard begin(.integrations) else { return false }
+        defer { finish(.integrations) }
+        guard let client = workspaceClient(area: .integrations) else { return false }
+        do {
+            integrations = try await client.send("v1/integrations/gmail/mutate", input: mutation)
+            loadedAreas.insert(.integrations)
+            clearRecordedError(.integrations)
+            switch mutation.action {
+            case .read: status = "Message marked read."
+            case .unread: status = "Message marked unread."
+            case .star: status = "Message starred."
+            case .unstar: status = "Star removed."
+            case .archive: status = "Message archived."
+            case .trash: status = "Message moved to Trash."
+            }
+            return true
+        } catch {
+            record(error, area: .integrations)
+            return false
+        }
+    }
+
+    @discardableResult
+    func sendGmail(_ message: GmailSendRequest) async -> Bool {
+        guard begin(.integrations) else { return false }
+        defer { finish(.integrations) }
+        guard let client = workspaceClient(area: .integrations) else { return false }
+        do {
+            integrations = try await client.send("v1/integrations/gmail/send", input: message)
+            loadedAreas.insert(.integrations)
+            clearRecordedError(.integrations)
+            status = message.replyToId == nil ? "Email sent." : "Reply sent."
             return true
         } catch {
             record(error, area: .integrations)

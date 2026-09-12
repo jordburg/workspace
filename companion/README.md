@@ -1,6 +1,6 @@
 # Workspace for iPhone
 
-Workspace for iPhone is the native companion to the personal Workspace on your Mac. It presents the same daily planning, Climbing, Health, Finance, Writing, Google Calendar, and Todoist data through a direct local connection. The Mac remains the source of truth and no Workspace cloud service is involved.
+Workspace for iPhone is the native companion to the personal Workspace on your Mac. It presents the same daily planning, Climbing, Health, Finance, Writing, Google Calendar, Gmail, and Todoist data through a direct local connection. The Mac remains the source of truth and no Workspace cloud service is involved.
 
 ## What is available on iPhone
 
@@ -8,9 +8,9 @@ Workspace for iPhone is the native companion to the personal Workspace on your M
 - **Inbox** captures thoughts, turns them into priorities, and shows unscheduled Personal tasks from Todoist.
 - **Climbing** manages sessions, plans, goals, and versioned training routines. Plans can be linked to reviewed Calendar events, goal actions can be linked to reviewed Todoist tasks, and sessions can reference an Apple Health workout without changing it.
 - **Health** reads the Apple Health categories you allow, syncs recent summaries and detailed sleep data, imports older sleep history in batches, and asks for confirmation before saving a requested weight entry.
-- **More** shows Finance balances and transactions, edits local finance annotations, saves Writing drafts, shows provider status and climbing links, and manages pairing and sync.
+- **More** includes Mail for reviewing the bounded personal Gmail inbox, marking messages read, starring or archiving them, moving a message to Gmail Trash after confirmation, and composing or replying after an explicit Send action. It also shows Finance balances and transactions, edits local finance annotations, saves Writing drafts, shows provider status and climbing links, and manages pairing and sync.
 
-Plaid credentials and bank connection changes, Google OAuth, Todoist token setup, personal account/source selection, site export and recovery, and detailed sleep analysis remain in Workspace on the Mac. Bank transactions and Apple Health workouts are read-only. Writing on iPhone saves a Workspace draft; publishing to the site remains a separate, reviewable Mac action.
+Plaid credentials and bank connection changes, Google OAuth, Todoist token setup, personal account/source selection, site export and recovery, and detailed sleep analysis remain in Workspace on the Mac. Bank transactions and Apple Health workouts are read-only. Gmail actions pass through the paired Mac; the phone never receives provider credentials, and it has no permanent-delete or bulk-mail route. Writing on iPhone saves a Workspace draft; publishing to the site remains a separate, reviewable Mac action.
 
 ## Install
 
@@ -28,7 +28,7 @@ The project targets iOS 17 or later and has no third-party app dependencies. A f
 3. AirDrop the JSON file to the iPhone. In **More → Pairing & Sync**, choose the file. It expires after ten minutes and can be used once. Delete the transferred file after pairing.
 4. Return to Today or pull to refresh. The app can reach the Mac only while Workspace is running on the same network.
 
-Version 2 pairing explicitly grants this iPhone access to the personal Workspace areas exposed by the phone allowlist. Pairing replaces the previous phone token. An older version 1 Health pairing remains valid for Health sync only and cannot read planning, Climbing, Finance, Writing, Calendar, or Todoist data; download and import a new file to use those tabs.
+Version 2 pairing explicitly grants this iPhone access to the personal Workspace areas exposed by the phone allowlist. Pairing replaces the previous phone token. An older version 1 Health pairing remains valid for Health sync only and cannot read planning, Climbing, Finance, Writing, Calendar, Gmail, or Todoist data; download and import a new file to use those areas.
 
 If the connection fails, check that the Mac is awake, Workspace is running, the saved Wi-Fi IP is still current, and the network does not isolate devices. A changed IP, renewed certificate, expired certificate, revoked token, or disabled iPhone connection requires a new pairing.
 

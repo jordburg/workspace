@@ -7,12 +7,14 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 import { z } from "zod";
 import { daySchema } from "../lib/workspace.ts";
-import { emptySync, googleSources, todoistSources, personalProjects, normalizeTask, normalizeEvent, integrationLinkSchema, integrationLinksSchema, syncRequestSchema, PERSONAL_CALENDAR, type IntegrationLink, type SyncView, type Source, type RemoteTask, type RemoteEvent } from "../lib/integrations/model.ts";
+import { emptySync, googleSources, todoistSources, personalProjects, normalizeTask, normalizeEvent, integrationLinkSchema, integrationLinksSchema, syncRequestSchema, PERSONAL_CALENDAR, type IntegrationLink, type SyncView, type Source, type RemoteTask, type RemoteEvent, type RemoteMail } from "../lib/integrations/model.ts";
 import { StoreBusyError, withPrivateLock, writePrivateJson } from "./private-store.ts";
 
 const TODOIST = "https://api.todoist.com/api/v1";
 const GOOGLE = "https://www.googleapis.com/calendar/v3";
+const GMAIL = "https://gmail.googleapis.com/gmail/v1";
 const SCOPES = ["https://www.googleapis.com/auth/calendar.calendarlist.readonly", "https://www.googleapis.com/auth/calendar.events.owned"];
+export const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
 const tokenSchema=z.object({access_token:z.string().min(1),refresh_token:z.string().optional(),expires_in:z.number().positive(),scope:z.string().optional()});
 const clientSchema=z.object({installed:z.object({client_id:z.string().endsWith(".apps.googleusercontent.com"),client_secret:z.string().min(1)})});
 const timeSchema=z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
@@ -27,21 +29,36 @@ const mutationSchema=z.object({provider:z.enum(["todoist","google"]),action:z.en
   if(input.location!==undefined&&(input.provider!=="google"||!["create","update"].includes(input.action)))ctx.addIssue({code:"custom",path:["location"],message:"A location can be saved only on a Google Calendar event."});
 });
 type Mutation=z.infer<typeof mutationSchema>;
-type SecretState={version:1;view:SyncView;todoistToken?:string;googleClient?:{client_id:string;client_secret:string};googleTokens?:{accessToken:string;refreshToken:string;expiresAt:number};receipts:Record<string,{provider:string;id?:string}>;requests:Record<string,string>;detachedRequests:string[]};
+const gmailMutationSchema=z.object({id:z.string().min(1).max(500),version:z.string().min(1).max(10000),action:z.enum(["read","unread","star","unstar","archive","trash"]),requestId:z.string().uuid(),confirm:z.literal(true).optional()}).strict().superRefine((input,ctx)=>{if(input.action==="trash"&&input.confirm!==true)ctx.addIssue({code:"custom",path:["confirm"],message:"Confirm before moving this message to Trash."});});
+const artekDomain=(value:string)=>{const domain=value.toLowerCase().split("@").at(-1)||"";return domain==="artek.energy"||domain.endsWith(".artek.energy");};
+const emailAddressSchema=z.string().trim().min(3).max(320).email().refine(value=>!/[\r\n]/.test(value),"Invalid email address").transform(value=>value.toLowerCase()).refine(value=>!artekDomain(value),"Artek email addresses are outside this workspace.");
+const emailListSchema=z.array(emailAddressSchema).max(20);
+const gmailSendSchema=z.object({requestId:z.string().uuid(),confirm:z.literal(true),to:emailListSchema.min(1),cc:emailListSchema.optional().default([]),bcc:emailListSchema.optional().default([]),subject:z.string().trim().min(1).max(998).refine(value=>!/[\r\n]/.test(value),"Subject cannot contain line breaks."),body:z.string().max(50000),replyToId:z.string().min(1).max(500).optional()}).strict().superRefine((input,ctx)=>{const recipients=[...input.to,...input.cc,...input.bcc];if(recipients.length>32)ctx.addIssue({code:"custom",path:["to"],message:"A message can have at most 32 recipients."});if(new Set(recipients).size!==recipients.length)ctx.addIssue({code:"custom",path:["to"],message:"List each recipient only once."});});
+const gmailSyncSchema=z.union([z.object({}).strict(),syncRequestSchema]);
+const gmailHeaderSchema=z.object({name:z.string().max(100),value:z.string().max(10000)}).passthrough();
+const gmailMessageSchema=z.object({id:z.string().min(1).max(500),threadId:z.string().min(1).max(500),labelIds:z.array(z.string().max(500)).max(200).optional().default([]),snippet:z.string().max(10000).optional().default(""),historyId:z.string().max(1000).optional().default(""),internalDate:z.string().max(30).optional(),payload:z.object({headers:z.array(gmailHeaderSchema).max(200).optional().default([])}).passthrough().optional()}).passthrough();
+type GmailMutation=z.infer<typeof gmailMutationSchema>;
+type GmailSend=z.infer<typeof gmailSendSchema>;
+type StoredTokens={accessToken:string;refreshToken:string;expiresAt:number};
+type SecretState={version:1;view:SyncView;todoistToken?:string;googleClient?:{client_id:string;client_secret:string};googleTokens?:StoredTokens;gmailTokens?:StoredTokens;receipts:Record<string,{provider:string;id?:string}>;requests:Record<string,string>;detachedRequests:string[]};
 class PublicError extends Error { readonly status:number; constructor(message:string,status=400){super(message);this.status=status;} }
+class MissingRemoteError extends PublicError { constructor(){super("This item is no longer available. Refresh your workspace.",409);} }
+class UncertainRemoteError extends PublicError { constructor(){super("The service did not confirm this request. Refresh before retrying a change.",502);} }
 const cleanError=(err:unknown)=>err instanceof PublicError||err instanceof StoreBusyError?err.message:"The service could not be reached. Your last successful sync is still available. Try again.";
+const responseError=(response:Response)=>{if(response.status===412)return new PublicError("This event changed in Google Calendar. Close this editor, sync, and review the latest version before editing again.",409);if([401,403].includes(response.status))return new PublicError("This connection needs permission to read and edit the selected personal source. Reconnect the correct account.",401);if(response.status===429)return new PublicError("The service is limiting requests. Wait a moment before syncing again.",429);if(response.status===404)return new MissingRemoteError();return new PublicError(`The service rejected this request (${response.status}). Your draft has been kept.`,502);};
 
 export function createIntegrationService(directory:string, remoteFetch:typeof fetch=fetch) {
   const file=join(directory,"integrations.private.json");
-  const pending=new Map<string,{verifier:string;redirectUri:string;expires:number}>();
+  const pending=new Map<string,{provider:"google"|"gmail";verifier:string;redirectUri:string;expires:number}>();
   let queue:Promise<unknown>=Promise.resolve();
-  async function read():Promise<SecretState> {try {const data=JSON.parse(await readFile(file,"utf8")); if(data.version!==1 || !data.view || !data.receipts) throw new Error("Invalid integration data");data.requests ??= {};data.detachedRequests=z.array(z.string().uuid()).max(10000).parse(data.detachedRequests??[]);data.view.links=integrationLinksSchema.parse(data.view.links??[]);return data;} catch(err){if((err as NodeJS.ErrnoException).code==="ENOENT")return {version:1,view:emptySync(),receipts:{},requests:{},detachedRequests:[]};throw new PublicError("Connection data could not be read. It has been left untouched.",500);} }
+  async function read():Promise<SecretState> {try {const data=JSON.parse(await readFile(file,"utf8")); if(data.version!==1 || !data.view || !data.receipts) throw new Error("Invalid integration data");data.requests ??= {};data.detachedRequests=z.array(z.string().uuid()).max(10000).parse(data.detachedRequests??[]);data.view.links=integrationLinksSchema.parse(data.view.links??[]);const gmailConnected=!!data.googleClient&&!!data.gmailTokens;data.view.gmail={...emptySync().gmail,...(data.view.gmail??{}),configured:!!data.googleClient,connected:gmailConnected,account:gmailConnected?PERSONAL_CALENDAR:null,unreadCount:0};data.view.messages=gmailConnected?z.array(z.object({id:z.string(),threadId:z.string(),from:z.string(),replyTo:z.string(),subject:z.string(),snippet:z.string(),receivedAt:z.string(),unread:z.boolean(),starred:z.boolean(),important:z.boolean(),version:z.string(),url:z.string()}).strict()).max(40).parse(data.view.messages??[]):[];data.view.gmail.unreadCount=data.view.messages.filter((message:RemoteMail)=>message.unread).length;return data;} catch(err){if((err as NodeJS.ErrnoException).code==="ENOENT")return {version:1,view:emptySync(),receipts:{},requests:{},detachedRequests:[]};throw new PublicError("Connection data could not be read. It has been left untouched.",500);} }
   const write=(state:SecretState)=>writePrivateJson(file,state);
   const exclusive=<T>(action:()=>Promise<T>):Promise<T>=>{const next=queue.catch(()=>{}).then(()=>withPrivateLock(file,action));queue=next;return next;};
   async function request(url:string,token:string,options:RequestInit={}) {
     let response:Response;
-    try{response=await remoteFetch(url,{...options,headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json",...options.headers},signal:AbortSignal.timeout(20000)});}catch{throw new PublicError("The service did not confirm this request. Refresh before retrying a change.",502);}
-    if(!response.ok) {if(response.status===412)throw new PublicError("This event changed in Google Calendar. Close this editor, sync, and review the latest version before editing again.",409);if([401,403].includes(response.status))throw new PublicError("This connection needs permission to read and edit the selected personal source. Reconnect the correct account.",401);if(response.status===429)throw new PublicError("The service is limiting requests. Wait a moment before syncing again.",429);if(response.status===404)throw new PublicError("This item is no longer available. Refresh your workspace.",409);throw new PublicError(`The service rejected this request (${response.status}). Your draft has been kept.`,502);}
+    const signal=options.signal?AbortSignal.any([options.signal,AbortSignal.timeout(20000)]):AbortSignal.timeout(20000);
+    try{response=await remoteFetch(url,{...options,headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json",...options.headers},signal});}catch{throw new UncertainRemoteError();}
+    if(!response.ok)throw responseError(response);
     const text=await response.text();return text?JSON.parse(text):null;
   }
   async function todoistPages(path:string,token:string) {const results:unknown[]=[];let cursor:string|null=null;const seen=new Set<string>();do {const url=new URL(TODOIST+path);url.searchParams.set("limit","200");if(cursor)url.searchParams.set("cursor",cursor);const data=await request(url.href,token);if(!Array.isArray(data.results))throw new PublicError("Todoist returned an unexpected response. Nothing was replaced.",502);results.push(...data.results);cursor=data.next_cursor || null;if(cursor && (seen.has(cursor)||seen.size>300))throw new PublicError("Todoist pagination did not finish. Nothing was replaced.",502);if(cursor)seen.add(cursor);}while(cursor);return results;}
@@ -53,12 +70,64 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
     if(!response.ok)throw new PublicError("Google authorization expired or was revoked. Reconnect Google Calendar.",401);
     const token=tokenSchema.parse(await response.json());state.googleTokens={accessToken:token.access_token,refreshToken:token.refresh_token||state.googleTokens.refreshToken,expiresAt:Date.now()+token.expires_in*1000};return token.access_token;
   }
+  async function gmailToken(state:SecretState,deadline?:AbortSignal) {
+    if(!state.googleClient || !state.gmailTokens)throw new PublicError("Connect your personal Gmail account first.");
+    if(state.gmailTokens.expiresAt>Date.now()+60000)return state.gmailTokens.accessToken;
+    const response=await remoteFetch("https://oauth2.googleapis.com/token",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({grant_type:"refresh_token",refresh_token:state.gmailTokens.refreshToken,...state.googleClient}),signal:deadline?AbortSignal.any([deadline,AbortSignal.timeout(20000)]):AbortSignal.timeout(20000)});
+    if(!response.ok)throw new PublicError("Gmail authorization expired or was revoked. Reconnect Gmail.",401);
+    const token=tokenSchema.parse(await response.json());state.gmailTokens={accessToken:token.access_token,refreshToken:token.refresh_token||state.gmailTokens.refreshToken,expiresAt:Date.now()+token.expires_in*1000};return token.access_token;
+  }
   async function personalGoogle(token:string):Promise<Source> {
     const calendar=await request(`${GOOGLE}/users/me/calendarList/primary`,token);
     if(calendar.id!==PERSONAL_CALENDAR || calendar.accessRole!=="owner")throw new PublicError(`Sign in as ${PERSONAL_CALENDAR}, which owns the personal calendar. The work account's shared access is not enough.`);
     return googleSources([calendar])[0];
   }
+  async function personalGmail(token:string,deadline?:AbortSignal):Promise<Source> {
+    const profile=z.object({emailAddress:z.string(),messagesTotal:z.number().optional(),threadsTotal:z.number().optional(),historyId:z.string().optional()}).passthrough().parse(await request(`${GMAIL}/users/me/profile`,token,{signal:deadline}));
+    if(profile.emailAddress.toLowerCase()!==PERSONAL_CALENDAR)throw new PublicError(`Sign in as ${PERSONAL_CALENDAR}. The work account is outside this workspace.`);
+    return {id:PERSONAL_CALENDAR,name:"Gmail",area:"personal",blocked:false};
+  }
   async function personalTodoist(token:string) {const sources=todoistSources(await todoistPages("/projects",token));const allowed=personalProjects(sources);if(!allowed.length)throw new PublicError("No Personal project was found in this Todoist account. Create it in Todoist or connect the account that contains it. Artek and Inbox will not be used.");return allowed;}
+  const headerValues=(headers:{name:string;value:string}[],name:string)=>headers.filter(header=>header.name.toLowerCase()===name.toLowerCase()).map(header=>header.value);
+  const headerValue=(headers:{name:string;value:string}[],name:string)=>headerValues(headers,name)[0]||"";
+  const cleanText=(value:string,max:number)=>value.replace(/[\u0000-\u001f\u007f]+/g," ").replace(/\s+/g," ").trim().slice(0,max);
+  const addresses=(value:string)=>[...value.matchAll(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+/gi)].map(match=>match[0].toLowerCase());
+  const isArtekAddress=(value:string)=>addresses(value).some(artekDomain);
+  const isArtekList=(value:string)=>addresses(value).some(artekDomain)||[...value.matchAll(/[A-Z0-9.-]+\.[A-Z]{2,}/gi)].some(match=>{const domain=match[0].toLowerCase();return domain==="artek.energy"||domain.endsWith(".artek.energy");});
+  async function gmailLabels(token:string,deadline?:AbortSignal):Promise<Set<string>> {
+    const data=z.object({labels:z.array(z.object({id:z.string().max(500),name:z.string().max(1000)}).passthrough()).max(10000).optional().default([])}).passthrough().parse(await request(`${GMAIL}/users/me/labels`,token,{signal:deadline}));
+    return new Set(data.labels.filter(label=>label.name.split("/").some(segment=>/^artek$/i.test(segment.trim()))).map(label=>label.id));
+  }
+  function normalizeMail(raw:unknown,blockedLabels:Set<string>,requireInbox=true):RemoteMail|null {
+    const message=gmailMessageSchema.parse(raw);const labels=new Set(message.labelIds);
+    if(requireInbox&&!labels.has("INBOX"))return null;
+    if(message.labelIds.some(label=>blockedLabels.has(label)))return null;
+    const headers=message.payload?.headers||[];const structured=["from","sender","reply-to","to","cc","bcc","resent-from","resent-to","resent-cc","return-path"];
+    if(structured.some(name=>headerValues(headers,name).some(isArtekAddress)))return null;
+    if(headerValues(headers,"list-id").some(isArtekList))return null;
+    const from=cleanText(headerValue(headers,"from")||"Unknown sender",500);
+    const replyCandidate=addresses(headerValue(headers,"reply-to")||headerValue(headers,"from"))[0]||"";const parsedReply=emailAddressSchema.safeParse(replyCandidate);const replyTo=parsedReply.success?parsedReply.data:"";
+    const subject=cleanText(headerValue(headers,"subject")||"(no subject)",998);
+    const internal=Number(message.internalDate);const headerDate=Date.parse(headerValue(headers,"date"));const candidate=Number.isFinite(internal)&&internal>=0?internal:Number.isFinite(headerDate)?headerDate:0;const milliseconds=candidate<=8.64e15?candidate:0;
+    const version=createHash("sha256").update(JSON.stringify([message.historyId,[...labels].sort()])).digest("hex");
+    return {id:message.id,threadId:message.threadId,from,replyTo,subject,snippet:cleanText(message.snippet,1000),receivedAt:new Date(milliseconds).toISOString(),unread:labels.has("UNREAD"),starred:labels.has("STARRED"),important:labels.has("IMPORTANT"),version,url:`https://mail.google.com/mail/u/0/#inbox/${encodeURIComponent(message.threadId)}`};
+  }
+  async function gmailMessage(token:string,id:string,deadline?:AbortSignal) {
+    const url=new URL(`${GMAIL}/users/me/messages/${encodeURIComponent(id)}`);url.searchParams.set("format","metadata");for(const name of ["From","Sender","Reply-To","To","Cc","Bcc","Resent-From","Resent-To","Resent-Cc","Return-Path","List-Id","Subject","Date","Message-ID","References","X-Workspace-Request-Hash"])url.searchParams.append("metadataHeaders",name);return request(url.href,token,{signal:deadline});
+  }
+  async function syncGmail(state:SecretState) {
+    if(!state.gmailTokens)return state.view;
+    try{
+      const deadline=AbortSignal.timeout(24000);const token=await gmailToken(state,deadline);const source=await personalGmail(token,deadline);const blockedLabels=await gmailLabels(token,deadline);
+      const url=new URL(`${GMAIL}/users/me/messages`);url.searchParams.append("labelIds","INBOX");url.searchParams.set("maxResults","50");
+      const data=z.object({messages:z.array(z.object({id:z.string().min(1).max(500),threadId:z.string().max(500).optional()}).passthrough()).max(500).optional().default([]),nextPageToken:z.string().max(2000).optional()}).passthrough().parse(await request(url.href,token,{signal:deadline}));
+      const candidates=data.messages.slice(0,50);const normalized=new Array<RemoteMail|null>(candidates.length).fill(null);let cursor=0;
+      const worker=async()=>{while(cursor<candidates.length){const index=cursor++;let raw:unknown;try{raw=await gmailMessage(token,candidates[index].id,deadline);}catch(err){if(err instanceof MissingRemoteError)continue;throw err;}normalized[index]=normalizeMail(raw,blockedLabels);}};
+      await Promise.all(Array.from({length:Math.min(6,candidates.length)},worker));const messages=normalized.filter((message):message is RemoteMail=>message!==null).slice(0,40);
+      state.view.messages=messages;state.view.gmail={connected:true,configured:true,sources:[source],selected:[{id:source.id,area:source.area}],account:PERSONAL_CALENDAR,unreadCount:messages.filter(message=>message.unread).length,lastSynced:new Date().toISOString(),error:null};
+    }catch(err){state.view.gmail.error=cleanError(err);}
+    return state.view;
+  }
   async function syncState(state:SecretState,date:string,timeZone:string) {
     const fromDate=new Date(`${date}T12:00:00Z`);fromDate.setUTCDate(fromDate.getUTCDate()-7);
     const toDate=new Date(`${date}T12:00:00Z`);toDate.setUTCDate(toDate.getUTCDate()+35);
@@ -76,6 +145,7 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
       const events=raw.map(event=>normalizeEvent(event,source,timeZone)).filter((e):e is RemoteEvent=>e!==null);
       state.view.events=events;state.view.range={from,to,timeZone};state.view.google={connected:true,configured:true,sources:[source],selected:[{id:source.id,area:source.area}],lastSynced:new Date().toISOString(),error:null};
     }catch(err){state.view.google.error=cleanError(err);}
+    await syncGmail(state);
     return state.view;
   }
   async function todoistCommand(token:string,command:object,uuid:string) {
@@ -107,6 +177,10 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
   }
   function checkLinkAvailability(state:SecretState,input:Mutation) {
     if(input.link&&linkConflict(state,input))throw linkConflictError(input.link.role);
+  }
+  function pruneRequests(state:SecretState) {
+    const linkedRequests=new Set(state.view.links.map(link=>link.requestId));const receiptKeys=Object.keys(state.receipts).filter(key=>!linkedRequests.has(key));for(const key of receiptKeys.slice(0,-1000)){delete state.receipts[key];delete state.requests[key];}
+    const unreceipted=Object.keys(state.requests).filter(key=>!linkedRequests.has(key)&&!state.receipts[key]);for(const key of unreceipted.slice(0,-1000))delete state.requests[key];
   }
   async function mutate(state:SecretState,input:Mutation) {
     const hash=createHash("sha256").update(JSON.stringify(input)).digest("hex");
@@ -178,24 +252,91 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
       state.receipts[input.requestId]??={provider:"google",id:input.id};if(input.action==="delete")state.view.events=state.view.events.filter(e=>e.id!==input.id);
     }
     ensureIntegrationLink(state,input);
-    const linkedRequests=new Set(state.view.links.map(link=>link.requestId));const receiptKeys=Object.keys(state.receipts).filter(key=>!linkedRequests.has(key));for(const key of receiptKeys.slice(0,-1000)){delete state.receipts[key];delete state.requests[key];}
+    pruneRequests(state);
+  }
+  const requestHash=(input:unknown)=>createHash("sha256").update(JSON.stringify(input)).digest("hex");
+  function beginGmailRequest(state:SecretState,requestId:string,input:unknown) {
+    const hash=requestHash(input);if(state.requests[requestId]&&state.requests[requestId]!==hash)throw new PublicError("This request was already used for a different Gmail action. Refresh and try again.",409);return hash;
+  }
+  async function mutateGmail(state:SecretState,input:GmailMutation) {
+    const existingHash=state.requests[input.requestId];const hash=beginGmailRequest(state,input.requestId,input);if(state.receipts[input.requestId]&&existingHash===hash)return;
+    let token:string;let blockedLabels:Set<string>;let raw:unknown;let current:RemoteMail;try{token=await gmailToken(state);await personalGmail(token);blockedLabels=await gmailLabels(token);raw=await gmailMessage(token,input.id);const normalized=normalizeMail(raw,blockedLabels,false);if(!normalized)throw new PublicError("This message is outside the personal Gmail connection.",403);current=normalized;}catch(err){if(!state.receipts[input.requestId]&&state.requests[input.requestId]){delete state.requests[input.requestId];await write(state);}throw err;}
+    const parsed=gmailMessageSchema.parse(raw);const labels=new Set(parsed.labelIds);const satisfied=input.action==="read"?!labels.has("UNREAD"):input.action==="unread"?labels.has("UNREAD"):input.action==="star"?labels.has("STARRED"):input.action==="unstar"?!labels.has("STARRED"):input.action==="archive"?!labels.has("INBOX"):labels.has("TRASH");
+    if(satisfied){state.requests[input.requestId]=hash;state.receipts[input.requestId]={provider:"gmail",id:input.id};const cached=normalizeMail(raw,blockedLabels);if(cached)state.view.messages=state.view.messages.map(message=>message.id===input.id?cached:message);else state.view.messages=state.view.messages.filter(message=>message.id!==input.id);state.view.gmail.unreadCount=state.view.messages.filter(message=>message.unread).length;pruneRequests(state);await write(state);await syncGmail(state);return;}
+    if(!labels.has("INBOX")){if(state.requests[input.requestId]){delete state.requests[input.requestId];await write(state);}throw new PublicError("This message is no longer in the personal inbox. Refresh before changing it.",409);}
+    if(current.version!==input.version){if(state.requests[input.requestId]){delete state.requests[input.requestId];await write(state);}throw new PublicError("This message changed in Gmail. Refresh the inbox before changing it.",409);}
+    let addLabelIds:string[]=[];let removeLabelIds:string[]=[];
+    if(input.action==="read"&&labels.has("UNREAD"))removeLabelIds=["UNREAD"];
+    if(input.action==="unread"&&!labels.has("UNREAD"))addLabelIds=["UNREAD"];
+    if(input.action==="star"&&!labels.has("STARRED"))addLabelIds=["STARRED"];
+    if(input.action==="unstar"&&labels.has("STARRED"))removeLabelIds=["STARRED"];
+    if(input.action==="archive"&&labels.has("INBOX"))removeLabelIds=["INBOX"];
+    state.requests[input.requestId]=hash;await write(state);let result:unknown=raw;
+    try{if(input.action==="trash")result=await request(`${GMAIL}/users/me/messages/${encodeURIComponent(input.id)}/trash`,token,{method:"POST"});else result=await request(`${GMAIL}/users/me/messages/${encodeURIComponent(input.id)}/modify`,token,{method:"POST",body:JSON.stringify({addLabelIds,removeLabelIds})});}catch(err){if(!(err instanceof UncertainRemoteError)){delete state.requests[input.requestId];await write(state);}throw err;}
+    state.receipts[input.requestId]={provider:"gmail",id:input.id};
+    if(input.action==="archive"||input.action==="trash")state.view.messages=state.view.messages.filter(message=>message.id!==input.id);
+    else {
+      const merged={...parsed,...(result&&typeof result==="object"?result:{}),payload:parsed.payload,snippet:parsed.snippet,internalDate:parsed.internalDate};const updated=normalizeMail(merged,blockedLabels);
+      if(updated)state.view.messages=state.view.messages.map(message=>message.id===input.id?updated:message);
+    }
+    state.view.gmail.unreadCount=state.view.messages.filter(message=>message.unread).length;pruneRequests(state);await write(state);await syncGmail(state);
+  }
+  const safeMessageId=(value:string)=>/^<[^<>\r\n]{1,480}>$/.test(value)?value:"";
+  const workspaceMessageId=(requestId:string)=>`<workspace.${requestId}@jordmburg-workspace.local>`;
+  async function recoverSentMessage(token:string,requestId:string,hash:string,knownBound:boolean):Promise<string|null> {
+    const expectedId=workspaceMessageId(requestId);const url=new URL(`${GMAIL}/users/me/messages`);url.searchParams.set("q",`rfc822msgid:${expectedId}`);url.searchParams.set("includeSpamTrash","true");url.searchParams.set("maxResults","10");
+    const data=z.object({messages:z.array(z.object({id:z.string().min(1).max(500)}).passthrough()).max(10).optional().default([])}).passthrough().parse(await request(url.href,token));let unresolved=false;
+    for(const item of data.messages){let raw;try{raw=gmailMessageSchema.parse(await gmailMessage(token,item.id));}catch(err){if(err instanceof MissingRemoteError)continue;throw err;}const headers=raw.payload?.headers||[];if(!raw.labelIds.includes("SENT")||safeMessageId(headerValue(headers,"message-id"))!==expectedId)continue;const savedHash=headerValue(headers,"x-workspace-request-hash");if(savedHash===hash)return raw.id;if(!savedHash&&knownBound)return raw.id;unresolved=true;}
+    if(unresolved)throw new PublicError("This request ID already belongs to a different or unverifiable sent message. Check Sent and start a fresh message.",409);return null;
+  }
+  function encodeSubject(value:string) {
+    if(/^[\x20-\x7e]*$/.test(value)&&value.length<=70)return value;
+    const chunks:string[]=[];let current="";for(const character of value){if(current&&Buffer.byteLength(current+character,"utf8")>42){chunks.push(current);current="";}current+=character;}if(current)chunks.push(current);
+    return chunks.map(chunk=>`=?UTF-8?B?${Buffer.from(chunk,"utf8").toString("base64")}?=`).join("\r\n ");
+  }
+  function mimeMessage(input:GmailSend,hash:string,reply?:{messageId:string;references:string[]}) {
+    const addressHeader=(name:string,values:string[])=>`${name}: ${values.join(",\r\n ")}`;const headers=[addressHeader("To",input.to)];if(input.cc.length)headers.push(addressHeader("Cc",input.cc));if(input.bcc.length)headers.push(addressHeader("Bcc",input.bcc));headers.push(`Subject: ${encodeSubject(input.subject)}`,`Message-ID: ${workspaceMessageId(input.requestId)}`,`X-Workspace-Request-Hash: ${hash}`);
+    if(reply){headers.push(`In-Reply-To: ${reply.messageId}`);const references=[...reply.references,reply.messageId].slice(-20);if(references.length)headers.push(`References: ${references.join("\r\n ")}`);}
+    headers.push("MIME-Version: 1.0","Content-Type: text/plain; charset=UTF-8","Content-Transfer-Encoding: base64");
+    const encodedBody=Buffer.from(input.body.replace(/\r?\n/g,"\r\n"),"utf8").toString("base64").replace(/.{1,76}/g,"$&\r\n").trimEnd();return `${headers.join("\r\n")}\r\n\r\n${encodedBody}`;
+  }
+  async function sendGmail(state:SecretState,input:GmailSend) {
+    const existingHash=state.requests[input.requestId];const hash=beginGmailRequest(state,input.requestId,input);const prior=state.receipts[input.requestId];if(prior&&existingHash===hash&&prior.provider!=="gmail-send-pending")return;
+    let token:string;try{token=await gmailToken(state);await personalGmail(token);const recovered=await recoverSentMessage(token,input.requestId,hash,existingHash===hash);if(recovered){state.requests[input.requestId]=hash;state.receipts[input.requestId]={provider:"gmail",id:recovered};pruneRequests(state);await write(state);return;}if(prior)throw new PublicError(prior.provider==="gmail-send-pending"?"Gmail may already have sent this message, but it is not searchable yet. Check Sent before starting a fresh send.":"This Gmail request ID is already in use. Check Sent and start a fresh message.",409);}catch(err){if(!prior&&state.requests[input.requestId]){delete state.requests[input.requestId];await write(state);}throw err;}
+    let threadId:string|undefined;let reply:undefined|{messageId:string;references:string[]};
+    try{if(input.replyToId){
+      const blockedLabels=await gmailLabels(token);const raw=gmailMessageSchema.parse(await gmailMessage(token,input.replyToId));const original=normalizeMail(raw,blockedLabels,false);if(!original)throw new PublicError("This message is outside the personal Gmail connection.",403);if(!original.replyTo)throw new PublicError("Gmail did not provide a safe reply address for this message.");
+      if(input.to.length!==1||input.to[0]!==original.replyTo)throw new PublicError("Refresh this message and use its displayed reply address before sending.",409);
+      const expectedSubject=/^re:/i.test(original.subject.trim())?original.subject.trim():`Re: ${original.subject.trim()}`;if(input.subject!==expectedSubject)throw new PublicError(`Use the reply subject “${expectedSubject}” so Gmail can keep this message in its thread.`,409);
+      const headers=raw.payload?.headers||[];const messageId=safeMessageId(headerValue(headers,"message-id"));if(!messageId)throw new PublicError("This message does not include a valid reply identifier. Open it in Gmail to reply.");
+      const references=[...headerValue(headers,"references").matchAll(/<[^<>\r\n]{1,480}>/g)].map(match=>match[0]);threadId=raw.threadId;reply={messageId,references};
+    }}catch(err){if(!prior&&state.requests[input.requestId]){delete state.requests[input.requestId];await write(state);}throw err;}
+    const raw=Buffer.from(mimeMessage(input,hash,reply),"utf8").toString("base64url");state.requests[input.requestId]=hash;state.receipts[input.requestId]={provider:"gmail-send-pending"};pruneRequests(state);await write(state);
+    let response:Response;try{response=await remoteFetch(`${GMAIL}/users/me/messages/send`,{method:"POST",headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify({raw,...(threadId?{threadId}:{})}),signal:AbortSignal.timeout(20000)});}catch{throw new PublicError("Gmail may already have sent this message. Check Sent before starting a fresh send.",409);}
+    if(!response.ok){delete state.receipts[input.requestId];delete state.requests[input.requestId];await write(state);throw responseError(response);}
+    let sent:{id:string;threadId?:string};try{sent=z.object({id:z.string().min(1),threadId:z.string().optional()}).passthrough().parse(await response.json());}catch{throw new PublicError("Gmail may already have sent this message. Check Sent before starting a fresh send.",409);}
+    state.receipts[input.requestId]={provider:"gmail",id:sent.id};pruneRequests(state);await write(state);await syncGmail(state);
   }
   async function handle(req:IncomingMessage,res:ServerResponse) {
     const host=req.headers.host||"";const url=new URL(req.url||"/",`http://${host||"localhost"}`);const path=url.pathname.replace(/^\/api\/integrations/,"") || "/";
     const send=(code:number,value:unknown)=>{res.statusCode=code;res.setHeader("Content-Type","application/json");res.setHeader("Cache-Control","no-store");res.end(JSON.stringify(value));};
     if(!/^(localhost|127\.0\.0\.1):\d+$/.test(host))return send(403,{error:"Only the local workspace can access connections."});
-    if(path==="/google/callback" && req.method==="GET") {
+    const callbackProvider=path==="/google/callback"?"google":path==="/gmail/callback"?"gmail":null;
+    if(callbackProvider && req.method==="GET") {
       const stateKey=url.searchParams.get("state")||"";const flow=pending.get(stateKey);pending.delete(stateKey);
-      if(!flow || flow.expires<Date.now())return send(400,{error:"This Google connection request expired. Start again from Connections."});
-      if(url.searchParams.has("error"))return send(400,{error:"Google connection was cancelled. You can return to your workspace."});
-      try {await exclusive(async()=>{const state=await read();if(!state.googleClient)throw new PublicError("Configure the Google client first.");const response=await remoteFetch("https://oauth2.googleapis.com/token",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({grant_type:"authorization_code",code:url.searchParams.get("code")||"",code_verifier:flow.verifier,redirect_uri:flow.redirectUri,...state.googleClient}),signal:AbortSignal.timeout(20000)});if(!response.ok)throw new PublicError("Google did not complete authorization. Try connecting again.");const token=tokenSchema.parse(await response.json());if(!SCOPES.every(scope=>token.scope?.split(" ").includes(scope)))throw new PublicError("Google did not grant the requested Calendar permissions.");await personalGoogle(token.access_token);if(!token.refresh_token)throw new PublicError("Google did not return offline access. Remove this app's old Google grant and reconnect.");state.googleTokens={accessToken:token.access_token,refreshToken:token.refresh_token,expiresAt:Date.now()+token.expires_in*1000};state.view.google.connected=true;state.view.google.configured=true;state.view.google.error=null;await write(state);});res.statusCode=302;res.setHeader("Location","/?connected=google");res.setHeader("Referrer-Policy","no-referrer");res.end();}catch(err){send(err instanceof PublicError?err.status:err instanceof StoreBusyError?423:500,{error:cleanError(err)});}return;
+      if(!flow || flow.provider!==callbackProvider || flow.expires<Date.now())return send(400,{error:`This ${callbackProvider==="gmail"?"Gmail":"Google"} connection request expired. Start again from Connections.`});
+      if(url.searchParams.has("error"))return send(400,{error:`${callbackProvider==="gmail"?"Gmail":"Google"} connection was cancelled. You can return to your workspace.`});
+      try {await exclusive(async()=>{const state=await read();if(!state.googleClient)throw new PublicError("Configure the Google client first.");const response=await remoteFetch("https://oauth2.googleapis.com/token",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({grant_type:"authorization_code",code:url.searchParams.get("code")||"",code_verifier:flow.verifier,redirect_uri:flow.redirectUri,...state.googleClient}),signal:AbortSignal.timeout(20000)});if(!response.ok)throw new PublicError(`${callbackProvider==="gmail"?"Gmail":"Google"} did not complete authorization. Try connecting again.`);const token=tokenSchema.parse(await response.json());const required=callbackProvider==="gmail"?[GMAIL_SCOPE]:SCOPES;if(!required.every(scope=>token.scope?.split(" ").includes(scope)))throw new PublicError(`${callbackProvider==="gmail"?"Gmail":"Google"} did not grant the requested ${callbackProvider==="gmail"?"mail":"Calendar"} permissions.`);
+        if(callbackProvider==="gmail"){await personalGmail(token.access_token);const refreshToken=token.refresh_token||state.gmailTokens?.refreshToken;if(!refreshToken)throw new PublicError("Gmail did not return offline access. Remove this app's old Google grant and reconnect.");state.gmailTokens={accessToken:token.access_token,refreshToken,expiresAt:Date.now()+token.expires_in*1000};state.view.gmail={...state.view.gmail,connected:true,configured:true,account:PERSONAL_CALENDAR,error:null};state.view.messages=[];}
+        else {await personalGoogle(token.access_token);const refreshToken=token.refresh_token||state.googleTokens?.refreshToken;if(!refreshToken)throw new PublicError("Google did not return offline access. Remove this app's old Google grant and reconnect.");state.googleTokens={accessToken:token.access_token,refreshToken,expiresAt:Date.now()+token.expires_in*1000};state.view.google.connected=true;state.view.google.configured=true;state.view.google.error=null;}
+        await write(state);});res.statusCode=302;res.setHeader("Location",`/?connected=${callbackProvider}`);res.setHeader("Referrer-Policy","no-referrer");res.end();}catch(err){send(err instanceof PublicError?err.status:err instanceof StoreBusyError?423:500,{error:cleanError(err)});}return;
     }
     if((req.headers.origin && req.headers.origin!==`http://${host}`) || req.headers["sec-fetch-site"]==="cross-site")return send(403,{error:"Open Connections from the local workspace."});
     if(req.method==="GET" && path==="/"){try{const state=await read();send(200,state.view);}catch(err){send(500,{error:cleanError(err)});}return;}
     if(req.method!=="POST")return send(405,{error:"Method not allowed"});
-    if(!req.headers["content-type"]?.startsWith("application/json"))return send(415,{error:"JSON is required"});
+    if(req.headers["content-type"]?.split(";",1)[0].trim().toLowerCase()!=="application/json")return send(415,{error:"JSON is required"});
     try{
-      const chunks:Buffer[]=[];let size=0;for await(const raw of req){const chunk=Buffer.from(raw);size+=chunk.length;if(size>64000)throw new PublicError("This request is too large.",413);chunks.push(chunk);}
+      const chunks:Buffer[]=[];let size=0;const maxRequestBytes=path==="/gmail/send"?256000:64000;for await(const raw of req){const chunk=Buffer.from(raw);size+=chunk.length;if(size>maxRequestBytes)throw new PublicError("This request is too large.",413);chunks.push(chunk);}
       const body=JSON.parse(Buffer.concat(chunks).toString("utf8")||"{}");
       const result=await exclusive(async()=>{
         const state=await read();
@@ -207,25 +348,46 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
           if(body && typeof body==="object" && "web" in body)throw new PublicError("This file is for a Web application client. Create an OAuth client with application type Desktop app in your personal Google Cloud project, then upload its JSON file. Your previously saved client has not been replaced.");
           const parsed=clientSchema.safeParse(body);
           if(!parsed.success)throw new PublicError("Choose the downloaded JSON file for a Google Desktop app OAuth client. This file was not saved; any previous client is still configured.");
-          const client=parsed.data.installed;state.googleClient=client;delete state.googleTokens;state.view.google={...emptySync().google,configured:true};state.view.events=[];await write(state);pending.clear();return state.view;
+          const client=parsed.data.installed;state.googleClient=client;delete state.googleTokens;delete state.gmailTokens;state.view.google={...emptySync().google,configured:true};state.view.gmail={...emptySync().gmail,configured:true};state.view.events=[];state.view.messages=[];await write(state);pending.clear();return state.view;
         }
         if(path==="/google/start"){
           if(!state.googleClient)throw new PublicError("Choose your Google Desktop OAuth client file first.");
           const stateKey=randomBytes(32).toString("base64url");const verifier=randomBytes(32).toString("base64url");const redirectUri=`http://127.0.0.1:${host.split(":")[1]}/api/integrations/google/callback`;
           for(const [key,flow] of pending)if(flow.expires<Date.now())pending.delete(key);
-          pending.set(stateKey,{verifier,redirectUri,expires:Date.now()+600000});
-          const query=new URLSearchParams({client_id:state.googleClient.client_id,redirect_uri:redirectUri,response_type:"code",scope:SCOPES.join(" "),state:stateKey,code_challenge:createHash("sha256").update(verifier).digest("base64url"),code_challenge_method:"S256",access_type:"offline",prompt:"consent",login_hint:PERSONAL_CALENDAR});
+          pending.set(stateKey,{provider:"google",verifier,redirectUri,expires:Date.now()+600000});
+          const query=new URLSearchParams({client_id:state.googleClient.client_id,redirect_uri:redirectUri,response_type:"code",scope:SCOPES.join(" "),state:stateKey,code_challenge:createHash("sha256").update(verifier).digest("base64url"),code_challenge_method:"S256",access_type:"offline",prompt:"consent",include_granted_scopes:"true",login_hint:PERSONAL_CALENDAR});
+          const authUrl=`https://accounts.google.com/o/oauth2/v2/auth?${query}`;
+          if(process.platform==="darwin" && remoteFetch===fetch)execFile("/usr/bin/open",[authUrl],()=>{});
+          return {url:authUrl};
+        }
+        if(path==="/gmail/start"){
+          if(!state.googleClient)throw new PublicError("Choose your Google Desktop OAuth client file first.");
+          const stateKey=randomBytes(32).toString("base64url");const verifier=randomBytes(32).toString("base64url");const redirectUri=`http://127.0.0.1:${host.split(":")[1]}/api/integrations/gmail/callback`;
+          for(const [key,flow] of pending)if(flow.expires<Date.now())pending.delete(key);
+          pending.set(stateKey,{provider:"gmail",verifier,redirectUri,expires:Date.now()+600000});
+          const query=new URLSearchParams({client_id:state.googleClient.client_id,redirect_uri:redirectUri,response_type:"code",scope:GMAIL_SCOPE,state:stateKey,code_challenge:createHash("sha256").update(verifier).digest("base64url"),code_challenge_method:"S256",access_type:"offline",prompt:"consent",include_granted_scopes:"true",login_hint:PERSONAL_CALENDAR});
           const authUrl=`https://accounts.google.com/o/oauth2/v2/auth?${query}`;
           if(process.platform==="darwin" && remoteFetch===fetch)execFile("/usr/bin/open",[authUrl],()=>{});
           return {url:authUrl};
         }
         if(path==="/disconnect"){
-          const provider=z.enum(["todoist","google"]).parse(body.provider);
-          if(provider==="todoist"){delete state.todoistToken;state.view.todoist=emptySync().todoist;state.view.tasks=[];}else{delete state.googleTokens;delete state.googleClient;state.view.google=emptySync().google;state.view.events=[];state.view.range=null;pending.clear();}
+          const provider=z.enum(["todoist","google","gmail"]).parse(body.provider);
+          if(provider==="todoist"){delete state.todoistToken;state.view.todoist=emptySync().todoist;state.view.tasks=[];}
+          else if(provider==="gmail"){delete state.gmailTokens;state.view.gmail={...emptySync().gmail,configured:!!state.googleClient};state.view.messages=[];for(const [key,flow] of pending)if(flow.provider==="gmail")pending.delete(key);}
+          else {delete state.googleTokens;state.view.google={...emptySync().google,configured:!!state.gmailTokens};state.view.events=[];state.view.range=null;for(const [key,flow] of pending)if(flow.provider==="google")pending.delete(key);if(!state.gmailTokens)delete state.googleClient;}
           await write(state);return state.view;
         }
         if(path==="/sync"){
           const input=syncRequestSchema.parse(body);await syncState(state,input.date,input.timeZone);await write(state);return state.view;
+        }
+        if(path==="/gmail/sync"){
+          gmailSyncSchema.parse(body);await syncGmail(state);await write(state);return state.view;
+        }
+        if(path==="/gmail/mutate"){
+          const input=gmailMutationSchema.parse(body);await mutateGmail(state,input);await write(state);return state.view;
+        }
+        if(path==="/gmail/send"){
+          const input=gmailSendSchema.parse(body);await sendGmail(state,input);await write(state);return state.view;
         }
         if(path==="/unlink"){
           const {id}=z.object({id:z.string().uuid()}).strict().parse(body);const link=state.view.links.find(item=>item.id===id);

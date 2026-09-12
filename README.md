@@ -39,7 +39,7 @@ The storage tests use disposable temporary directories. They cover persistence, 
 
 The page exposes optional WebMCP tools to read the selected day and open an unsaved item draft. A draft-start tool cannot overwrite an open editor or run during a save. Saving remains an explicit action in the editor.
 
-## Todoist and Google Calendar sync
+## Todoist, Google Calendar, and Gmail sync
 
 Open **Connect your apps** in the daily overview (or visit `http://127.0.0.1:5173/?connections=1`). These are connections owned by this local application; assistant connectors are not reused as application credentials.
 
@@ -47,6 +47,7 @@ Open **Connect your apps** in the daily overview (or visit `http://127.0.0.1:517
 
 - Todoist: the project named **Personal**, plus its descendants. Artek and all descendants of an Artek project are excluded. The app never falls back to Inbox when Personal is missing. Task and calendar titles are not used to infer scope.
 - Google Calendar: only **jordmburg@gmail.com**. Authorization must be through that Google account, with owner access to its primary calendar. Shared read access through the Artek account does not enable this integration.
+- Gmail: only **jordmburg@gmail.com**. Recent Inbox messages are cached as bounded plain-text summaries. Messages with `Artek` anywhere in their Gmail label path, or a structured address header from the Artek domain or one of its subdomains, are excluded before they are saved or returned. This keeps obvious work mail out; forwarded content without those signals cannot be classified reliably.
 - The app refreshes on opening a connected workspace, changing the selected day, after a write, and every five minutes while the page is visible. It is not a background service when the app is closed. Manual **Sync now** is also available.
 - Google fetches a rolling window around the selected date and expands recurring occurrences. Each provider replaces its cache only after every page succeeds; failures retain the last saved personal data. Removed or moved-out-of-scope Todoist projects are pruned when source metadata can be refreshed.
 
@@ -70,6 +71,16 @@ Requested scopes are `calendar.calendarlist.readonly` and `calendar.events.owned
 
 Use **Add event** for personal solo events. Click an imported event to edit its title, dates, or times. An edit to a recurring occurrence affects only that occurrence, never its parent series. Guest meetings, series masters, and special/locked events link to Google Calendar for editing. The app does not create guests or send invitation messages. Unchanged event time boundaries are preserved on title-only edits, and Google ETags protect updates/deletes against concurrent edits.
 
+### Connect Gmail
+
+Enable the **Gmail API** in the same dedicated personal Google Cloud project used for Calendar. The Desktop OAuth client file already saved in Workspace is reused, while Gmail receives its own optional authorization and token. In Connections, choose **Connect Gmail**, keep the local Workspace running, and authorize `jordmburg@gmail.com` in the browser.
+
+Gmail requests only `gmail.modify`, which Google documents for reading, composing, sending, and ordinary mailbox changes. It does not allow immediate permanent deletion. Workspace exposes a narrower set of actions: mark read or unread, star or unstar, archive, move to Gmail Trash, compose, and reply. See [Google's Gmail scope reference](https://developers.google.com/workspace/gmail/api/auth/scopes), [send method](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/send), and [Trash method](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/trash).
+
+Sending always begins as an editable Workspace draft and requires an explicit **Send** action. A reply keeps Gmail's original recipient, subject, and thread metadata. If Gmail may have accepted a send but the response is lost, Workspace refuses to send that request again and asks you to check Sent before starting a fresh draft. Mail deletion means moving one message to Gmail Trash; Workspace has no permanent-delete or bulk-delete route. HTML bodies, remote images, tracking pixels, and attachments are not fetched or rendered. Use **Open in Gmail** for the complete conversation and attachments.
+
+Google classifies `gmail.modify` as a restricted scope. A personal-use app can qualify for Google's verification exception, although an External project left in Testing still normally issues refresh tokens that expire after seven days. Move the OAuth project to Production when you want durable personal sync, and keep its user type External.
+
 ### Sync storage and conflicts
 
 Connection credentials, tokens, mutation receipts, cross-area links, and the imported cache are stored in `~/Data/personal-workspace/integrations.private.json`, with owner-only file permissions, outside the repository. The browser receives a sanitized connection view, never the saved tokens or OAuth client secret. **Disconnect** forgets the local connection and its cache; it does not revoke the provider's grant or change source records. Provider grants can be revoked in the provider's account settings.
@@ -78,7 +89,7 @@ Local priorities, notes, and plans continue to use `workspace.json` and stay loc
 
 Todoist commands use stable UUIDs for idempotency and source/version preflight checks. Todoist does not document atomic compare-and-swap for these task edits, so a narrow race between its preflight read and write remains possible. Google uses conditional `If-Match` writes. The integration store holds a cross-process lock for the full provider mutation and saves through a unique atomic temporary file, preventing two Workspace processes from losing receipts or creating competing links. When a conflict is reported, retain/copy the draft as needed, close the editor, sync, and review the latest version before editing again. A request ID is bound to one payload; changing a previously attempted draft requires a new edit. If `integrations.private.json.lock` remains after a stopped process, use the stopped-process/PID verification procedure in **Recovery** before removing that exact lock.
 
-Integration tests use simulated provider responses and isolated temporary data, including OAuth/PKCE, refresh, pagination, scope enforcement, recurring completion, stale revisions, preserved event boundaries, cross-process locking, linked-item repair, and cached-data retention. No real Todoist or Calendar records are mutated by tests. A live credential-based round trip remains necessary after connecting your accounts.
+Integration tests use simulated provider responses and isolated temporary data, including OAuth/PKCE, refresh, pagination, scope enforcement, recurring completion, stale revisions, preserved event boundaries, Gmail filtering and actions, cross-process locking, linked-item repair, and cached-data retention. No real Todoist, Calendar, or Gmail records are mutated by tests. A live credential-based round trip remains necessary after connecting your accounts.
 
 ## Finances
 
@@ -100,7 +111,7 @@ Open **Health → iPhone setup**. The native project and installation guide are 
 
 The app connects only while the Mac Workspace is running on the same private Wi-Fi. Its dedicated HTTPS listener uses a certificate pinned during pairing and a bearer token stored in the iPhone Keychain. The desktop web server, provider credentials, and private data files remain loopback-only. A new full-Workspace pairing is an explicit broader grant: existing Health-only tokens continue to sync Health but cannot read Daily, Climbing, Finance, Writing, Calendar, or Todoist data. Download a new pairing file after installing the expanded app.
 
-The first native client supports the daily overview and Inbox, local Workspace edits, Climbing records, Apple Health sync and confirmed weight entries, Finance summaries/annotations, Writing drafts, and the sanitized Google Calendar/Todoist views. Bank connection setup or removal, Plaid credential entry, Google OAuth configuration, Todoist token entry, site export/recovery, and long-form Sleep archive editing remain Mac actions for now.
+The first native client supports the daily overview and Inbox, local Workspace edits, Climbing records, Apple Health sync and confirmed weight entries, Finance summaries/annotations, Writing drafts, and the sanitized Google Calendar, Gmail, and Todoist views. Gmail messages can be triaged, moved to Trash, composed, and replied to through the paired Mac. Bank connection setup or removal, Plaid credential entry, Google OAuth configuration, Todoist token entry, site export/recovery, and long-form Sleep archive editing remain Mac actions for now.
 
 This Mac app cannot access HealthKit directly; Workspace for iPhone uses HealthKit with your selected permissions.
 

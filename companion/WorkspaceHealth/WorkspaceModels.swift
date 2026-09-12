@@ -883,7 +883,7 @@ struct WritingView: Codable, Equatable, Sendable {
     static let empty = WritingView(repository: "", available: false, error: nil, entries: [], drafts: [], pendingExports: [])
 }
 
-// MARK: - Todoist and Google Calendar
+// MARK: - Connected services
 
 enum IntegrationProvider: String, Codable, CaseIterable, Hashable, Sendable {
     case todoist
@@ -946,6 +946,43 @@ struct IntegrationProviderState: Codable, Hashable, Sendable {
     var error: String?
 }
 
+struct GmailState: Codable, Hashable, Sendable {
+    var connected: Bool
+    var configured: Bool
+    var sources: [IntegrationSource]
+    var selected: [IntegrationSelection]
+    var account: String?
+    var lastSynced: String?
+    var error: String?
+    var unreadCount: Int
+
+    static let empty = GmailState(
+        connected: false,
+        configured: false,
+        sources: [],
+        selected: [],
+        account: nil,
+        lastSynced: nil,
+        error: nil,
+        unreadCount: 0
+    )
+}
+
+struct RemoteMail: Codable, Identifiable, Hashable, Sendable {
+    var id: String
+    var threadId: String
+    var from: String
+    var replyTo: String
+    var subject: String
+    var snippet: String
+    var receivedAt: String
+    var unread: Bool
+    var starred: Bool
+    var important: Bool
+    var version: String
+    var url: String
+}
+
 enum IntegrationEntityKind: String, Codable, Hashable, Sendable {
     case goal
     case plan
@@ -976,13 +1013,60 @@ struct IntegrationRange: Codable, Hashable, Sendable {
 struct IntegrationView: Codable, Equatable, Sendable {
     var todoist: IntegrationProviderState
     var google: IntegrationProviderState
+    var gmail: GmailState
     var tasks: [RemoteTask]
     var events: [RemoteEvent]
+    var messages: [RemoteMail]
     var links: [IntegrationLink]
     var range: IntegrationRange?
 
     static let emptyProvider = IntegrationProviderState(connected: false, configured: false, sources: [], selected: [], lastSynced: nil, error: nil)
-    static let empty = IntegrationView(todoist: emptyProvider, google: emptyProvider, tasks: [], events: [], links: [], range: nil)
+    static let empty = IntegrationView(
+        todoist: emptyProvider,
+        google: emptyProvider,
+        gmail: .empty,
+        tasks: [],
+        events: [],
+        messages: [],
+        links: [],
+        range: nil
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case todoist, google, gmail, tasks, events, messages, links, range
+    }
+
+    init(
+        todoist: IntegrationProviderState,
+        google: IntegrationProviderState,
+        gmail: GmailState,
+        tasks: [RemoteTask],
+        events: [RemoteEvent],
+        messages: [RemoteMail],
+        links: [IntegrationLink],
+        range: IntegrationRange?
+    ) {
+        self.todoist = todoist
+        self.google = google
+        self.gmail = gmail
+        self.tasks = tasks
+        self.events = events
+        self.messages = messages
+        self.links = links
+        self.range = range
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        todoist = try values.decodeIfPresent(IntegrationProviderState.self, forKey: .todoist) ?? Self.emptyProvider
+        google = try values.decodeIfPresent(IntegrationProviderState.self, forKey: .google) ?? Self.emptyProvider
+        gmail = try values.decodeIfPresent(GmailState.self, forKey: .gmail) ?? .empty
+        tasks = try values.decodeIfPresent([RemoteTask].self, forKey: .tasks) ?? []
+        events = try values.decodeIfPresent([RemoteEvent].self, forKey: .events) ?? []
+        messages = try values.decodeIfPresent([RemoteMail].self, forKey: .messages) ?? []
+        links = try values.decodeIfPresent([IntegrationLink].self, forKey: .links) ?? []
+        range = try values.decodeIfPresent(IntegrationRange.self, forKey: .range)
+    }
 }
 
 typealias SyncView = IntegrationView
@@ -1101,4 +1185,66 @@ struct IntegrationMutation: Codable, Hashable, Sendable {
 
 struct IntegrationUnlinkRequest: Codable, Hashable, Sendable {
     var id: String
+}
+
+enum GmailMutationAction: String, Codable, CaseIterable, Hashable, Sendable {
+    case read
+    case unread
+    case star
+    case unstar
+    case archive
+    case trash
+}
+
+struct GmailMutationRequest: Codable, Hashable, Sendable {
+    var id: String
+    var version: String
+    var action: GmailMutationAction
+    var requestId: String
+    var confirm: Bool?
+
+    init(
+        id: String,
+        version: String,
+        action: GmailMutationAction,
+        requestId: String = UUID().uuidString.lowercased(),
+        confirm: Bool? = nil
+    ) {
+        self.id = id
+        self.version = version
+        self.action = action
+        self.requestId = requestId
+        self.confirm = confirm
+    }
+}
+
+struct GmailSendRequest: Codable, Hashable, Sendable {
+    var requestId: String
+    var confirm: Bool
+    var to: [String]
+    var cc: [String]?
+    var bcc: [String]?
+    var subject: String
+    var body: String
+    var replyToId: String?
+
+    init(
+        requestId: String = UUID().uuidString.lowercased(),
+        confirm: Bool = true,
+        to: [String],
+        cc: [String] = [],
+        bcc: [String] = [],
+        subject: String,
+        body: String,
+        replyToId: String? = nil
+    ) {
+        self.requestId = requestId
+        self.confirm = confirm
+        self.to = to
+        self.cc = cc.isEmpty ? nil : cc
+        self.bcc = bcc.isEmpty ? nil : bcc
+        self.subject = subject
+        self.body = body
+        self.replyToId = replyToId
+    }
 }

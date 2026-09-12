@@ -35,6 +35,8 @@ const phoneWorkspaceRoutes:Record<string,{path:string;method:"GET"|"POST"|"PUT";
   "GET /v1/integrations":{path:"/api/integrations",method:"GET"},
   "POST /v1/integrations/sync":{path:"/api/integrations/sync",method:"POST",max:64_000},
   "POST /v1/integrations/mutate":{path:"/api/integrations/mutate",method:"POST",max:64_000},
+  "POST /v1/integrations/gmail/mutate":{path:"/api/integrations/gmail/mutate",method:"POST",max:64_000},
+  "POST /v1/integrations/gmail/send":{path:"/api/integrations/gmail/send",method:"POST",max:256_000},
   "POST /v1/integrations/unlink":{path:"/api/integrations/unlink",method:"POST",max:64_000},
   "GET /v1/health-view":{path:"/api/health",method:"GET"},
 };

@@ -6,8 +6,10 @@ export type LifeArea = "personal" | "independent";
 export type Source = { id: string; name: string; area: LifeArea; blocked: boolean; parentId?: string };
 export type RemoteTask = { id: string; sourceId: string; sourceName: string; title: string; area: LifeArea; dueDate: string | null; dueTime: string | null; deadline: string | null; recurring: boolean; priority: number; version: string; parentId: string | null; url: string };
 export type RemoteEvent = { id: string; sourceId: string; sourceName: string; title: string; area: LifeArea; startDate: string; endDate: string; startTime: string | null; endTime: string | null; allDay: boolean; version: string; editable: boolean; recurring: boolean; url: string; location: string };
+export type RemoteMail = { id: string; threadId: string; from: string; replyTo: string; subject: string; snippet: string; receivedAt: string; unread: boolean; starred: boolean; important: boolean; version: string; url: string };
 export type Selection = { id: string; area: LifeArea };
 export type ProviderState = { connected: boolean; configured: boolean; sources: Source[]; selected: Selection[]; lastSynced: string | null; error: string | null };
+export type GmailState = ProviderState & { account: string | null; unreadCount: number };
 export const integrationLinkSchema = z.object({
   id: z.string().uuid(), entityKind: z.enum(["goal", "plan"]), entityId: z.string().uuid(), role: z.enum(["goal-next-step", "scheduled-session"]),
   provider: z.enum(["todoist", "google"]), remoteId: z.string().min(1).max(500), requestId: z.string().uuid(), createdAt: z.string().datetime({ offset: true }),
@@ -25,12 +27,13 @@ export const integrationLinksSchema = z.array(integrationLinkSchema).max(10000).
   if (new Set(scheduledPlans).size !== scheduledPlans.length) ctx.addIssue({ code: "custom", message: "A climbing plan can link to only one Calendar event." });
 });
 export type IntegrationLink = z.infer<typeof integrationLinkSchema>;
-export type SyncView = { todoist: ProviderState; google: ProviderState; tasks: RemoteTask[]; events: RemoteEvent[]; links: IntegrationLink[]; range: { from: string; to: string; timeZone: string } | null };
+export type SyncView = { todoist: ProviderState; google: ProviderState; gmail: GmailState; tasks: RemoteTask[]; events: RemoteEvent[]; messages: RemoteMail[]; links: IntegrationLink[]; range: { from: string; to: string; timeZone: string } | null };
 export const selectionSchema = z.array(z.object({ id: z.string().min(1).max(500), area: z.enum(["personal", "independent"]) }).strict()).max(100).refine(items => new Set(items.map(i => i.id)).size === items.length, "Choose each source only once");
 export const syncRequestSchema = z.object({ date: daySchema, timeZone: z.string().min(1).max(100).refine(zone => { try { new Intl.DateTimeFormat("en", {timeZone: zone}); return true; } catch { return false; } }, "Invalid time zone") }).strict();
 export const isArtek = (name: string) => /artek/i.test(name);
 export const emptyProvider = (): ProviderState => ({connected:false,configured:false,sources:[],selected:[],lastSynced:null,error:null});
-export const emptySync = (): SyncView => ({todoist:emptyProvider(),google:emptyProvider(),tasks:[],events:[],links:[],range:null});
+export const emptyGmail = (): GmailState => ({...emptyProvider(),account:null,unreadCount:0});
+export const emptySync = (): SyncView => ({todoist:emptyProvider(),google:emptyProvider(),gmail:emptyGmail(),tasks:[],events:[],messages:[],links:[],range:null});
 
 const projectSchema = z.object({id:z.string(),name:z.string(),parent_id:z.string().nullable().optional()});
 export function todoistSources(raw: unknown[]): Source[] {
