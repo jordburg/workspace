@@ -11,7 +11,7 @@
 <key>LSRequiresIPhoneOS</key><true/>
 <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
 <key>UILaunchScreen</key><dict/>
-<key>NSHealthShareUsageDescription</key><string>Share your steps, sleep, workouts, resting heart rate, and weight with your personal workspace on your Mac.</string>
+<key>NSHealthShareUsageDescription</key><string>Share sleep stages, steps, workouts, resting heart rate, HRV, active energy, exercise minutes, respiratory rate, oxygen saturation, and weight with your personal workspace on your Mac.</string>
 <key>NSHealthUpdateUsageDescription</key><string>Save weight measurements you explicitly review and confirm from your personal workspace.</string>
 <key>NSLocalNetworkUsageDescription</key><string>Sync selected health data directly with your paired Mac on the same Wi-Fi using an encrypted connection.</string>
 <key>NSAppTransportSecurity</key><dict>

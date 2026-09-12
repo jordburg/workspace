@@ -1,4 +1,4 @@
-import { readFile, mkdir, open, rename } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes, createHash, randomUUID } from "node:crypto";
@@ -7,7 +7,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 import { z } from "zod";
 import { daySchema } from "../lib/workspace.ts";
-import { emptySync, googleSources, todoistSources, personalProjects, normalizeTask, normalizeEvent, syncRequestSchema, PERSONAL_CALENDAR, isArtek, type SyncView, type Source, type RemoteTask, type RemoteEvent } from "../lib/integrations/model.ts";
+import { emptySync, googleSources, todoistSources, personalProjects, normalizeTask, normalizeEvent, integrationLinkSchema, integrationLinksSchema, syncRequestSchema, PERSONAL_CALENDAR, isArtek, type IntegrationLink, type SyncView, type Source, type RemoteTask, type RemoteEvent } from "../lib/integrations/model.ts";
+import { StoreBusyError, withPrivateLock, writePrivateJson } from "./private-store.ts";
 
 const TODOIST = "https://api.todoist.com/api/v1";
 const GOOGLE = "https://www.googleapis.com/calendar/v3";
@@ -15,19 +16,28 @@ const SCOPES = ["https://www.googleapis.com/auth/calendar.calendarlist.readonly"
 const tokenSchema=z.object({access_token:z.string().min(1),refresh_token:z.string().optional(),expires_in:z.number().positive(),scope:z.string().optional()});
 const clientSchema=z.object({installed:z.object({client_id:z.string().endsWith(".apps.googleusercontent.com"),client_secret:z.string().min(1)})});
 const timeSchema=z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
-const mutationSchema=z.object({provider:z.enum(["todoist","google"]),action:z.enum(["create","update","delete","complete"]),id:z.string().max(500).optional(),version:z.string().max(10000).optional(),requestId:z.string().uuid(),sourceId:z.string().max(500).optional(),anchorDate:daySchema.optional(),title:z.string().trim().min(1).max(2000).optional(),date:daySchema.nullable().optional(),endDate:daySchema.optional(),time:timeSchema.nullable().optional(),endTime:timeSchema.nullable().optional(),allDay:z.boolean().optional(),timeZone:z.string().max(100)}).strict();
+const linkRequestSchema=z.object({entityKind:z.enum(["goal","plan"]),entityId:z.string().uuid(),role:z.enum(["goal-next-step","scheduled-session"])}).strict();
+const mutationSchema=z.object({provider:z.enum(["todoist","google"]),action:z.enum(["create","update","delete","complete"]),id:z.string().max(500).optional(),version:z.string().max(10000).optional(),requestId:z.string().uuid(),sourceId:z.string().max(500).optional(),anchorDate:daySchema.optional(),title:z.string().trim().min(1).max(2000).optional(),date:daySchema.nullable().optional(),endDate:daySchema.optional(),time:timeSchema.nullable().optional(),endTime:timeSchema.nullable().optional(),allDay:z.boolean().optional(),location:z.string().trim().max(1000).optional(),link:linkRequestSchema.optional(),timeZone:z.string().max(100)}).strict().superRefine((input,ctx)=>{
+  if(input.link && input.action!=="create")ctx.addIssue({code:"custom",path:["link"],message:"Integration links can be added only while creating an item."});
+  if(input.link){
+    const goalTask=input.provider==="todoist"&&input.link.entityKind==="goal"&&input.link.role==="goal-next-step";
+    const scheduledSession=input.provider==="google"&&input.link.entityKind==="plan"&&input.link.role==="scheduled-session";
+    if(!goalTask&&!scheduledSession)ctx.addIssue({code:"custom",path:["link"],message:"Choose the provider and role that match this linked Workspace item."});
+  }
+  if(input.location!==undefined&&(input.provider!=="google"||!["create","update"].includes(input.action)))ctx.addIssue({code:"custom",path:["location"],message:"A location can be saved only on a Google Calendar event."});
+});
 type Mutation=z.infer<typeof mutationSchema>;
-type SecretState={version:1;view:SyncView;todoistToken?:string;googleClient?:{client_id:string;client_secret:string};googleTokens?:{accessToken:string;refreshToken:string;expiresAt:number};receipts:Record<string,{provider:string;id?:string}>;requests:Record<string,string>};
+type SecretState={version:1;view:SyncView;todoistToken?:string;googleClient?:{client_id:string;client_secret:string};googleTokens?:{accessToken:string;refreshToken:string;expiresAt:number};receipts:Record<string,{provider:string;id?:string}>;requests:Record<string,string>;detachedRequests:string[]};
 class PublicError extends Error { readonly status:number; constructor(message:string,status=400){super(message);this.status=status;} }
-const cleanError=(err:unknown)=>err instanceof PublicError?err.message:"The service could not be reached. Your last successful sync is still available. Try again.";
+const cleanError=(err:unknown)=>err instanceof PublicError||err instanceof StoreBusyError?err.message:"The service could not be reached. Your last successful sync is still available. Try again.";
 
 export function createIntegrationService(directory:string, remoteFetch:typeof fetch=fetch) {
   const file=join(directory,"integrations.private.json");
   const pending=new Map<string,{verifier:string;redirectUri:string;expires:number}>();
   let queue:Promise<unknown>=Promise.resolve();
-  async function read():Promise<SecretState> {try {const data=JSON.parse(await readFile(file,"utf8")); if(data.version!==1 || !data.view || !data.receipts) throw new Error("Invalid integration data");data.requests ??= {};return data;} catch(err){if((err as NodeJS.ErrnoException).code==="ENOENT")return {version:1,view:emptySync(),receipts:{},requests:{}};throw new PublicError("Connection data could not be read. It has been left untouched.",500);} }
-  async function write(state:SecretState) {await mkdir(directory,{recursive:true,mode:0o700});const temp=await open(`${file}.tmp`,"w",0o600);try{await temp.writeFile(JSON.stringify(state));await temp.sync();}finally{await temp.close();}await rename(`${file}.tmp`,file);}
-  const exclusive=<T>(action:()=>Promise<T>):Promise<T>=>{const next=queue.catch(()=>{}).then(action);queue=next;return next;};
+  async function read():Promise<SecretState> {try {const data=JSON.parse(await readFile(file,"utf8")); if(data.version!==1 || !data.view || !data.receipts) throw new Error("Invalid integration data");data.requests ??= {};data.detachedRequests=z.array(z.string().uuid()).max(10000).parse(data.detachedRequests??[]);data.view.links=integrationLinksSchema.parse(data.view.links??[]);return data;} catch(err){if((err as NodeJS.ErrnoException).code==="ENOENT")return {version:1,view:emptySync(),receipts:{},requests:{},detachedRequests:[]};throw new PublicError("Connection data could not be read. It has been left untouched.",500);} }
+  const write=(state:SecretState)=>writePrivateJson(file,state);
+  const exclusive=<T>(action:()=>Promise<T>):Promise<T>=>{const next=queue.catch(()=>{}).then(()=>withPrivateLock(file,action));queue=next;return next;};
   async function request(url:string,token:string,options:RequestInit={}) {
     let response:Response;
     try{response=await remoteFetch(url,{...options,headers:{Authorization:`Bearer ${token}`,"Content-Type":"application/json",...options.headers},signal:AbortSignal.timeout(20000)});}catch{throw new PublicError("The service did not confirm this request. Refresh before retrying a change.",502);}
@@ -73,10 +83,28 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
     if(result.sync_status?.[uuid]!=="ok")throw new PublicError("Todoist did not apply this change. Refresh and review the task before trying again.",409);
     return result;
   }
+  function ensureIntegrationLink(state:SecretState,input:Mutation):IntegrationLink|null {
+    if(!input.link)return null;
+    const receipt=state.receipts[input.requestId];
+    if(!receipt?.id)throw new PublicError("The connected app saved the item but did not return its identifier. Retry this same request to finish linking it.",502);
+    const existing=state.view.links.find(link=>link.requestId===input.requestId);
+    if(existing){
+      if(existing.provider!==input.provider||existing.remoteId!==receipt.id||existing.entityKind!==input.link.entityKind||existing.entityId!==input.link.entityId||existing.role!==input.link.role)throw new PublicError("This integration request is already linked to a different item.",409);
+      return existing;
+    }
+    if(input.link.role==="scheduled-session"&&state.view.links.some(link=>link.role==="scheduled-session"&&link.entityId===input.link!.entityId))throw new PublicError("This climbing plan already has a Calendar event. Edit the linked event instead of creating another one.",409);
+    const link=integrationLinkSchema.parse({id:randomUUID(),...input.link,provider:input.provider,remoteId:receipt.id,requestId:input.requestId,createdAt:new Date().toISOString()});
+    state.view.links=integrationLinksSchema.parse([...state.view.links,link]);return link;
+  }
+  function checkLinkAvailability(state:SecretState,input:Mutation) {
+    if(input.link?.role==="scheduled-session"&&state.view.links.some(link=>link.role==="scheduled-session"&&link.entityId===input.link!.entityId&&link.requestId!==input.requestId))throw new PublicError("This climbing plan already has a Calendar event. Edit the linked event instead of creating another one.",409);
+  }
   async function mutate(state:SecretState,input:Mutation) {
     const hash=createHash("sha256").update(JSON.stringify(input)).digest("hex");
+    if(state.detachedRequests.includes(input.requestId))throw new PublicError("This integration request was detached. Start a fresh link from the climbing plan.",409);
     if(state.requests[input.requestId] && state.requests[input.requestId]!==hash)throw new PublicError("This request was already used for a different edit. Close the editor and start a fresh edit.",409);
-    if(state.receipts[input.requestId])return;
+    if(state.receipts[input.requestId]){ensureIntegrationLink(state,input);return;}
+    checkLinkAvailability(state,input);
     state.requests[input.requestId]=hash;await write(state);
     syncRequestSchema.parse({date:input.date || new Date().toISOString().slice(0,10),timeZone:input.timeZone});
     if(input.provider==="todoist"){
@@ -129,9 +157,10 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
         else {if(!input.time||!input.endTime || `${input.endDate}T${input.endTime}`<=`${input.date}T${input.time}`)throw new PublicError("End time must be after start time.");start={dateTime:`${input.date}T${input.time}:00`,timeZone:input.timeZone,...(event?.allDay?{date:null}:{})};end={dateTime:`${input.endDate}T${input.endTime}:00`,timeZone:input.timeZone,...(event?.allDay?{date:null}:{})};}
         const startChanged=!event||event.startDate!==input.date||event.allDay!==allDay||(!allDay&&event.startTime!==input.time);
         const endChanged=!event||event.endDate!==input.endDate||event.allDay!==allDay||(!allDay&&event.endTime!==input.endTime);
-        const body={summary:input.title,...(startChanged?{start}:{}),...(endChanged?{end}:{}),...(input.action==="create"?{id:input.requestId.replaceAll("-","")}:{})};
+        const locationChanged=input.location!==undefined&&(!event||event.location!==input.location);
+        const body={summary:input.title,...(startChanged?{start}:{}),...(endChanged?{end}:{}),...(locationChanged?{location:input.location}:{}),...(input.action==="create"?{id:input.requestId.replaceAll("-","")}:{})};
         if(input.action==="create"){
-          try{const existing=await request(`${base}/${input.requestId.replaceAll("-","")}`,token);const normalized=normalizeEvent(existing,source,input.timeZone);state.receipts[input.requestId]={provider:"google",id:existing.id};if(normalized)state.view.events=[...state.view.events.filter(e=>e.id!==existing.id),normalized];return;}catch(err){if(!(err instanceof PublicError) || err.status!==409)throw err;}
+          try{const existing=await request(`${base}/${input.requestId.replaceAll("-","")}`,token);const normalized=normalizeEvent(existing,source,input.timeZone);state.receipts[input.requestId]={provider:"google",id:existing.id};if(normalized)state.view.events=[...state.view.events.filter(e=>e.id!==existing.id),normalized];ensureIntegrationLink(state,input);return;}catch(err){if(!(err instanceof PublicError) || err.status!==409)throw err;}
         }
         const result=await request(input.action==="create"?`${base}?sendUpdates=none`:`${base}/${encodeURIComponent(input.id!)}?sendUpdates=none`,token,{method:input.action==="create"?"POST":"PATCH",headers,body:JSON.stringify(body)});
         state.receipts[input.requestId]={provider:"google",id:result.id};
@@ -139,7 +168,8 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
       }
       state.receipts[input.requestId]??={provider:"google",id:input.id};if(input.action==="delete")state.view.events=state.view.events.filter(e=>e.id!==input.id);
     }
-    const receiptKeys=Object.keys(state.receipts);for(const key of receiptKeys.slice(0,-1000)){delete state.receipts[key];delete state.requests[key];}
+    ensureIntegrationLink(state,input);
+    const linkedRequests=new Set(state.view.links.map(link=>link.requestId));const receiptKeys=Object.keys(state.receipts).filter(key=>!linkedRequests.has(key));for(const key of receiptKeys.slice(0,-1000)){delete state.receipts[key];delete state.requests[key];}
   }
   async function handle(req:IncomingMessage,res:ServerResponse) {
     const host=req.headers.host||"";const url=new URL(req.url||"/",`http://${host||"localhost"}`);const path=url.pathname.replace(/^\/api\/integrations/,"") || "/";
@@ -149,7 +179,7 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
       const stateKey=url.searchParams.get("state")||"";const flow=pending.get(stateKey);pending.delete(stateKey);
       if(!flow || flow.expires<Date.now())return send(400,{error:"This Google connection request expired. Start again from Connections."});
       if(url.searchParams.has("error"))return send(400,{error:"Google connection was cancelled. You can return to your workspace."});
-      try {await exclusive(async()=>{const state=await read();if(!state.googleClient)throw new PublicError("Configure the Google client first.");const response=await remoteFetch("https://oauth2.googleapis.com/token",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({grant_type:"authorization_code",code:url.searchParams.get("code")||"",code_verifier:flow.verifier,redirect_uri:flow.redirectUri,...state.googleClient}),signal:AbortSignal.timeout(20000)});if(!response.ok)throw new PublicError("Google did not complete authorization. Try connecting again.");const token=tokenSchema.parse(await response.json());if(!SCOPES.every(scope=>token.scope?.split(" ").includes(scope)))throw new PublicError("Google did not grant the requested Calendar permissions.");await personalGoogle(token.access_token);if(!token.refresh_token)throw new PublicError("Google did not return offline access. Remove this app's old Google grant and reconnect.");state.googleTokens={accessToken:token.access_token,refreshToken:token.refresh_token,expiresAt:Date.now()+token.expires_in*1000};state.view.google.connected=true;state.view.google.configured=true;state.view.google.error=null;await write(state);});res.statusCode=302;res.setHeader("Location","/?connected=google");res.setHeader("Referrer-Policy","no-referrer");res.end();}catch(err){send(err instanceof PublicError?err.status:500,{error:cleanError(err)});}return;
+      try {await exclusive(async()=>{const state=await read();if(!state.googleClient)throw new PublicError("Configure the Google client first.");const response=await remoteFetch("https://oauth2.googleapis.com/token",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({grant_type:"authorization_code",code:url.searchParams.get("code")||"",code_verifier:flow.verifier,redirect_uri:flow.redirectUri,...state.googleClient}),signal:AbortSignal.timeout(20000)});if(!response.ok)throw new PublicError("Google did not complete authorization. Try connecting again.");const token=tokenSchema.parse(await response.json());if(!SCOPES.every(scope=>token.scope?.split(" ").includes(scope)))throw new PublicError("Google did not grant the requested Calendar permissions.");await personalGoogle(token.access_token);if(!token.refresh_token)throw new PublicError("Google did not return offline access. Remove this app's old Google grant and reconnect.");state.googleTokens={accessToken:token.access_token,refreshToken:token.refresh_token,expiresAt:Date.now()+token.expires_in*1000};state.view.google.connected=true;state.view.google.configured=true;state.view.google.error=null;await write(state);});res.statusCode=302;res.setHeader("Location","/?connected=google");res.setHeader("Referrer-Policy","no-referrer");res.end();}catch(err){send(err instanceof PublicError?err.status:err instanceof StoreBusyError?423:500,{error:cleanError(err)});}return;
     }
     if((req.headers.origin && req.headers.origin!==`http://${host}`) || req.headers["sec-fetch-site"]==="cross-site")return send(403,{error:"Open Connections from the local workspace."});
     if(req.method==="GET" && path==="/"){try{const state=await read();send(200,state.view);}catch(err){send(500,{error:cleanError(err)});}return;}
@@ -188,12 +218,17 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
         if(path==="/sync"){
           const input=syncRequestSchema.parse(body);await syncState(state,input.date,input.timeZone);await write(state);return state.view;
         }
+        if(path==="/unlink"){
+          const {id}=z.object({id:z.string().uuid()}).strict().parse(body);const link=state.view.links.find(item=>item.id===id);
+          if(!link)throw new PublicError("This connection link is no longer available. Refresh the climbing plan.",409);
+          state.view.links=state.view.links.filter(item=>item.id!==id);state.detachedRequests=[...new Set([...state.detachedRequests,link.requestId])].slice(-10000);await write(state);return state.view;
+        }
         if(path==="/mutate"){
           const input=mutationSchema.parse(body);await mutate(state,input);await write(state);await syncState(state,input.anchorDate||input.date||new Date().toISOString().slice(0,10),input.timeZone);await write(state);return state.view;
         }
         throw new PublicError("Unknown connection action.",404);
       });send(200,result);
-    }catch(err){send(err instanceof PublicError?err.status:err instanceof z.ZodError?400:500,{error:err instanceof z.ZodError?"Check the connection file, dates, and required fields.":cleanError(err)});}
+    }catch(err){send(err instanceof PublicError?err.status:err instanceof StoreBusyError?423:err instanceof z.ZodError?400:500,{error:err instanceof z.ZodError?"Check the connection file, dates, and required fields.":cleanError(err)});}
   }
   return {handle};
 }

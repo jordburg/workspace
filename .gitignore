@@ -46,3 +46,9 @@ next-env.d.ts
 /work/
 
 *.tsbuildinfo
+
+# Personal Xcode state and generated companion builds
+**/xcuserdata/
+*.xcuserstate
+/companion/DerivedData/
+/companion/build/

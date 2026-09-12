@@ -10,6 +10,7 @@ import type { Plugin } from "vite";
 import { z } from "zod";
 import { healthSnapshotSchema, weightInputSchema, type HealthView, type HealthSnapshot, type WeightCommand } from "../lib/health.ts";
 import { withPrivateLock, writePrivateJson, StoreBusyError } from "./private-store.ts";
+import { emptySleep, mergeSleepBatch, sleepBatchSchema, sleepNoteInputSchema, sleepSettingsSchema, type SleepArchive } from "../lib/sleep.ts";
 
 type State={version:1;enabled:boolean;address?:string;tokenHash?:string;pairing?:{hash:string;expires:number};snapshot:HealthSnapshot|null;lastSynced:string|null;commands:WeightCommand[]};
 class HealthError extends Error {readonly status:number;constructor(message:string,status=400){super(message);this.status=status;}}
@@ -20,11 +21,13 @@ const errorMessage=(e:unknown)=>e instanceof HealthError||e instanceof StoreBusy
 
 export function createHealthService(directory:string,options:{addresses?:()=>string[];port?:number}={}){
   const file=join(directory,"health.private.json");const certificate=join(directory,"health-certificate.pem");const privateKey=join(directory,"health-key.pem");
+  const sleepFile=join(directory,"sleep.private.json");
   let server:Server|undefined;let endpoint:string|null=null;let runtimeError:string|null=null;let queue:Promise<unknown>=Promise.resolve();
   const addresses=options.addresses||lanAddresses;
   const exclusive=<T>(fn:()=>Promise<T>)=>{const next=queue.catch(()=>{}).then(()=>withPrivateLock(file,fn));queue=next;return next;};
   async function read():Promise<State>{try{const state=JSON.parse(await readFile(file,"utf8"));if(state.version!==1||!Array.isArray(state.commands)||typeof state.enabled!=="boolean")throw new Error();return state;}catch(e){if((e as NodeJS.ErrnoException).code==="ENOENT")return {version:1,enabled:false,snapshot:null,lastSynced:null,commands:[]};throw new HealthError("Saved health data could not be read. It has been left untouched.",500);}}
   const write=(s:State)=>writePrivateJson(file,s);
+  async function readSleep():Promise<SleepArchive>{try{const archive=JSON.parse(await readFile(sleepFile,"utf8"));if(archive.version!==1||!Array.isArray(archive.samples)||!Array.isArray(archive.days)||!Array.isArray(archive.notes)||!Array.isArray(archive.ranges)||!sleepSettingsSchema.safeParse(archive.settings).success)throw new Error();archive.settingsRevision??=0;return archive;}catch(e){if((e as NodeJS.ErrnoException).code==="ENOENT")return emptySleep();throw new HealthError("Saved sleep data could not be read. It has been left untouched.",500);}}
   function view(s:State):HealthView{return {enabled:s.enabled,online:!!server?.listening,paired:!!s.tokenHash,endpoint,addresses:addresses(),error:runtimeError,lastSynced:s.lastSynced,snapshot:s.snapshot,commands:s.commands};}
   async function generateCertificate(address:string){
     await mkdir(directory,{recursive:true,mode:0o700});const suffix=randomUUID();const key=`${privateKey}.${suffix}.tmp`;const cert=`${certificate}.${suffix}.tmp`;
@@ -43,11 +46,18 @@ export function createHealthService(directory:string,options:{addresses?:()=>str
       if(!matches(credential,initial.tokenHash))throw new HealthError("Pair this iPhone again.",401);
       if(path==="/commands"&&req.method==="GET"){send(res,200,{commands:initial.commands.filter(c=>c.status==="pending")});return;}
       if(req.method!=="POST")throw new HealthError("Unknown health endpoint.",404);
-      const input=await body(req);
+      const input=await body(req,path==="/sleep-batch"?20_000_000:2_000_000);
       const result=await exclusive(async()=>{const s=await read();if(!s.enabled||!matches(credential,s.tokenHash))throw new HealthError("Pair this iPhone again.",401);
         if(path==="/snapshot"){
           const snapshot=healthSnapshotSchema.parse(input);if(Date.parse(snapshot.generatedAt)>Date.now()+300000)throw new HealthError("Check the iPhone’s clock before syncing.");if(s.snapshot&&Date.parse(snapshot.generatedAt)<Date.parse(s.snapshot.generatedAt))throw new HealthError("A newer health snapshot is already saved.",409);
           s.snapshot=snapshot;s.lastSynced=new Date().toISOString();await write(s);return {saved:true};
+        }
+        if(path==="/sleep-batch"){
+          const batch=sleepBatchSchema.parse(input);
+          if(Date.parse(batch.generatedAt)>Date.now()+300000||Date.parse(batch.to)>Date.now()+86400000)throw new HealthError("Check the iPhone’s clock before syncing.");
+          const archive=await readSleep();let merged:SleepArchive;
+          try{merged=mergeSleepBatch(archive,batch);}catch(e){throw new HealthError((e as Error).message,409);}
+          await writePrivateJson(sleepFile,merged);return {saved:true};
         }
         if(path==="/receipt"){
           const receipt=z.object({id:z.string().uuid(),payloadHash:z.string().regex(/^[a-f0-9]{64}$/)}).strict().parse(input);const command=s.commands.find(c=>c.id===receipt.id);if(!command||command.payloadHash!==receipt.payloadHash)throw new HealthError("This health entry does not match the saved request.",409);command.status="applied";command.appliedAt??=new Date().toISOString();await write(s);return {saved:true};
@@ -58,22 +68,30 @@ export function createHealthService(directory:string,options:{addresses?:()=>str
   }
   async function stop(){const old=server;server=undefined;endpoint=null;if(old){old.closeAllConnections();await new Promise<void>(resolve=>old.close(()=>resolve()));}}
   async function start(s:State){
-    if(!s.enabled||!s.address)return;if(server?.listening)return;
+    if(!s.enabled||!s.address)return;if(server?.listening){runtimeError=null;return;}
     if(!addresses().includes(s.address))throw new HealthError("The Mac’s network address changed. Disable sync, then enable and pair again.");
     const cert=await readFile(certificate);const x509=new X509Certificate(cert);if(!x509.checkIP(s.address)||Date.parse(x509.validTo)<Date.now())throw new HealthError("The health certificate needs renewal. Disable sync, then enable and pair again.");
     const candidate=createServer({key:await readFile(privateKey),cert,minVersion:"TLSv1.2"},phone);candidate.requestTimeout=30000;candidate.headersTimeout=15000;candidate.maxRequestsPerSocket=50;
     try{await new Promise<void>((resolve,reject)=>{candidate.once("error",reject);candidate.listen(options.port??5174,s.address,()=>{candidate.removeListener("error",reject);resolve();});});candidate.on("error",()=>{runtimeError="The iPhone connection stopped. Disable and enable sync to retry.";});server=candidate;const address=candidate.address();endpoint=`https://${s.address}:${typeof address==="object"&&address?address.port:5174}`;runtimeError=null;}catch{candidate.close();throw new HealthError("The health connection could not listen on this address. Check the Wi-Fi connection and whether port 5174 is already in use.",503);}
   }
-  async function resume(){try{await start(await read());}catch(e){runtimeError=errorMessage(e);}}
+  async function resume(){try{await exclusive(async()=>start(await read()));}catch(e){runtimeError=errorMessage(e);}}
   async function handle(req:IncomingMessage,res:ServerResponse,next?:()=>void){
     if(!req.url?.startsWith("/api/health")){next?.();return;}
     const host=req.headers.host||"";if(!/^(localhost|127\.0\.0\.1):\d+$/.test(host)||(req.headers.origin&&req.headers.origin!==`http://${host}`)||req.headers["sec-fetch-site"]==="cross-site")return send(res,403,{error:"Open health settings from your local workspace."});
     const path=new URL(req.url,`http://${host}`).pathname.slice("/api/health".length)||"/";
     try{
       if(path==="/"&&req.method==="GET")return send(res,200,view(await read()));
-      if(req.method!=="POST")throw new HealthError("Method not allowed.",405);const input=await body(req,10000);
+      if(path==="/sleep"&&req.method==="GET")return send(res,200,await readSleep());
+      if(req.method!=="POST")throw new HealthError("Method not allowed.",405);const input=await body(req,path==="/sleep/note"?40000:10000);
       const result=await exclusive(async()=>{const s=await read();
+        if(path==="/sleep/settings"){const archive=await readSleep();const {revision,...settings}=sleepSettingsSchema.extend({revision:z.number().int().nonnegative()}).parse(input);if(revision!==archive.settingsRevision)throw new HealthError("Sleep settings changed in another window. Refresh to review the current settings before saving.",409);archive.settings=settings;archive.settingsRevision++;await writePrivateJson(sleepFile,archive);return {settings:archive.settings,settingsRevision:archive.settingsRevision};}
+        if(path==="/sleep/note"){
+          const note=sleepNoteInputSchema.parse(input);const archive=await readSleep();const old=archive.notes.find(n=>n.date===note.date);
+          if(note.revision!==(old?.revision||0))throw new HealthError("This note changed in another window. Your text is still here; reload the saved note before replacing it.",409);
+          const saved={...note,tags:[...new Set(note.tags)],revision:note.revision+1,updatedAt:new Date().toISOString()};archive.notes=[...archive.notes.filter(n=>n.date!==note.date),saved];await writePrivateJson(sleepFile,archive);return {note:saved};
+        }
         if(path==="/open-companion"){await promisify(execFile)("/usr/bin/open",[join(process.cwd(),"companion/WorkspaceHealth.xcodeproj")]);return {opened:true};}
+        if(path==="/retry"){await start(s);return view(s);}
         if(path==="/enable"){
           const {address}=z.object({address:z.string()}).strict().parse(input);if(!addresses().includes(address))throw new HealthError("Choose this Mac’s current Wi-Fi address.");if(s.enabled)throw new HealthError("Disable the existing iPhone connection before setting it up again.",409);
           await generateCertificate(address);s.address=address;s.enabled=true;delete s.tokenHash;delete s.pairing;await start(s);await write(s);return view(s);
@@ -92,4 +110,4 @@ export function createHealthService(directory:string,options:{addresses?:()=>str
   return {handle,resume,stop};
 }
 const hashBuffer=(value:Buffer)=>createHash("sha256").update(value).digest("hex");
-export function health():Plugin {const service=createHealthService(process.env.WORKSPACE_DATA_DIR||join(homedir(),"Data/personal-workspace"));return {name:"personal-health",configureServer(server){server.middlewares.use(service.handle);void service.resume();server.httpServer?.once("close",()=>{void service.stop();});}};}
+export function health():Plugin {const service=createHealthService(process.env.WORKSPACE_DATA_DIR||join(homedir(),"Data/personal-workspace"));return {name:"personal-health",configureServer(server){server.middlewares.use(service.handle);void service.resume();server.httpServer?.once("listening",()=>{void service.resume();});server.httpServer?.once("close",()=>{void service.stop();});}};}

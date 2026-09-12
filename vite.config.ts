@@ -1,6 +1,8 @@
 import vinext from "vinext";
+import { writing } from "./build/writing";
 import { finance } from "./build/finance";
 import { health } from "./build/health";
+import { climbing } from "./build/climbing";
 import { integrations } from "./build/integrations";
 import { localWorkspace } from "./build/local-workspace";
 import { defineConfig } from "vite";
@@ -62,7 +64,7 @@ export default defineConfig(async () => {
       ...(isCodexSeatbeltSandbox ? { watch: { useFsEvents: false, usePolling: true } } : {}),
     },
     plugins: [
-      ...(!managedLinux ? [localWorkspace(), integrations(), finance(), health()] : []),
+      ...(!managedLinux ? [localWorkspace(), integrations(), finance(), health(), writing(), climbing()] : []),
       vinext(),
       sites({ mockAuth: !managedLinux }),
       cloudflare({

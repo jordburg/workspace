@@ -10,6 +10,9 @@ import UniformTypeIdentifiers
     @Published var status = "Pair with your Mac to begin."
     @Published var error: String?
     @Published var dayCount = 0
+    @Published var sleepStatus = "Sleep history has not been imported in this session."
+    @Published var importingHistory = false
+    var cancelHistory = false
     let health = HealthStore()
     struct Saved: Decodable { let saved: Bool }
     struct Commands: Decodable { let commands: [WeightCommand] }
@@ -28,8 +31,13 @@ import UniformTypeIdentifiers
         guard !busy, let credentials else { return }; busy = true; error = nil; defer { busy = false }
         do {
             let client = try BridgeClient(credentials)
+            health.refreshCalendar()
             let snapshot = try await health.snapshot()
             let _: Saved = try await client.call("snapshot", body: bridgeEncoder().encode(snapshot))
+            let calendar = health.calendar, today = calendar.startOfDay(for: Date())
+            let batch = try await health.sleepBatch(from: calendar.date(byAdding: .day, value: -29, to: today)!, to: calendar.date(byAdding: .day, value: 1, to: today)!)
+            let _: Saved = try await client.call("sleep-batch", body: bridgeEncoder().encode(batch))
+            sleepStatus = "Recent sleep stages and daily context synced."
             let pending: Commands = try await client.call("commands")
             var review: [WeightCommand] = []
             for command in pending.commands {
@@ -41,6 +49,26 @@ import UniformTypeIdentifiers
             commands = review; dayCount = snapshot.days.count
             status = "Synced at \(Date().formatted(date: .omitted, time: .shortened))."
         } catch { self.error = error.localizedDescription }
+    }
+    func importHistory(from requested: Date) async {
+        guard !busy, let credentials else { return }; busy = true; importingHistory = true; cancelHistory = false; error = nil
+        defer { busy = false; importingHistory = false }
+        do {
+            health.refreshCalendar()
+            let client = try BridgeClient(credentials), calendar = health.calendar
+            var cursor = calendar.startOfDay(for: requested)
+            let end = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: Date()))!
+            while cursor < end && !cancelHistory {
+                let next = min(calendar.date(byAdding: .day, value: 30, to: cursor)!, end)
+                sleepStatus = "Importing \(cursor.formatted(date: .abbreviated, time: .omitted))…"
+                let batch = try await health.sleepBatch(from: cursor, to: next)
+                let _: Saved = try await client.call("sleep-batch", body: bridgeEncoder().encode(batch))
+                cursor = next
+                sleepStatus = "Saved history through \(next.addingTimeInterval(-1).formatted(date: .abbreviated, time: .omitted))."
+            }
+            if cancelHistory { sleepStatus += " Import stopped; completed ranges are kept." }
+            else { sleepStatus = "Sleep history imported. Open Sleep on your Mac." }
+        } catch { self.error = error.localizedDescription; sleepStatus += " Completed ranges are kept. Retrying is safe." }
     }
     func save(_ command: WeightCommand) async {
         guard !busy, var credentials else { return }; busy = true; error = nil; defer { busy = false }
@@ -60,11 +88,12 @@ struct HealthHome: View {
     @State private var importing = false
     @State private var selected: WeightCommand?
     @State private var confirmUnpair = false
+    @State private var historyFrom = Calendar.current.date(from: DateComponents(year: 2020, month: 1, day: 1))!
     var body: some View {
         NavigationStack {
             healthList
             .navigationTitle("Workspace Health")
-            .disabled(model.busy)
+            .toolbar { if model.importingHistory { Button("Stop import") { model.cancelHistory = true } } }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
                 switch result { case .success(let url): Task { await model.pair(url) }; case .failure(let error): model.error = error.localizedDescription }
             }
@@ -81,6 +110,7 @@ struct HealthHome: View {
         List {
             permissionsSection
             macSection
+            sleepSection
             if model.dayCount > 0 { Section { Text("Latest snapshot: \(model.dayCount) calendar days. Missing values mean no accessible data, not zero.") } }
             entriesSection
             if let error = model.error { Section { Text(error).foregroundStyle(.red) } }
@@ -90,8 +120,8 @@ struct HealthHome: View {
     private var permissionsSection: some View {
         Section {
             Label("Your health, in your workspace", systemImage: "heart.text.square.fill").font(.headline).foregroundStyle(.teal)
-            Text("Share steps, sleep, workouts, resting heart rate, and weight with your Mac. Only accessible data is included.")
-            Button("Review Health permissions") { Task { await model.authorize() } }
+            Text("Share steps, sleep stages, workouts, resting heart rate, HRV, active energy, exercise minutes, respiratory rate, oxygen saturation, and weight with your Mac. Only accessible data is included.")
+            Button("Review Health permissions") { Task { await model.authorize() } }.disabled(model.busy)
         }
     }
     private var macSection: some View {
@@ -99,13 +129,20 @@ struct HealthHome: View {
             if let credentials = model.credentials {
                 Label(credentials.url.host ?? "Paired Mac", systemImage: "desktopcomputer")
                 Text(model.status)
-                Button("Sync now", systemImage: "arrow.triangle.2.circlepath") { Task { await model.sync() } }
-                Button("Forget this pairing", role: .destructive) { confirmUnpair = true }
+                Button("Sync now", systemImage: "arrow.triangle.2.circlepath") { Task { await model.sync() } }.disabled(model.busy)
+                Button("Forget this pairing", role: .destructive) { confirmUnpair = true }.disabled(model.busy)
             } else {
                 Text("On your Mac, open Workspace → Health → iPhone setup. Enable sync and AirDrop the pairing file to this iPhone, then select it below.")
-                Button("Import pairing file", systemImage: "link") { importing = true }
+                Button("Import pairing file", systemImage: "link") { importing = true }.disabled(model.busy)
             }
         } header: { Text("Your Mac") } footer: { Text("The Mac must be awake with Workspace running, and both devices must be on the same Wi-Fi. Sync runs while this app is open. No background delivery is promised.") }
+    }
+    private var sleepSection: some View {
+        Section {
+            DatePicker("History from", selection: $historyFrom, in: Calendar.current.date(from: DateComponents(year: 2010, month: 1, day: 1))!...Date(), displayedComponents: .date).disabled(model.busy)
+            Button("Import sleep history", systemImage: "moon.zzz") { Task { await model.importHistory(from: historyFrom) } }.disabled(model.busy || model.credentials == nil)
+            Text(model.sleepStatus).font(.subheadline)
+        } header: { Text("Sleep history") } footer: { Text("Review Health permissions after updating this app. Regular sync refreshes 30 days; this imports older stages and daily context in batches. Keep the app open and your Mac awake. Import again to refresh older deletions or corrections. Unavailable readings remain missing.") }
     }
     @ViewBuilder private var entriesSection: some View {
         if !model.commands.isEmpty {
@@ -116,7 +153,7 @@ struct HealthHome: View {
                             Text("Weight · \(command.kg, specifier: "%.2f") kg")
                             Text(command.measuredAt.formatted()).font(.caption).foregroundStyle(.secondary)
                         }
-                    }
+                    }.disabled(model.busy)
                 }
             } header: { Text("Review entries from your Mac") } footer: { Text("Each measurement is saved only after you review and confirm it here.") }
         }

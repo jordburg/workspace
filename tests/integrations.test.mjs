@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { createIntegrationService } from '../build/integrations.ts';
-import { todoistSources, personalProjects, normalizeEvent, normalizeTask, eventOnDay, PERSONAL_CALENDAR } from '../lib/integrations/model.ts';
+import { integrationLinkSchema, todoistSources, personalProjects, normalizeEvent, eventOnDay, PERSONAL_CALENDAR } from '../lib/integrations/model.ts';
 
 const zone='America/Los_Angeles';
 const source={id:PERSONAL_CALENDAR,name:'Personal',area:'personal',blocked:false};
@@ -15,7 +15,7 @@ const baseTask={id:'task1',project_id:'personal',content:'Personal task',due:{da
 
 async function harness() {
   const directory=await mkdtemp(join(tmpdir(),'workspace-integration-test-'));
-  const remote={calls:[],task:{...baseTask},event:structuredClone(baseEvent),failTasks:false,failEvents:false,projects:[{id:'personal',name:'Personal'},{id:'learning',name:'Learning',parent_id:'personal'},{id:'work',name:'Artek'},{id:'work-child',name:'Personal',parent_id:'work'}],pagination:false,primaryId:PERSONAL_CALENDAR,tokenExchanges:[],commands:new Map(),googleWrites:[],todoistWrites:0};
+  const remote={calls:[],task:{...baseTask},event:structuredClone(baseEvent),failTasks:false,failEvents:false,projects:[{id:'personal',name:'Personal'},{id:'learning',name:'Learning',parent_id:'personal'},{id:'work',name:'Artek'},{id:'work-child',name:'Personal',parent_id:'work'}],pagination:false,primaryId:PERSONAL_CALENDAR,tokenExchanges:[],commands:new Map(),googleWrites:[],todoistWrites:0,mutationDelay:0};
   const json=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{'Content-Type':'application/json'}});
   const fakeFetch=async(input,options={})=>{
     const url=new URL(String(input));remote.calls.push({url:url.href,method:options.method||'GET'});
@@ -45,7 +45,7 @@ async function harness() {
         return json(remote.event);
       }
       if(/\/events\/[a-f0-9]{32}$/.test(url.pathname)&&method==='GET')return json({},404);
-      if(url.pathname.endsWith('/events')&&method==='POST'){const body=JSON.parse(options.body);remote.googleWrites.push(body);remote.event={...body,etag:'"created"',organizer:{self:true}};return json(remote.event);}
+      if(url.pathname.endsWith('/events')&&method==='POST'){if(remote.mutationDelay)await new Promise(resolve=>setTimeout(resolve,remote.mutationDelay));const body=JSON.parse(options.body);remote.googleWrites.push(body);remote.event={...body,etag:'"created"',organizer:{self:true}};return json(remote.event);}
     }
     throw new Error(`Unexpected mock endpoint: ${method} ${url}`);
   };
@@ -63,7 +63,7 @@ async function harness() {
     assert.equal(createHash('sha256').update(remote.tokenExchanges.at(-1).code_verifier).digest('base64url'),auth.searchParams.get('code_challenge'));
     assert.equal((await fetch(`${origin}/api/integrations/google/callback?state=${auth.searchParams.get('state')}&code=fake`,{redirect:'manual'})).status,400);
   }
-  return {remote,post,view,googleConnect,directory,origin,cleanup:async()=>{await new Promise(resolve=>server.close(resolve));await rm(directory,{recursive:true,force:true});}};
+  return {remote,fakeFetch,post,view,googleConnect,directory,origin,cleanup:async()=>{await new Promise(resolve=>server.close(resolve));await rm(directory,{recursive:true,force:true});}};
 }
 
 test('project boundaries and calendar day normalization',()=>{
@@ -115,6 +115,70 @@ test('Todoist sync and guarded write-back',async t=>{
   }finally{await h.cleanup();}
 });
 
+test('linked provider creates retain exact remote identities',async t=>{
+  await t.test('Todoist goal task persists its link across replay, sync, and disconnect',async()=>{
+    const h=await harness();try{
+      assert.equal((await h.post('/todoist/connect',{token:'linked-todoist-token-for-tests'})).status,200);
+      const entityId=randomUUID();const requestId=randomUUID();
+      const mutation={provider:'todoist',action:'create',sourceId:'personal',title:'[Climbing] Book a lead lesson',date:'2026-09-18',anchorDate:'2026-09-18',timeZone:zone,requestId,link:{entityKind:'goal',entityId,role:'goal-next-step'}};
+      const created=await h.post('/mutate',mutation);assert.equal(created.status,200);assert.equal(created.data.links.length,1);
+      const link=integrationLinkSchema.parse(created.data.links[0]);assert.deepEqual({...link,id:undefined,createdAt:undefined},{id:undefined,createdAt:undefined,entityKind:'goal',entityId,role:'goal-next-step',provider:'todoist',remoteId:'created-task',requestId});
+      const writes=h.remote.todoistWrites;const replay=await h.post('/mutate',mutation);assert.equal(replay.status,200);assert.equal(h.remote.todoistWrites,writes);assert.equal(replay.data.links[0].id,link.id);
+      const refreshed=await h.post('/sync',{date:'2026-09-18',timeZone:zone});assert.equal(refreshed.data.links[0].id,link.id);
+      const disconnected=await h.post('/disconnect',{provider:'todoist'});assert.equal(disconnected.status,200);assert.equal(disconnected.data.links[0].remoteId,'created-task');
+      const saved=JSON.parse(await readFile(join(h.directory,'integrations.private.json'),'utf8'));assert.equal(saved.receipts[requestId].id,'created-task');assert.equal(saved.view.links[0].id,link.id);
+    }finally{await h.cleanup();}
+  });
+  await t.test('Google scheduled session persists location and allows only one event per plan',async()=>{
+    const h=await harness();try{
+      await h.googleConnect();const entityId=randomUUID();const requestId=randomUUID();
+      const mutation={provider:'google',action:'create',title:'Climbing · Power session',date:'2026-09-19',endDate:'2026-09-19',time:'18:00',endTime:'19:30',allDay:false,location:'Movement Portland',anchorDate:'2026-09-19',timeZone:zone,requestId,link:{entityKind:'plan',entityId,role:'scheduled-session'}};
+      const created=await h.post('/mutate',mutation);assert.equal(created.status,200);assert.equal(h.remote.googleWrites.at(-1).location,'Movement Portland');
+      const link=integrationLinkSchema.parse(created.data.links[0]);assert.equal(link.remoteId,requestId.replaceAll('-',''));assert.equal(link.entityId,entityId);assert.equal(link.role,'scheduled-session');
+      const writes=h.remote.googleWrites.length;const replay=await h.post('/mutate',mutation);assert.equal(replay.status,200);assert.equal(h.remote.googleWrites.length,writes);assert.equal(replay.data.links[0].id,link.id);
+      const duplicate=await h.post('/mutate',{...mutation,requestId:randomUUID(),title:'Duplicate climbing block'});assert.equal(duplicate.status,409);assert.equal(h.remote.googleWrites.length,writes);
+      const detached=await h.post('/unlink',{id:link.id});assert.equal(detached.status,200);assert.deepEqual(detached.data.links,[]);
+      const retiredReplay=await h.post('/mutate',mutation);assert.equal(retiredReplay.status,409);assert.equal(h.remote.googleWrites.length,writes);
+      const replacement=await h.post('/mutate',{...mutation,requestId:randomUUID(),title:'Replacement climbing block'});assert.equal(replacement.status,200);assert.equal(replacement.data.links.length,1);assert.equal(h.remote.googleWrites.length,writes+1);
+      const disconnected=await h.post('/disconnect',{provider:'google'});assert.equal(disconnected.status,200);assert.equal(disconnected.data.links[0].id,replacement.data.links[0].id);
+    }finally{await h.cleanup();}
+  });
+});
+
+test('integration mutations use a cross-process lock around provider writes',async()=>{
+  const h=await harness();let second;try{
+    await h.googleConnect();h.remote.mutationDelay=75;
+    const service=createIntegrationService(h.directory,h.fakeFetch);second=createServer(service.handle);await new Promise(resolve=>second.listen(0,'127.0.0.1',resolve));
+    const secondOrigin=`http://127.0.0.1:${second.address().port}`;
+    const postSecond=async(path,body)=>{const response=await fetch(`${secondOrigin}/api/integrations${path}`,{method:'POST',headers:{'Content-Type':'application/json',Origin:secondOrigin},body:JSON.stringify(body)});return {status:response.status,data:await response.json()};};
+    const entityId=randomUUID();const common={provider:'google',action:'create',title:'Climbing · Locked plan',date:'2026-09-20',endDate:'2026-09-20',time:'10:00',endTime:'11:00',allDay:false,anchorDate:'2026-09-20',timeZone:zone,link:{entityKind:'plan',entityId,role:'scheduled-session'}};
+    const results=await Promise.all([h.post('/mutate',{...common,requestId:randomUUID()}),postSecond('/mutate',{...common,requestId:randomUUID()})]);
+    assert.deepEqual(results.map(result=>result.status).sort((a,b)=>a-b),[200,423]);
+    assert.equal(h.remote.googleWrites.length,1);
+    const saved=JSON.parse(await readFile(join(h.directory,'integrations.private.json'),'utf8'));assert.equal(saved.view.links.length,1);assert.equal(Object.keys(saved.receipts).length>0,true);
+  }finally{if(second)await new Promise(resolve=>second.close(resolve));await h.cleanup();}
+});
+
+test('integration link validation rejects mismatched or non-create mutations',async()=>{
+  const h=await harness();try{
+    const goal={entityKind:'goal',entityId:randomUUID(),role:'goal-next-step'};
+    const plan={entityKind:'plan',entityId:randomUUID(),role:'scheduled-session'};
+    assert.equal((await h.post('/mutate',{provider:'google',action:'create',requestId:randomUUID(),title:'Wrong provider',date:'2026-09-11',endDate:'2026-09-11',time:'09:00',endTime:'10:00',allDay:false,timeZone:zone,link:goal})).status,400);
+    assert.equal((await h.post('/mutate',{provider:'todoist',action:'create',requestId:randomUUID(),title:'Wrong provider',timeZone:zone,link:plan})).status,400);
+    assert.equal((await h.post('/mutate',{provider:'google',action:'update',id:'event1',version:'"v1"',requestId:randomUUID(),title:'Cannot add link',date:'2026-09-11',endDate:'2026-09-11',time:'09:00',endTime:'10:00',allDay:false,timeZone:zone,link:plan})).status,400);
+    assert.equal((await h.post('/mutate',{provider:'todoist',action:'create',requestId:randomUUID(),title:'No Todoist location',location:'Gym',timeZone:zone})).status,400);
+  }finally{await h.cleanup();}
+});
+
+test('saved integration views without links migrate to an empty link list',async()=>{
+  const h=await harness();try{
+    assert.equal((await h.post('/todoist/connect',{token:'migration-todoist-token-for-tests'})).status,200);
+    const path=join(h.directory,'integrations.private.json');const saved=JSON.parse(await readFile(path,'utf8'));delete saved.view.links;await writeFile(path,JSON.stringify(saved));
+    const migrated=await h.view();assert.deepEqual(migrated.links,[]);
+    const persisted=await h.post('/sync',{date:'2026-09-11',timeZone:zone});assert.deepEqual(persisted.data.links,[]);assert.deepEqual(JSON.parse(await readFile(path,'utf8')).view.links,[]);
+  }finally{await h.cleanup();}
+});
+
 test('Google client replacement rejects Web credentials and expires old authorization links',async()=>{
   const h=await harness();try{
     await h.googleConnect();
@@ -159,6 +223,10 @@ test('Google OAuth and precise calendar edits',async t=>{
     await t.test('converts timed events to all-day by clearing nested fields',async()=>{
       const event=(await h.view()).events[0];const result=await h.post('/mutate',{provider:'google',action:'update',id:event.id,version:event.version,title:event.title,date:'2026-09-11',endDate:'2026-09-12',time:null,endTime:null,allDay:true,timeZone:zone,requestId:randomUUID()});
       assert.equal(result.status,200);assert.deepEqual(h.remote.googleWrites.at(-1).start,{date:'2026-09-11',dateTime:null,timeZone:null});assert.equal(result.data.events[0].allDay,true);
+    });
+    await t.test('updates an event location without replacing its time boundaries',async()=>{
+      const event=(await h.view()).events[0];const result=await h.post('/mutate',{provider:'google',action:'update',id:event.id,version:event.version,title:event.title,date:event.startDate,endDate:event.endDate,time:null,endTime:null,allDay:true,location:'Portland Rock Gym',timeZone:zone,requestId:randomUUID()});
+      assert.equal(result.status,200);assert.deepEqual(h.remote.googleWrites.at(-1),{summary:event.title,location:'Portland Rock Gym'});assert.equal(result.data.events[0].location,'Portland Rock Gym');
     });
     await t.test('refuses stale versions, series masters, and guest meetings',async()=>{
       const event=(await h.view()).events[0];const base={provider:'google',action:'delete',id:event.id,version:event.version,timeZone:zone,requestId:randomUUID()};const writes=h.remote.googleWrites.length;

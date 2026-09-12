@@ -17,7 +17,7 @@ async function harness(){
     else if(path==='/item/public_token/exchange')result={item_id:input.public_token==='second-token'?'item2':'item1',access_token:'fake-bank-access'};
     else if(path==='/item/get')result={item:{institution_id:'institution1'}};
     else if(path==='/institutions/get_by_id')result={institution:{name:'Personal Bank'}};
-    else if(path==='/accounts/get'){if(state.failAccounts){status=400;result={error_code:'ITEM_LOGIN_REQUIRED'};}else result={accounts:[bankAccount('personal','Personal checking'),bankAccount('artek','Artek checking')]};}
+    else if(path==='/accounts/get'){if(state.failAccounts){status=400;result={error_code:'ITEM_LOGIN_REQUIRED'};}else result={accounts:[bankAccount('personal','Personal checking'),bankAccount('personal-two','Personal savings'),bankAccount('artek','Artek checking')]};}
     else if(path==='/transactions/sync'){
       assert.equal(input.options.account_id,'personal','only selected personal account may be fetched');
       if(state.failPage&&input.cursor==='partial'){status=400;result={error_code:'PRODUCT_NOT_READY'};}
@@ -34,7 +34,7 @@ async function harness(){
 }
 test('Finance normalizes unknown balances, refunds, currencies, and work exclusions',()=>{
   const a=normalizeAccount(bankAccount('work','Artek credit','credit'),new Set(['work']));assert.equal(a.blocked,true);assert.equal(a.current,null);
-  const totals=spendingByCurrency({transactions:[{...transaction('a'),id:'a',date:'2026-09-11',currency:'USD',category:'FOOD_AND_DRINK'},{id:'refund',date:'2026-09-11',amount:-4,currency:'USD',pending:false,category:'FOOD_AND_DRINK'},{id:'other',date:'2026-09-11',amount:8,currency:'CAD',category:'FOOD_AND_DRINK'},{id:'transfer',date:'2026-09-11',amount:100,currency:'USD',category:'TRANSFER_OUT'}],annotations:{}},'2026-09');
+  const totals=spendingByCurrency({transactions:[{...transaction('a'),id:'a',date:'2026-09-11',currency:'USD',category:'FOOD_AND_DRINK'},{id:'refund',date:'2026-09-11',amount:-4,currency:'USD',pending:false,category:'FOOD_AND_DRINK'},{id:'other',date:'2026-09-11',amount:8,currency:'CAD',category:'FOOD_AND_DRINK'},{id:'transfer',date:'2026-09-11',amount:100,currency:'USD',category:'TRANSFER_OUT'},{id:'loan',date:'2026-09-11',amount:-10000,currency:'USD',category:'LOAN_DISBURSEMENTS'}],annotations:{}},'2026-09');
   assert.deepEqual(totals,{USD:16,CAD:8});
 });
 test('Finance scopes account reads, preserves snapshots, and protects connection lifecycle',async()=>{
@@ -50,9 +50,9 @@ test('Finance scopes account reads, preserves snapshots, and protects connection
     assert.equal((await h.post('/annotate',{transactionId:'one',category:'Stale',note:'',excludeFromSpending:false,revision:0})).status,409);
     h.state.failPage=true;const failed=await h.post('/sync');assert.ok(failed.data.banks[0].error);assert.deepEqual(failed.data.transactions.map(t=>t.id),['one']);
     const saved=JSON.parse(await readFile(join(h.directory,'finance.private.json'),'utf8'));assert.equal(saved.items[0].cursors.personal,'cursor-complete');
-    h.state.failPage=false;h.state.changes=[{...transaction('posted'),pending_transaction_id:'one'}];const updated=await h.post('/sync');assert.equal(updated.data.annotations.posted.note,'Weekly shop');assert.equal(updated.data.annotations.one,undefined);
+    h.state.failPage=false;h.state.mutation=true;const restarted=await h.post('/sync');assert.equal(restarted.data.banks[0].error,null);assert.deepEqual(restarted.data.transactions.map(t=>t.id),['one']);h.state.changes=[{...transaction('posted'),pending_transaction_id:'one'}];const updated=await h.post('/sync');assert.equal(updated.data.annotations.posted.note,'Weekly shop');assert.equal(updated.data.annotations.one,undefined);
     await h.post('/exchange',{publicToken:'second-token'});assert.equal((await h.post('/accounts',{itemId:'item2',accountIds:['personal']})).status,409);
-    h.state.failAccounts=true;const cleared=await h.post('/accounts',{itemId:'item1',accountIds:[]});assert.equal(cleared.status,200);assert.equal(cleared.data.transactions.length,0);assert.deepEqual(cleared.data.annotations,{});
+    h.state.failAccounts=true;assert.equal((await h.post('/accounts',{itemId:'item1',accountIds:['personal-two']})).status,502);const afterFailedAddition=JSON.parse(await readFile(join(h.directory,'finance.private.json'),'utf8'));assert.equal(afterFailedAddition.items[0].transactions.length,0,'removals must persist even when additions cannot be checked');const cleared=await h.post('/accounts',{itemId:'item1',accountIds:[]});assert.equal(cleared.status,200);assert.equal(cleared.data.transactions.length,0);assert.deepEqual(cleared.data.annotations,{});
     h.state.failRemove=true;assert.equal((await h.post('/disconnect',{itemId:'item1'})).status,502);assert.equal(JSON.parse(await readFile(join(h.directory,'finance.private.json'),'utf8')).items.length,2);
     h.state.failRemove=false;assert.equal((await h.post('/disconnect',{itemId:'item1'})).status,200);assert.equal(h.state.removed,true);
     const blocked=await fetch(h.origin+'/api/finance',{headers:{Origin:'https://example.com'}});assert.equal(blocked.status,403);
