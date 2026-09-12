@@ -23,20 +23,20 @@ const matches=(value:string,expected?:string)=>!!expected&&expected.length===64&
 export const lanAddresses=()=>Object.values(networkInterfaces()).flatMap(entries=>entries||[]).filter(a=>a.family==="IPv4"&&!a.internal&&/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address)).map(a=>a.address).filter((a,i,all)=>all.indexOf(a)===i);
 const errorMessage=(e:unknown)=>e instanceof HealthError||e instanceof StoreBusyError?e.message:"Health sync could not finish. The last saved snapshot has been kept.";
 const phoneWorkspaceRoutes:Record<string,{path:string;method:"GET"|"POST"|"PUT";max?:number}>={
-  "GET /workspace":{path:"/api/workspace",method:"GET"},
-  "POST /workspace":{path:"/api/workspace",method:"PUT",max:2_000_000},
-  "GET /climbing":{path:"/api/climbing",method:"GET"},
-  "POST /climbing":{path:"/api/climbing",method:"PUT",max:3_000_000},
-  "GET /finance":{path:"/api/finance",method:"GET"},
-  "POST /finance/sync":{path:"/api/finance/sync",method:"POST"},
-  "POST /finance/annotate":{path:"/api/finance/annotate",method:"POST",max:64_000},
-  "GET /writing":{path:"/api/writing",method:"GET"},
-  "POST /writing/save":{path:"/api/writing/save",method:"POST",max:500_000},
-  "GET /integrations":{path:"/api/integrations",method:"GET"},
-  "POST /integrations/sync":{path:"/api/integrations/sync",method:"POST",max:64_000},
-  "POST /integrations/mutate":{path:"/api/integrations/mutate",method:"POST",max:64_000},
-  "POST /integrations/unlink":{path:"/api/integrations/unlink",method:"POST",max:64_000},
-  "GET /health-view":{path:"/api/health",method:"GET"},
+  "GET /v1/workspace":{path:"/api/workspace",method:"GET"},
+  "POST /v1/workspace":{path:"/api/workspace",method:"PUT",max:2_000_000},
+  "GET /v1/climbing":{path:"/api/climbing",method:"GET"},
+  "POST /v1/climbing":{path:"/api/climbing",method:"PUT",max:3_000_000},
+  "GET /v1/finance":{path:"/api/finance",method:"GET"},
+  "POST /v1/finance/sync":{path:"/api/finance/sync",method:"POST"},
+  "POST /v1/finance/annotate":{path:"/api/finance/annotate",method:"POST",max:64_000},
+  "GET /v1/writing":{path:"/api/writing",method:"GET"},
+  "POST /v1/writing/save":{path:"/api/writing/save",method:"POST",max:500_000},
+  "GET /v1/integrations":{path:"/api/integrations",method:"GET"},
+  "POST /v1/integrations/sync":{path:"/api/integrations/sync",method:"POST",max:64_000},
+  "POST /v1/integrations/mutate":{path:"/api/integrations/mutate",method:"POST",max:64_000},
+  "POST /v1/integrations/unlink":{path:"/api/integrations/unlink",method:"POST",max:64_000},
+  "GET /v1/health-view":{path:"/api/health",method:"GET"},
 };
 
 export function createHealthService(directory:string,options:HealthServiceOptions={}){

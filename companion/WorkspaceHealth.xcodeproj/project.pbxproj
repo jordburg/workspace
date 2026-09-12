@@ -10,12 +10,18 @@
 		B000000000000000000000001 /* WorkspaceHealthApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000001 /* WorkspaceHealthApp.swift */; };
 		B000000000000000000000002 /* BridgeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000002 /* BridgeClient.swift */; };
 		B000000000000000000000003 /* HealthStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000003 /* HealthStore.swift */; };
+		B000000000000000000000004 /* WorkspaceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000004 /* WorkspaceModels.swift */; };
+		B000000000000000000000005 /* WorkspaceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000005 /* WorkspaceStore.swift */; };
+		B000000000000000000000006 /* WorkspaceViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000006 /* WorkspaceViews.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A000000000000000000000001 /* WorkspaceHealthApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceHealthApp.swift; sourceTree = "<group>"; };
 		A000000000000000000000002 /* BridgeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeClient.swift; sourceTree = "<group>"; };
 		A000000000000000000000003 /* HealthStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthStore.swift; sourceTree = "<group>"; };
+		A000000000000000000000004 /* WorkspaceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceModels.swift; sourceTree = "<group>"; };
+		A000000000000000000000005 /* WorkspaceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceStore.swift; sourceTree = "<group>"; };
+		A000000000000000000000006 /* WorkspaceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceViews.swift; sourceTree = "<group>"; };
 		C00000000000000000000007 /* WorkspaceHealth.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WorkspaceHealth.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -52,6 +58,9 @@
 				A000000000000000000000001 /* WorkspaceHealthApp.swift */,
 				A000000000000000000000002 /* BridgeClient.swift */,
 				A000000000000000000000003 /* HealthStore.swift */,
+				A000000000000000000000004 /* WorkspaceModels.swift */,
+				A000000000000000000000005 /* WorkspaceStore.swift */,
+				A000000000000000000000006 /* WorkspaceViews.swift */,
 			);
 			path = WorkspaceHealth;
 			sourceTree = "<group>";
@@ -121,6 +130,9 @@
 				B000000000000000000000001 /* WorkspaceHealthApp.swift in Sources */,
 				B000000000000000000000002 /* BridgeClient.swift in Sources */,
 				B000000000000000000000003 /* HealthStore.swift in Sources */,
+				B000000000000000000000004 /* WorkspaceModels.swift in Sources */,
+				B000000000000000000000005 /* WorkspaceStore.swift in Sources */,
+				B000000000000000000000006 /* WorkspaceViews.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
