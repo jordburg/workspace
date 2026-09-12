@@ -1,6 +1,6 @@
 "use client";
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
-import { CalendarDays, Check, ExternalLink, Link2, LoaderCircle, Plus, RefreshCw, Settings2, Trash2, X } from "lucide-react";
+import { CalendarDays, Check, ExternalLink, Link2, LoaderCircle, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
@@ -28,8 +28,8 @@ export function IntegrationProvider({children}:{children:ReactNode}) {
   const [error,setError]=useState("");const [date,setDate]=useState("");
   const [settings,setSettings]=useState(false);const [draft,setDraft]=useState<RemoteDraft|null>(null);
   const opener=useRef<HTMLElement|null>(null);
-  async function load(){const response=await fetch("/api/integrations",{cache:"no-store"});if(!response.ok)throw new Error("Connections could not be loaded. Your local plans are still available.");setView(await response.json() as SyncView);}
-  useEffect(()=>{if(new URLSearchParams(location.search).get("connections")==="1")setSettings(true);void load().catch(err=>setError(message(err)));},[]);
+  const load=useCallback(async()=>{const response=await fetch("/api/integrations",{cache:"no-store"});if(!response.ok)throw new Error("Connections could not be loaded. Your local plans are still available.");setView(await response.json() as SyncView);},[]);
+  useEffect(()=>{const timer=setTimeout(()=>{if(new URLSearchParams(location.search).get("connections")==="1")setSettings(true);void load().catch(err=>setError(message(err)));},0);return()=>clearTimeout(timer);},[load]);
   const perform=useCallback(async(path:string,body:unknown)=>{
     if(busyRef.current)throw new Error("Wait for the current sync to finish.");
     busyRef.current=true;setBusy(true);setError("");
@@ -37,11 +37,11 @@ export function IntegrationProvider({children}:{children:ReactNode}) {
       if(!response.ok){if(response.status===409)await load().catch(()=>{});throw new Error(result.error||"The service could not apply this change.");}
       if(result.todoist && result.google)setView(result);return result;
     }catch(err){setError(message(err));throw err;}finally{busyRef.current=false;setBusy(false);}
-  },[]);
+  },[load]);
   const refresh=useCallback(async()=>{if(!date || busyRef.current)return;try{await perform("/sync",{date,timeZone:zone()});}catch{}},[date,perform]);
   const connected=view.todoist.connected||view.google.connected;
   useEffect(()=>{if(!connected||!date)return;let retry:ReturnType<typeof setTimeout>|undefined;const attempt=()=>{if(busyRef.current){retry=setTimeout(attempt,1000);return;}void refresh();};attempt();const timer=setInterval(()=>{if(document.visibilityState==="visible")attempt();},300000);return()=>{clearInterval(timer);if(retry)clearTimeout(retry);};},[connected,date,refresh]);
-  useEffect(()=>{if(!settings)return;const timer=setInterval(()=>{if(!busyRef.current)void load().catch(()=>{});},5000);return()=>clearInterval(timer);},[settings]);
+  useEffect(()=>{if(!settings)return;const timer=setInterval(()=>{if(!busyRef.current)void load().catch(()=>{});},5000);return()=>clearInterval(timer);},[settings,load]);
   function captureFocus(){opener.current=document.activeElement instanceof HTMLElement?document.activeElement:null;}
   const context={view,busy,error,date,setDate,refresh,perform,openSettings:()=>{captureFocus();setError("");setSettings(true);},openEditor:(next:RemoteDraft)=>{captureFocus();setError("");setDraft(next);}};
   const restoreFocus=(event:Event)=>{event.preventDefault();if(opener.current?.isConnected)opener.current.focus();else document.getElementById("connection-settings")?.focus();};
