@@ -74,7 +74,7 @@ function newClimb(session: ClimbingSession): Climb {
   return { id: crypto.randomUUID(), name: "", discipline, ropeStyle: route ? "top-rope" : null, gradeSystem, grade: gradeSystem ? "" : null, outcome: "attempt", attempts: null, notes: "" };
 }
 
-export function ClimbingPanel({ openHealth }: { openHealth: () => void }) {
+export function ClimbingPanel({ active = true, openHealth }: { active?: boolean; openHealth: () => void }) {
   const integrations = useIntegrations();
   const [data, setData] = useState<ClimbingState>(emptyClimbing);
   const dataRef = useRef(data);
@@ -112,8 +112,8 @@ export function ClimbingPanel({ openHealth }: { openHealth: () => void }) {
     } catch (cause) { setHealthError(errorMessage(cause, "Apple Health could not be loaded.")); }
     finally { setHealthLoaded(true); }
   }, []);
-  useEffect(() => { const timer = setTimeout(() => { void load(); void loadHealth(); }, 0); return () => clearTimeout(timer); }, [load, loadHealth]);
-  useEffect(() => { const timer = setInterval(() => { if (document.visibilityState === "visible") void loadHealth(); }, 60000); return () => clearInterval(timer); }, [loadHealth]);
+  useEffect(() => { if (!active) return; const timer = setTimeout(() => { void load(); void loadHealth(); }, 0); return () => clearTimeout(timer); }, [active, load, loadHealth]);
+  useEffect(() => { if (!active) return; const timer = setInterval(() => { if (document.visibilityState === "visible") void loadHealth(); }, 60000); return () => clearInterval(timer); }, [active, loadHealth]);
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(""), 5000); return () => clearTimeout(timer); }, [notice]);
   useEffect(() => { if (!editor) return; const warn = (event: BeforeUnloadEvent) => { if (dirtyRef.current) event.preventDefault(); }; window.addEventListener("beforeunload", warn); return () => window.removeEventListener("beforeunload", warn); }, [editor]);
 

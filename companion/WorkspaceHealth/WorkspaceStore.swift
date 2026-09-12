@@ -39,6 +39,7 @@ final class WorkspaceStore: ObservableObject {
 
     @Published private(set) var workspace: WorkspaceState = .empty
     @Published private(set) var climbing: ClimbingState = .empty
+    @Published private(set) var chess: ChessView = .empty
     @Published private(set) var finance: FinanceView = .empty
     @Published private(set) var writing: WritingView = .empty
     @Published private(set) var integrations: IntegrationView = .empty
@@ -50,13 +51,16 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var loadedAreas: Set<WorkspaceArea> = []
     @Published private(set) var busyAreas: Set<WorkspaceArea> = []
     @Published private(set) var areaErrors: [WorkspaceArea: String] = [:]
+    @Published private(set) var chessProgressNeedsRebase = false
+    @Published private(set) var chessReviewCanChangeAnswer = false
+    @Published private(set) var chessReviewNoLongerDue = false
+    @Published private(set) var chessSessionNeedsRebase = false
 
     @Published private(set) var commands: [WeightCommand] = []
     @Published private(set) var dayCount = 0
     @Published private(set) var sleepStatus = "Sleep history has not been imported in this session."
     @Published private(set) var importingHistory = false
     @Published var status = "Pair with your Mac to begin."
-    @Published var error: String?
 
     let health: HealthStore
     private var cancelHistoryRequested = false
@@ -71,6 +75,10 @@ final class WorkspaceStore: ObservableObject {
         capabilities?.workspace ?? (credentials?.scope == .workspace)
     }
     var busy: Bool { !busyAreas.isEmpty }
+    var error: String? {
+        let priority: [WorkspaceArea] = [.pairing, .workspace, .integrations, .health, .climbing, .chess, .finance, .writing]
+        return priority.compactMap { areaErrors[$0] }.first
+    }
 
     init(credentials suppliedCredentials: BridgeCredentials? = nil, health: HealthStore = HealthStore()) {
         self.health = health
@@ -89,7 +97,7 @@ final class WorkspaceStore: ObservableObject {
                 }
             } catch {
                 credentials = nil
-                self.error = error.localizedDescription
+                areaErrors[.pairing] = error.localizedDescription
             }
         }
     }
@@ -99,7 +107,10 @@ final class WorkspaceStore: ObservableObject {
     func clearError(_ area: WorkspaceArea? = nil) {
         if let area { areaErrors.removeValue(forKey: area) }
         else { areaErrors.removeAll() }
-        error = areaErrors.values.first
+    }
+
+    func report(_ cause: Error, area: WorkspaceArea) {
+        record(cause, area: area)
     }
 
     func pair(_ url: URL) async {
@@ -131,6 +142,9 @@ final class WorkspaceStore: ObservableObject {
                 : "Paired for Health. Keep both devices on the same Wi-Fi."
             do {
                 try await negotiateCapabilities(using: BridgeClient(paired))
+                if hasWorkspaceAccess {
+                    await loadWorkspaceAreas()
+                }
             } catch {
                 record(error, area: .pairing)
             }
@@ -201,10 +215,7 @@ final class WorkspaceStore: ObservableObject {
             return
         }
         guard hasWorkspaceAccess else { return }
-        await load(.workspace)
-        await load(.climbing)
-        await load(.integrations)
-        await load(.health)
+        await loadWorkspaceAreas()
     }
 
     func refreshAll() async {
@@ -221,9 +232,7 @@ final class WorkspaceStore: ObservableObject {
             record(BridgeError.message("Pair again with a Workspace pairing file to load these areas."), area: .pairing)
             return
         }
-        for area in [WorkspaceArea.workspace, .climbing, .finance, .writing, .integrations, .health] {
-            await load(area, force: true)
-        }
+        await loadWorkspaceAreas(force: true)
     }
 
     func load(_ area: WorkspaceArea, force: Bool = false) async {
@@ -241,6 +250,8 @@ final class WorkspaceStore: ObservableObject {
                 workspace = try await client.get("v1/workspace")
             case .climbing:
                 climbing = try await client.get("v1/climbing")
+            case .chess:
+                chess = try await client.get("v1/chess")
             case .finance:
                 finance = try await client.get("v1/finance")
             case .writing:
@@ -249,7 +260,8 @@ final class WorkspaceStore: ObservableObject {
                 integrations = try await client.get("v1/integrations")
             case .health:
                 try await requireWorkspace(using: client)
-                healthView = try await client.get("v1/health-view")
+                let view: PhoneHealthView = try await client.get("v1/health-view")
+                try acceptHealthView(view)
             case .pairing:
                 return
             }
@@ -484,6 +496,124 @@ final class WorkspaceStore: ObservableObject {
 
     func discardClimbingConflict() { climbingConflict = nil }
 
+    @discardableResult
+    func saveChessProgress(_ request: ChessProgressRequest) async -> Bool {
+        guard begin(.chess) else { return false }
+        defer { finish(.chess) }
+        guard let client = workspaceClient(area: .chess) else { return false }
+        chessProgressNeedsRebase = false
+        do {
+            let response: ChessProgressResponse = try await client.send("v1/chess/progress", input: request)
+            chess = response.view
+            loadedAreas.insert(.chess)
+            clearRecordedError(.chess)
+            status = "Chess progress saved."
+            return true
+        } catch let bridge as BridgeError {
+            if bridge.statusCode == 409,
+               ["revision_conflict", "request_id_conflict"].contains(bridge.responseCode ?? ""),
+               let latest = try? await client.get("v1/chess") as ChessView {
+                chess = latest
+                loadedAreas.insert(.chess)
+                chessProgressNeedsRebase = true
+            }
+            record(bridge, area: .chess)
+            return false
+        } catch {
+            record(error, area: .chess)
+            return false
+        }
+    }
+
+    func submitChessReview(_ request: ChessReviewRequest) async -> ChessReviewResult? {
+        guard begin(.chess) else { return nil }
+        defer { finish(.chess) }
+        guard let client = workspaceClient(area: .chess) else { return nil }
+        chessReviewCanChangeAnswer = false
+        chessReviewNoLongerDue = false
+        do {
+            let response: ChessReviewResponse = try await client.send("v1/chess/review", input: request)
+            chess = response.view
+            loadedAreas.insert(.chess)
+            clearRecordedError(.chess)
+            status = response.result.grade == .good ? "Chess review complete." : "Chess review saved for another look."
+            return response.result
+        } catch let bridge as BridgeError {
+            if bridge.responseCode == "review_not_due" {
+                if let latest = try? await client.get("v1/chess") as ChessView {
+                    chess = latest
+                    loadedAreas.insert(.chess)
+                }
+                chessReviewNoLongerDue = true
+            } else if let status = bridge.statusCode,
+               (400..<500).contains(status),
+               ![408, 423, 429].contains(status) {
+                // These responses prove the review was not saved. A transport
+                // failure remains locked to the original request for safe replay.
+                chessReviewCanChangeAnswer = true
+                if bridge.responseCode == "revision_conflict",
+                   let latest = try? await client.get("v1/chess") as ChessView {
+                    chess = latest
+                    loadedAreas.insert(.chess)
+                }
+            }
+            record(bridge, area: .chess)
+            return nil
+        } catch {
+            record(error, area: .chess)
+            return nil
+        }
+    }
+
+    func saveChessSession(_ request: ChessSessionRequest) async -> ChessStudySession? {
+        guard begin(.chess) else { return nil }
+        defer { finish(.chess) }
+        guard let client = workspaceClient(area: .chess) else { return nil }
+        chessSessionNeedsRebase = false
+        do {
+            let response: ChessSessionResponse = try await client.send("v1/chess/session", input: request)
+            chess = response.view
+            loadedAreas.insert(.chess)
+            clearRecordedError(.chess)
+            status = "Chess study session saved."
+            return response.session
+        } catch let bridge as BridgeError {
+            if bridge.statusCode == 409,
+               ["revision_conflict", "request_id_conflict"].contains(bridge.responseCode ?? ""),
+               let latest = try? await client.get("v1/chess") as ChessView {
+                chess = latest
+                loadedAreas.insert(.chess)
+                chessSessionNeedsRebase = true
+            }
+            record(bridge, area: .chess)
+            return nil
+        } catch {
+            record(error, area: .chess)
+            return nil
+        }
+    }
+
+    func changeChessReviewAnswer() {
+        chessReviewCanChangeAnswer = false
+        clearRecordedError(.chess)
+    }
+
+    func dismissStaleChessReview() {
+        chessReviewNoLongerDue = false
+        chessReviewCanChangeAnswer = false
+        clearRecordedError(.chess)
+    }
+
+    func prepareRebasedChessProgress() {
+        chessProgressNeedsRebase = false
+        clearRecordedError(.chess)
+    }
+
+    func prepareRebasedChessSession() {
+        chessSessionNeedsRebase = false
+        clearRecordedError(.chess)
+    }
+
     func reportStaleRow(_ noun: String, area: WorkspaceArea) {
         record(
             BridgeError.message("This \(noun) changed or was removed on your Mac. Refresh and try again."),
@@ -677,9 +807,9 @@ final class WorkspaceStore: ObservableObject {
             }
             commands = review
             dayCount = snapshot.days.count
-            if hasWorkspaceAccess {
-                healthView = try? await client.get("v1/health-view")
-                if healthView != nil { loadedAreas.insert(.health) }
+            if hasWorkspaceAccess, let view: PhoneHealthView = try? await client.get("v1/health-view") {
+                try acceptHealthView(view)
+                loadedAreas.insert(.health)
             }
             clearRecordedError(.health)
             status = "Synced at \(Date().formatted(date: .omitted, time: .shortened))."
@@ -758,7 +888,6 @@ final class WorkspaceStore: ObservableObject {
         guard !unpairing, !busyAreas.contains(area) else { return false }
         busyAreas.insert(area)
         areaErrors.removeValue(forKey: area)
-        error = areaErrors.values.first
         return true
     }
 
@@ -820,7 +949,6 @@ final class WorkspaceStore: ObservableObject {
 
     private func clearRecordedError(_ area: WorkspaceArea) {
         areaErrors.removeValue(forKey: area)
-        error = areaErrors.values.first
     }
 
     private func allowWorkspaceMutation() -> Bool {
@@ -837,13 +965,34 @@ final class WorkspaceStore: ObservableObject {
     private func record(_ cause: Error, area: WorkspaceArea) {
         let message = cause.localizedDescription
         areaErrors[area] = message
-        error = message
+    }
+
+    private func loadWorkspaceAreas(force: Bool = false) async {
+        for area in [WorkspaceArea.workspace, .climbing, .chess, .finance, .writing, .integrations, .health] {
+            await load(area, force: force)
+        }
+    }
+
+    private func acceptHealthView(_ view: PhoneHealthView) throws {
+        var review: [WeightCommand] = []
+        for command in view.commands {
+            if let receipt = credentials?.receipts[command.id] {
+                guard receipt == command.payloadHash else {
+                    throw BridgeError.message("A health request changed after it was saved. Check the Mac’s health queue.")
+                }
+            } else {
+                review.append(command)
+            }
+        }
+        healthView = view
+        commands = review
     }
 
     private func resetWorkspaceState() {
         capabilities = nil
         workspace = .empty
         climbing = .empty
+        chess = .empty
         finance = .empty
         writing = .empty
         integrations = .empty
@@ -856,8 +1005,11 @@ final class WorkspaceStore: ObservableObject {
         workspaceConflict = nil
         workspaceConflictChange = nil
         climbingConflict = nil
+        chessProgressNeedsRebase = false
+        chessReviewCanChangeAnswer = false
+        chessReviewNoLongerDue = false
+        chessSessionNeedsRebase = false
         loadedAreas = []
         areaErrors = [:]
-        error = nil
     }
 }

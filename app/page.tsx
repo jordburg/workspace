@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { ArrowDown, ArrowRight, ArrowUpRight, BriefcaseBusiness, CalendarDays, Check, ChevronLeft, ChevronRight, House, Heart, Wallet, FilePenLine, Inbox, LayoutDashboard, LoaderCircle, Mail, Mountain, Plus, Sparkles, Sun, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowRight, ArrowUpRight, BriefcaseBusiness, CalendarDays, Check, ChevronLeft, ChevronRight, Crown, House, Heart, Wallet, FilePenLine, Inbox, LayoutDashboard, LoaderCircle, Mail, Mountain, Plus, Sparkles, Sun, Trash2, X, type LucideIcon } from "lucide-react";
 import { ClimbingPanel } from "@/components/climbing";
+import { ChessPanel, TodayChessCard } from "@/components/chess";
 import { WritingPanel } from "@/components/writing";
 import { FinancePanel } from "@/components/finance";
 import { HealthPanel, LifeOverview } from "@/components/health";
@@ -15,6 +16,20 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/compone
 import { dateFromKey, dateKey, daySchema, emptyWorkspace, itemSchema, workspaceSchema, type Item, type Workspace } from "@/lib/workspace";
 
 type AreaFilter = "all" | Item["area"];
+type WorkspaceView = "daily" | "inbox" | "mail" | "finance" | "health" | "climbing" | "chess" | "writing";
+type ViewDefinition = { label: string; icon: LucideIcon; eyebrow?: string; title?: string; subtitle: string };
+
+const workspaceViews: Record<WorkspaceView, ViewDefinition> = {
+  daily: { label: "Daily overview", icon: Sun, subtitle: "Your plans, priorities, and everything in between." },
+  inbox: { label: "Inbox", icon: Inbox, title: "A little room to think.", subtitle: "Ideas and loose ends, ready when you are." },
+  mail: { label: "Mail", icon: Mail, eyebrow: "PERSONAL GMAIL", title: "Email, with room to decide.", subtitle: "Read, reply, send, and clear what no longer needs your attention." },
+  finance: { label: "Finances", icon: Wallet, title: "A clearer picture of your money.", subtitle: "Your personal accounts, spending, and the details worth keeping." },
+  health: { label: "Health", icon: Heart, title: "Your health.", subtitle: "Your movement, rest, and measurements from Apple Health." },
+  climbing: { label: "Climbing", icon: Mountain, eyebrow: "YOUR CLIMBING LOG", title: "Climbing.", subtitle: "Sessions, projects, and the training behind them." },
+  chess: { label: "Chess", icon: Crown, eyebrow: "YOUR CHESS PRACTICE", title: "Chess.", subtitle: "Learn a position, recall the move, and understand the idea behind it." },
+  writing: { label: "Writing", icon: FilePenLine, title: "Something worth writing down.", subtitle: "Develop an idea and give it a place on your personal site." },
+};
+const navigationViews = Object.entries(workspaceViews) as [WorkspaceView, ViewDefinition][];
 const responseError = (value: unknown, fallback: string) => typeof value === "object" && value !== null && "error" in value && typeof value.error === "string" ? value.error : fallback;
 const areaName = (area: Item["area"]) => area === "personal" ? "Personal" : "Independent work";
 const formatTime = (time: string) => { const [h,m] = time.split(":").map(Number); return `${h % 12 || 12}:${String(m).padStart(2,"0")} ${h < 12 ? "am" : "pm"}`; };
@@ -24,13 +39,13 @@ export default function Home() { return <IntegrationProvider><WorkspaceHome/></I
 
 function WorkspaceHome() {
   const {view: synced, busy: integrationBusy, error: integrationError} = useIntegrations();
-  const [today, setToday] = useState("");
-  const [selected, setSelected] = useState("");
+  const [today, setToday] = useState(() => dateKey(new Date()));
+  const [selected, setSelected] = useState(() => dateKey(new Date()));
   const [data, setData] = useState<Workspace>(emptyWorkspace);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [view, setView] = useState<"daily" | "inbox" | "mail" | "finance" | "health" | "writing" | "climbing">("daily");
+  const [view, setView] = useState<WorkspaceView>("daily");
   const [area, setArea] = useState<AreaFilter>("all");
   const [capture, setCapture] = useState("");
   const [editor, setEditor] = useState<Item | null>(null);
@@ -39,23 +54,31 @@ function WorkspaceHome() {
   const dataRef = useRef(data); const busyRef = useRef(false);
   const openerRef = useRef<HTMLElement | null>(null);
   function openEditor(item: Item) { openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; setEditor(item); }
-  const uiRef = useRef({ selected, area, editing: !!editor, loaded }); uiRef.current = { selected, area, editing: !!editor, loaded };
-  function receive(next: Workspace) { dataRef.current = next; setData(next); }
-  async function load() {
+  const uiRef = useRef({ selected, area, editing: !!editor, loaded });
+  useEffect(() => { uiRef.current = { selected, area, editing: !!editor, loaded }; }, [selected, area, editor, loaded]);
+  const receive = useCallback((next: Workspace) => { dataRef.current = next; setData(next); }, []);
+  const load = useCallback(async () => {
     try { const response = await fetch("/api/workspace", { cache: "no-store" }); const result = await response.json(); if (!response.ok) throw new Error(responseError(result, "Your workspace could not be loaded.")); receive(workspaceSchema.parse(result)); setLoaded(true); return true; }
     catch (err) { setError(err instanceof Error ? err.message : "Your workspace could not be loaded."); return false; }
-  }
+  }, [receive]);
   useEffect(() => {
-    const key = dateKey(new Date()); setToday(key);
-    const requested = new URLSearchParams(location.search).get("date"); setSelected(requested && daySchema.safeParse(requested).success ? requested : key);
-    void load();
+    const initial = setTimeout(() => {
+      const requested = new URLSearchParams(location.search).get("date");
+      if (requested && daySchema.safeParse(requested).success) setSelected(requested);
+      void load();
+    }, 0);
     const timer = setInterval(() => setToday(dateKey(new Date())), 60_000);
-    return () => clearInterval(timer);
-  }, []);
+    return () => { clearTimeout(initial); clearInterval(timer); };
+  }, [load]);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => { setNotice(""); setDeleted(null); }, deleted ? 8000 : 5000);
+    return () => clearTimeout(timer);
+  }, [notice, deleted]);
   function selectDay(key: string) { setSelected(key); const url = new URL(location.href); url.searchParams.set("date", key); history.replaceState(null,"",url); }
   async function save(items: Item[], message = "Saved") {
     if (busyRef.current || !loaded) return false;
-    busyRef.current = true; setBusy(true); setError("");
+    busyRef.current = true; setBusy(true); setError(""); setNotice(""); setDeleted(null);
     try {
       const response = await fetch("/api/workspace", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...dataRef.current, items }) });
       const result = await response.json();
@@ -85,7 +108,7 @@ function WorkspaceHome() {
     } });
     return () => lifecycle.abort();
   }, []);
-  const date = selected ? dateFromKey(selected) : dateFromKey("2026-01-01");
+  const date = dateFromKey(selected);
   const monday = new Date(date); monday.setDate(date.getDate() - (date.getDay()+6)%7);
   const days = Array.from({length:7}, (_,index) => { const day = new Date(monday); day.setDate(monday.getDate()+index); return day; });
   const filtered = data.items.filter(item => area === "all" || item.area === area);
@@ -98,33 +121,33 @@ function WorkspaceHome() {
   const calendarConnected = synced.google.connected && area !== "independent";
   const shiftWeek = (amount: number) => { const shifted = new Date(date); shifted.setDate(date.getDate()+amount); selectDay(dateKey(shifted)); };
   const noteRows = (items: Item[]) => items.map(item => <div className="note-row" key={item.id}><button className="note-content" onClick={() => openEditor(item)} disabled={!canAct}><p>{item.title}</p><span className={`area-label ${item.area}`}>{areaName(item.area)}</span></button><button className="icon-button" disabled={!canAct} aria-label={`Make ${item.title} a priority`} title="Make a priority" onClick={() => openEditor({ ...item, kind:"priority", date:selected })}><ArrowUpRight size={17}/></button></div>);
-  const topbarIcon = view === "daily" ? <Sun size={16}/> : view === "mail" ? <Mail size={16}/> : view === "finance" ? <Wallet size={16}/> : view === "health" ? <Heart size={16}/> : view === "climbing" ? <Mountain size={16}/> : view === "writing" ? <FilePenLine size={16}/> : <Inbox size={16}/>;
-  const topbarTitle = {daily:"Daily overview",inbox:"Inbox",mail:"Mail",finance:"Finances",health:"Health",climbing:"Climbing",writing:"Writing"}[view];
-  const topbarStatus = view === "mail" ? integrationBusy ? <><LoaderCircle className="spin" size={14}/> Syncing Gmail…</> : integrationError || synced.gmail.error ? "Mail needs attention" : synced.gmail.connected ? <><Check size={14}/> Personal Gmail connected</> : "Gmail not connected" : view !== "daily" && view !== "inbox" ? "Local workspace" : busy ? <><LoaderCircle className="spin" size={14}/> Saving…</> : error ? "Save needs attention" : loaded ? <><Check size={14}/> All changes saved</> : "Loading workspace…";
-  const headingEyebrow = view === "climbing" ? "YOUR CLIMBING LOG" : view === "mail" ? "PERSONAL GMAIL" : selected ? date.toLocaleDateString("en-US", { weekday:"long", month:"long", day:"numeric", year:"numeric" }) : "YOUR DAILY WORKSPACE";
-  const headingTitle = view === "writing" ? "Something worth writing down." : view === "finance" ? "A clearer picture of your money." : view === "health" ? "Your health." : view === "climbing" ? "Climbing." : view === "mail" ? "Email, with room to decide." : view === "inbox" ? "A little room to think." : selected === today ? "A little clarity for your day." : "A little space to plan ahead.";
-  const headingSubtitle = view === "writing" ? "Develop an idea and give it a place on your personal site." : view === "finance" ? "Your personal accounts, spending, and the details worth keeping." : view === "health" ? "Your movement, rest, and measurements from Apple Health." : view === "climbing" ? "Sessions, projects, and the training behind them." : view === "mail" ? "Read, reply, send, and clear what no longer needs your attention." : view === "inbox" ? "Ideas and loose ends, ready when you are." : "Your plans, priorities, and everything in between.";
+  const definition = workspaceViews[view];
+  const TopbarIcon = definition.icon;
+  const topbarStatus = view === "mail" ? integrationBusy ? <><LoaderCircle className="spin" size={14}/> Syncing Gmail…</> : integrationError || synced.gmail.error ? "Mail needs attention" : synced.gmail.connected ? <><Check size={14}/> Personal Gmail connected</> : "Gmail not connected" : view === "daily" || view === "inbox" ? busy ? <><LoaderCircle className="spin" size={14}/> Saving…</> : error ? "Save needs attention" : loaded ? <><Check size={14}/> All changes saved</> : "Loading workspace…" : "Private workspace";
+  const headingEyebrow = definition.eyebrow ?? date.toLocaleDateString("en-US", { weekday:"long", month:"long", day:"numeric", year:"numeric" });
+  const headingTitle = definition.title ?? (selected === today ? "A little clarity for your day." : "A little space to plan ahead.");
   return <div className="workspace">
     <aside className="sidebar">
-      <a className="brand" href="/"><span className="brand-mark"><LayoutDashboard size={19}/></span>workspace<span className="brand-period">.</span></a>
+      <button className="brand" type="button" aria-label="Open daily overview" onClick={() => setView("daily")}><span className="brand-mark"><LayoutDashboard size={19}/></span>workspace<span className="brand-period">.</span></button>
       <div className="workspace-owner"><span className="avatar">JB</span><div><strong>Jordan’s workspace</strong><span>Personal & independent</span></div></div>
       <span className="nav-label">YOUR SPACE</span>
-      <nav aria-label="Workspace"><button className={`nav-item ${view === "daily" ? "active" : ""}`} aria-label="Daily overview" aria-current={view === "daily" ? "page" : undefined} onClick={() => setView("daily")}><Sun size={19}/><span>Daily overview</span></button><button className={`nav-item ${view === "inbox" ? "active" : ""}`} aria-label="Inbox" aria-current={view === "inbox" ? "page" : undefined} onClick={() => setView("inbox")}><Inbox size={19}/><span>Inbox</span><span className="nav-count">{data.items.filter(i => i.kind === "note").length}</span></button><button className={`nav-item ${view === "mail" ? "active" : ""}`} aria-label="Mail" aria-current={view === "mail" ? "page" : undefined} onClick={() => setView("mail")}><Mail size={19}/><span>Mail</span>{synced.gmail.unreadCount>0&&<span className="nav-count">{synced.gmail.unreadCount}</span>}</button><button className={`nav-item ${view === "finance" ? "active" : ""}`} aria-current={view === "finance" ? "page" : undefined} onClick={() => setView("finance")}><Wallet size={19}/><span>Finances</span></button><button className={`nav-item ${view === "health" ? "active" : ""}`} aria-current={view === "health" ? "page" : undefined} onClick={() => setView("health")}><Heart size={19}/><span>Health</span></button><button className={`nav-item ${view === "climbing" ? "active" : ""}`} aria-label="Climbing" aria-current={view === "climbing" ? "page" : undefined} onClick={() => setView("climbing")}><Mountain size={19}/><span>Climbing</span></button><button className={`nav-item ${view === "writing" ? "active" : ""}`} aria-current={view === "writing" ? "page" : undefined} onClick={() => setView("writing")}><FilePenLine size={19}/><span>Writing</span></button></nav>
+      <nav aria-label="Workspace">{navigationViews.map(([id, item]) => { const Icon = item.icon; const count = id === "inbox" ? data.items.filter(value => value.kind === "note").length : id === "mail" ? synced.gmail.unreadCount : 0; return <button key={id} className={`nav-item ${view === id ? "active" : ""}`} aria-label={item.label} aria-current={view === id ? "page" : undefined} onClick={() => setView(id)}><Icon size={19}/><span>{item.label}</span>{count > 0 && <span className="nav-count">{count}</span>}</button>; })}</nav>
       <div className="area-nav"><span className="nav-label">LIFE AREAS</span><button className={`nav-item ${area === "personal" ? "area-selected" : ""}`} aria-pressed={area === "personal"} onClick={() => setArea(area === "personal" ? "all" : "personal")}><House size={17}/> Personal</button><button className={`nav-item ${area === "independent" ? "area-selected" : ""}`} aria-pressed={area === "independent"} onClick={() => setArea(area === "independent" ? "all" : "independent")}><BriefcaseBusiness size={17}/> Independent work</button></div>
       <div className="sidebar-note"><span className="small-rule"/><p>A little space to see the day clearly.</p></div>
-      <div className="sidebar-bottom"><span className="local-dot"/> Saved on this Mac</div>
+      <div className="sidebar-bottom"><span className="local-dot"/> Private workspace</div>
     </aside>
     <main className="main">
-      <header className="topbar"><span>{topbarIcon} {topbarTitle}</span><span className="save-status" role="status">{topbarStatus}</span></header>
+      <header className="topbar"><span><TopbarIcon size={16}/> {definition.label}</span><span className="save-status" role="status">{topbarStatus}</span></header>
       <div className="page-content">
         {error && !editor && <div className="error-banner" role="alert"><p>{error}</p>{!loaded ? <button onClick={() => { setError(""); void load(); }}>Retry</button> : <button className="icon-button" aria-label="Dismiss error" onClick={() => setError("")}><X size={16}/></button>}</div>}
-        <div className={`page-heading ${view === "health" ? "health-page-heading" : ""}`}><div><p className="eyebrow">{headingEyebrow}</p><h1>{headingTitle}</h1><p className="page-subtitle">{headingSubtitle}</p></div>{(view === "daily" || view === "inbox") && <Button id="add-item" className="primary-button" disabled={!canAct} onClick={() => start(view === "inbox" ? "note" : "priority")}><Plus size={17}/> {view === "inbox" ? "Capture a thought" : "Add to your day"}</Button>}</div>
+        <div className={`page-heading ${view === "health" ? "health-page-heading" : ""}`}><div><p className="eyebrow">{headingEyebrow}</p><h1>{headingTitle}</h1><p className="page-subtitle">{definition.subtitle}</p></div>{(view === "daily" || view === "inbox") && <Button id="add-item" className="primary-button" disabled={!canAct} onClick={() => start(view === "inbox" ? "note" : "priority")}><Plus size={17}/> {view === "inbox" ? "Capture a thought" : "Add to your day"}</Button>}</div>
         {(view === "daily" || view === "inbox") && area !== "all" && <div className="filter-banner">Showing {areaName(area).toLowerCase()}<button onClick={() => setArea("all")}>Show all areas <X size={14}/></button></div>}
         {view === "daily" && <section className="week-strip" aria-label="Choose a day"><button className="icon-button" aria-label="Previous week" disabled={!selected} onClick={() => shiftWeek(-7)}><ChevronLeft size={18}/></button><div className="week-days">{days.map(day => <button key={dateKey(day)} disabled={!selected} aria-pressed={dateKey(day) === selected} aria-label={day.toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"})} className={`day-button ${dateKey(day) === selected ? "selected" : ""}`} onClick={() => selectDay(dateKey(day))}><span>{day.toLocaleDateString("en-US",{weekday:"short"})}</span><strong>{day.getDate()}</strong>{dateKey(day) === today && <i/>}</button>)}</div><button className="icon-button" aria-label="Next week" disabled={!selected} onClick={() => shiftWeek(7)}><ChevronRight size={18}/></button><button className="today-button" disabled={!today} onClick={() => selectDay(today)}>Today</button></section>}
-        <div hidden={view !== "writing"}><WritingPanel/></div>
-        <div hidden={view !== "health"}><HealthPanel/></div>
-        <div hidden={view !== "climbing"}><ClimbingPanel openHealth={()=>setView("health")}/></div>
-        {view === "writing" || view === "health" || view === "climbing" ? null : view === "finance" ? <FinancePanel/> : view === "mail" ? <><ConnectionsBar date={selected}/><MailPanel/></> : <><ConnectionsBar date={selected}/>
+        <div hidden={view !== "writing"}><WritingPanel active={view === "writing"}/></div>
+        <div hidden={view !== "health"}><HealthPanel active={view === "health"}/></div>
+        <div hidden={view !== "climbing"}><ClimbingPanel active={view === "climbing"} openHealth={()=>setView("health")}/></div>
+        <div hidden={view !== "chess"}><ChessPanel active={view === "chess"} selectedDay={selected}/></div>
+        {view === "writing" || view === "health" || view === "climbing" || view === "chess" ? null : view === "finance" ? <FinancePanel/> : view === "mail" ? <><ConnectionsBar date={selected}/><MailPanel/></> : <><ConnectionsBar date={selected}/>
         <div className="daily-grid"><div className="day-column">
           {view === "daily" ? <>
             <section className="focus-panel"><div className="section-top"><span className="overline"><Sparkles size={16}/> THE IMPORTANT THINGS</span><span className="focus-count">{done} of {priorities.length} done</span></div>
@@ -139,6 +162,7 @@ function WorkspaceHome() {
         </div><div className="right-column"><section className="capture-panel"><div className="section-heading"><h2>A place to put it</h2><ArrowDown size={20}/></div><p>An idea, a reminder, a loose end.<br/>Get it out of your head.</p><form onSubmit={async e => { e.preventDefault(); if (capture.trim() && canAct) { if (await upsert({...newItem("note",selected,area === "all" ? "personal" : area),title:capture.trim()})) setCapture(""); } }}><label className="sr-only" htmlFor="capture">Capture a thought</label><textarea id="capture" value={capture} onChange={e => setCapture(e.target.value)} placeholder="What’s on your mind?" maxLength={2000} disabled={!loaded || busy}/><div className="capture-footer"><span>Goes to your inbox</span><button className="capture-button" type="submit" disabled={!capture.trim() || !canAct} aria-label="Save thought"><ArrowRight size={19}/></button></div></form></section>
         {view === "daily" && <section className="inbox-panel"><div className="section-heading"><h2>For later</h2><span className="count-label">{notes.length}</span></div>{!loaded ? <p className="loading-content">Loading your inbox…</p> : notes.length ? <>{noteRows(notes.slice(0,3))}<button className="text-button inbox-link" onClick={() => setView("inbox")}>Open inbox <ArrowRight size={15}/></button></> : <div className="inbox-empty"><Inbox size={23}/><p>Nothing on the back burner.</p><span>Your captured thoughts will be here when you need them.</span></div>}</section>}
         {view === "daily" && area !== "independent" && <TodayMailCard openMail={() => setView("mail")}/>}
+        {view === "daily" && area !== "independent" && <TodayChessCard day={selected} openChess={() => setView("chess")}/>}
         {view === "daily" && area !== "independent" && <LifeOverview day={selected} open={setView}/>}<div className="day-summary"><span className="summary-icon"><Check size={16}/></span><p>One thing at a time is a good pace.</p></div></div></div></>}
         <footer className="page-footer"><span>YOUR DAY. YOUR SPACE.</span><span>Personal life + independent work</span></footer>
       </div>

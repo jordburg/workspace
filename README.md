@@ -15,11 +15,11 @@ Open http://127.0.0.1:5173. `npm start` and `npm run dev` both run the local app
 
 ## Storage
 
-Records live in `~/Data/personal-workspace/workspace.json`, outside this source tree. Saves validate the full document, serialize writes, check a revision number, flush a temporary file, and atomically replace the main file. `workspace.backup.json` keeps the previous saved version. This is a local app with optional Todoist and Google Calendar connections described below. It has no remote deployment or workspace sign-in. The API is provided by the Vite middleware in `build/local-workspace.ts`; the build output alone is not a standalone data server.
+Records live in `~/Data/personal-workspace/workspace.json`, outside this source tree. Saves validate the full document, serialize writes, check a revision number, flush a temporary file, and atomically replace the main file. `workspace.backup.json` keeps the previous saved version. This is a local app with optional Todoist, Google Calendar, Gmail, Plaid, iPhone, personal-site, and Chess capabilities described below. It has no remote deployment or workspace sign-in. The API is provided by the Vite middleware in `build/local-workspace.ts`; the build output alone is not a standalone data server.
 
 To use an isolated directory for development, set `WORKSPACE_DATA_DIR` to an absolute path when starting the server. Do not use this override to point at another app’s data.
 
-If another window saves first, the stale window reloads the saved state and keeps the open draft. Review it and save again. Captured text is cleared only after a successful save. Dates and times are local calendar days and wall-clock times; there is no calendar or time-zone synchronization.
+If another window saves first, the stale window reloads the saved state and keeps the open draft. Review it and save again. Captured text is cleared only after a successful save. Local Workspace items use local calendar dates and wall-clock times; they do not create or modify provider records unless you explicitly choose a connected-service action.
 
 ## Recovery
 
@@ -107,11 +107,11 @@ Credentials, selected account data, transactions, cursors, and notes live in `~/
 
 ## Workspace for iPhone
 
-Open **Health → iPhone setup**. The native project and installation guide are in [`companion/README.md`](companion/README.md). The iPhone app mirrors the main Workspace areas with native Today, Inbox, Climbing, Health, and More tabs. The Mac remains the source of truth: provider credentials, Plaid Link, and Google/Todoist connection setup stay on the Mac, while the paired phone reads the sanitized views and sends revision-checked edits through the same local services.
+Open **Health → iPhone setup**. The native project and installation guide are in [`companion/README.md`](companion/README.md). The iPhone app mirrors the main Workspace areas with native Today, Inbox, Climbing, Health, and More tabs; Chess, Mail, Finance, Writing, Connections, and pairing live under More. The Mac remains the source of truth: provider credentials, Plaid Link, and Google/Todoist connection setup stay on the Mac, while the paired phone reads the sanitized views and sends revision-checked edits through the same local services.
 
-The app connects only while the Mac Workspace is running on the same private Wi-Fi. Its dedicated HTTPS listener uses a certificate pinned during pairing and a bearer token stored in the iPhone Keychain. The desktop web server, provider credentials, and private data files remain loopback-only. A new full-Workspace pairing is an explicit broader grant: existing Health-only tokens continue to sync Health but cannot read Daily, Climbing, Finance, Writing, Calendar, or Todoist data. Download a new pairing file after installing the expanded app.
+The app connects only while the Mac Workspace is running on the same private Wi-Fi. Its dedicated HTTPS listener uses a certificate pinned during pairing and a bearer token stored in the iPhone Keychain. The desktop web server, provider credentials, and private data files remain loopback-only. A new full-Workspace pairing is an explicit broader grant: existing Health-only tokens continue to sync Health but cannot read Daily, Climbing, Chess, Finance, Writing, Calendar, Gmail, or Todoist data. Download a new pairing file after installing the expanded app.
 
-The first native client supports the daily overview and Inbox, local Workspace edits, Climbing records, Apple Health sync and confirmed weight entries, Finance summaries/annotations, Writing drafts, and the sanitized Google Calendar, Gmail, and Todoist views. Gmail messages can be triaged, moved to Trash, composed, and replied to through the paired Mac. Bank connection setup or removal, Plaid credential entry, Google OAuth configuration, Todoist token entry, site export/recovery, and long-form Sleep archive editing remain Mac actions for now.
+The first native client supports the daily overview and Inbox, local Workspace edits, Climbing records, Chess lessons and reviews, Apple Health sync and confirmed weight entries, Finance summaries/annotations, Writing drafts, and the sanitized Google Calendar, Gmail, and Todoist views. Gmail messages can be triaged, moved to Trash, composed, and replied to through the paired Mac. Bank connection setup or removal, Plaid credential entry, Google OAuth configuration, Todoist token entry, site export/recovery, and long-form Sleep archive editing remain Mac actions for now.
 
 This Mac app cannot access HealthKit directly; Workspace for iPhone uses HealthKit with your selected permissions.
 
@@ -173,8 +173,14 @@ If an export was interrupted, **Recover saved draft** recognizes an already-crea
 
 Verification uses disposable repository fixtures for export, collisions, stale saves, Markdown, and recovery. A generated draft was also checked in an isolated copy of the actual personal site using its own `npm run verify`; the real site’s entries remain untouched.
 
-## Chess Desk integration direction
+## Chess practice
 
-The existing sibling `chess-desk` app contains opening lessons and spaced move-and-explanation reviews. It has one Sicilian/Najdorf lesson, progress/resume state, and authenticated Supabase review cards. It does not currently import games or ratings. Workspace has not copied its account data or added a chess connection yet.
+Chess brings the useful learning loop from the sibling `chess-desk` project into the personal Workspace: the Sicilian/Najdorf lesson, an interactive authored-move trainer, move-and-explanation reviews, progress, and recent study history. The daily overview stays compact and shows reviews due, the next review time, and lesson steps covered. The full course catalog and board live in **Chess**.
 
-The proposed first slice is a compact daily card showing reviews due, next review time, and lesson progress, with a link to continue training. An embedded short review session can follow if practicing inside Workspace is useful. Keep the lesson catalog, board, and engine out of the daily overview. Preserve the existing authenticated user and row-level data boundaries; the old `getReviewDeck()` helper writes missing review cards and must not be used as a read-only summary accessor. Label lesson progress as steps covered, since revealing answers currently advances it.
+Lesson progress and reviews use `~/Data/personal-workspace/chess.private.json`. The service validates lesson, segment, step, move, and explanation identifiers against the bundled catalog. Revision checks protect concurrent edits, stable request IDs make retries idempotent, and private atomic writes keep the previous saved file intact when a request fails. A revealed lesson answer counts as a step covered; review accuracy is calculated only from submitted move-and-explanation attempts. If `chess.private.json.lock` remains after a stopped process, follow the stopped-process/PID verification procedure in **Recovery** before removing that exact lock.
+
+**Block 20 minutes** and **Add review task** open reviewed drafts for the personal Google Calendar and Todoist Personal project. They do not create provider items automatically. Chess events and tasks are recognized by their `Chess ·` title for the daily context; durable provider links can be added if Chess later needs to own or reconcile those remote records.
+
+The iPhone companion reads and writes the same Chess state through its pinned, scope-limited Mac bridge. It includes the course summary, interactive tap-to-move lessons with hints and reveal, move-and-explanation reviews, saved progress, and review scheduling. The Mac remains the data source and must be running on the same private Wi-Fi.
+
+The standalone Chess Desk Supabase account and its existing rows are not imported automatically, and Workspace does not copy its auth credentials. Stockfish is intentionally omitted because the current authored lesson and review flow does not use engine analysis. Chess.com game and rating import remain separate from this first integrated practice slice.

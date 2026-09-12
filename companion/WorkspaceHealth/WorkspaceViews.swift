@@ -12,6 +12,7 @@ enum WorkspaceTab: Hashable {
 }
 
 private enum MoreRoute: Hashable {
+    case chess
     case mail
     case pairing
 }
@@ -31,6 +32,7 @@ struct WorkspaceRootView: View {
                         selectedDay: $selectedDay,
                         openClimbing: { tab = .climbing },
                         openHealth: { tab = .health },
+                        openChess: openChess,
                         openMail: openMail,
                         openPairing: openPairing
                     )
@@ -60,6 +62,7 @@ struct WorkspaceRootView: View {
                     MoreView()
                         .navigationDestination(for: MoreRoute.self) { route in
                             switch route {
+                            case .chess: ChessWorkspaceView()
                             case .mail: MailWorkspaceView()
                             case .pairing: PairingSyncView()
                             }
@@ -99,6 +102,11 @@ struct WorkspaceRootView: View {
 
     private func openMail() {
         morePath = [.mail]
+        tab = .more
+    }
+
+    private func openChess() {
+        morePath = [.chess]
         tab = .more
     }
 }
@@ -291,6 +299,7 @@ struct TodayView: View {
     @Binding var selectedDay: Date
     let openClimbing: () -> Void
     let openHealth: () -> Void
+    let openChess: () -> Void
     let openMail: () -> Void
     let openPairing: () -> Void
 
@@ -462,6 +471,9 @@ struct TodayView: View {
                 Button(action: openClimbing) {
                     SummaryRow(icon: "mountain.2.fill", color: .orange, title: "Climbing", detail: climbingSummary)
                 }
+                Button(action: openChess) {
+                    SummaryRow(icon: "checkerboard.rectangle", color: .indigo, title: "Chess", detail: chessSummary)
+                }
             }
         }
         .navigationTitle(day == today ? "Today" : shortDay(day))
@@ -492,6 +504,7 @@ struct TodayView: View {
                     }
                 } label: { Image(systemName: "plus") }
                 .disabled(!store.hasWorkspaceAccess)
+                .accessibilityLabel("Add to today")
             }
         }
         .refreshable {
@@ -563,7 +576,11 @@ struct TodayView: View {
     }
 
     private var healthSummary: String {
-        guard let value = store.healthSnapshot?.days.first(where: { $0.date == day }) else {
+        guard let value = preferredHealthDay(
+            on: day,
+            localSnapshot: store.healthSnapshot,
+            remoteSnapshot: store.healthView?.snapshot
+        ) else {
             return store.isPaired ? "No synced reading for this day" : "Pair your iPhone and Mac"
         }
         let steps = value.steps.map { "\(Int($0).formatted()) steps" }
@@ -585,6 +602,20 @@ struct TodayView: View {
             return goal.nextStep.isEmpty ? "Active goal · \(goal.title)" : "Next · \(goal.nextStep)"
         }
         return "Log or plan a climbing session"
+    }
+
+    private var chessSummary: String {
+        let summary = store.chess.summary
+        if summary.reviewsDue > 0 {
+            let reviews = summary.reviewsDue == 1 ? "1 review due" : "\(summary.reviewsDue) reviews due"
+            return "\(reviews) · \(summary.stepsCovered) of \(summary.totalSteps) steps covered"
+        }
+        if let nextDueAt = summary.nextDueAt {
+            return "Reviews clear · Next \(displayTimestamp(nextDueAt))"
+        }
+        return summary.totalSteps > 0
+            ? "\(summary.stepsCovered) of \(summary.totalSteps) steps covered"
+            : "Study and review your repertoire"
     }
 
     private func effectivePlanEvent(_ plan: ClimbingPlan) -> RemoteEvent? {
@@ -679,11 +710,13 @@ private struct WeekDayPicker: View {
         VStack(spacing: 10) {
             HStack {
                 Button { shift(-7) } label: { Image(systemName: "chevron.left") }
+                    .accessibilityLabel("Previous week")
                 Spacer()
                 Text(selection.formatted(.dateTime.month(.wide).year()))
                     .font(.subheadline.weight(.semibold))
                 Spacer()
                 Button { shift(7) } label: { Image(systemName: "chevron.right") }
+                    .accessibilityLabel("Next week")
             }
             HStack(spacing: 4) {
                 ForEach(days, id: \.self) { date in
@@ -1356,6 +1389,7 @@ struct ClimbingView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Button { createForSection() } label: { Image(systemName: "plus") }
                     .disabled(!store.hasWorkspaceAccess)
+                    .accessibilityLabel("Add " + section.rawValue.lowercased())
             }
         }
         .refreshable {
@@ -2429,11 +2463,34 @@ private struct ClimbingRoutineEditor: View {
 // MARK: - Health
 
 private struct MobileHealthDay {
-    let date: String
     let steps: Double?
     let sleepMinutes: Double?
     let restingHeartRate: Double?
     let weightKg: Double?
+}
+
+private func preferredHealthDay(
+    on day: String,
+    localSnapshot: HealthSnapshot?,
+    remoteSnapshot: PhoneHealthSnapshot?
+) -> MobileHealthDay? {
+    if let local = localSnapshot?.days.first(where: { $0.date == day }) {
+        return MobileHealthDay(
+            steps: local.steps,
+            sleepMinutes: local.sleepMinutes,
+            restingHeartRate: local.restingHeartRate,
+            weightKg: local.weightKg
+        )
+    }
+    if let remote = remoteSnapshot?.days.first(where: { $0.date == day }) {
+        return MobileHealthDay(
+            steps: remote.steps,
+            sleepMinutes: remote.sleepMinutes,
+            restingHeartRate: remote.restingHeartRate,
+            weightKg: remote.weightKg
+        )
+    }
+    return nil
 }
 
 struct HealthWorkspaceView: View {
@@ -2446,13 +2503,11 @@ struct HealthWorkspaceView: View {
 
     private var day: String { WorkspaceFormat.dayKey(selectedDay) }
     private var healthDay: MobileHealthDay? {
-        if let local = store.healthSnapshot?.days.first(where: { $0.date == day }) {
-            return MobileHealthDay(date: local.date, steps: local.steps, sleepMinutes: local.sleepMinutes, restingHeartRate: local.restingHeartRate, weightKg: local.weightKg)
-        }
-        if let remote = store.healthView?.snapshot?.days.first(where: { $0.date == day }) {
-            return MobileHealthDay(date: remote.date, steps: remote.steps, sleepMinutes: remote.sleepMinutes, restingHeartRate: remote.restingHeartRate, weightKg: remote.weightKg)
-        }
-        return nil
+        preferredHealthDay(
+            on: day,
+            localSnapshot: store.healthSnapshot,
+            remoteSnapshot: store.healthView?.snapshot
+        )
     }
     private var workouts: [UnifiedHealthWorkout] {
         preferredHealthWorkouts(
@@ -2538,13 +2593,7 @@ struct HealthWorkspaceView: View {
             await store.syncHealth()
             await store.load(.health, force: true)
         }
-        .task {
-            await store.load(.health)
-            if weightToReview == nil { weightToReview = store.commands.first }
-        }
-        .onChange(of: store.commands) { _, commands in
-            if weightToReview == nil { weightToReview = commands.first }
-        }
+        .task { await store.load(.health) }
         .sheet(isPresented: $showingImport) { HealthHistoryImportView() }
         .confirmationDialog(
             weightToReview.map { "Save \(weightLabel($0.kg)) to Apple Health?" } ?? "Save this measurement?",
@@ -2627,7 +2676,7 @@ struct MoreView: View {
             WorkspaceStatusBanner(openPairing: nil)
             Section("Workspace") {
                 NavigationLink { MailWorkspaceView() } label: {
-                    MoreDestinationRow(icon: "envelope.fill", color: .blue, title: "Email", detail: mailDetail)
+                    MoreDestinationRow(icon: "envelope.fill", color: .blue, title: "Mail", detail: mailDetail)
                 }
                 NavigationLink { FinanceWorkspaceView() } label: {
                     MoreDestinationRow(icon: "wallet.bifold.fill", color: .green, title: "Finances", detail: financeDetail)
@@ -2635,13 +2684,16 @@ struct MoreView: View {
                 NavigationLink { WritingWorkspaceView() } label: {
                     MoreDestinationRow(icon: "square.and.pencil", color: .purple, title: "Writing", detail: writingDetail)
                 }
+                NavigationLink { ChessWorkspaceView() } label: {
+                    MoreDestinationRow(icon: "checkerboard.rectangle", color: .indigo, title: "Chess", detail: chessDetail)
+                }
             }
             Section("Connected services") {
                 NavigationLink { ConnectionsView() } label: {
                     MoreDestinationRow(icon: "link", color: .blue, title: "Connections", detail: connectionsDetail)
                 }
                 NavigationLink { PairingSyncView() } label: {
-                    MoreDestinationRow(icon: "iphone.and.arrow.forward", color: .teal, title: "Pairing & Sync", detail: store.isPaired ? store.status : "Pair with your Mac")
+                    MoreDestinationRow(icon: "iphone.and.arrow.forward", color: .teal, title: "Pairing & Sync", detail: pairingDetail)
                 }
             }
             Section {
@@ -2667,9 +2719,24 @@ struct MoreView: View {
         guard store.writing.available else { return "Connect the site repository on your Mac" }
         return "\(store.writing.drafts.count) drafts · \(store.writing.entries.count) site entries"
     }
+    private var chessDetail: String {
+        let summary = store.chess.summary
+        if summary.reviewsDue > 0 {
+            return summary.reviewsDue == 1 ? "1 review due" : "\(summary.reviewsDue) reviews due"
+        }
+        return summary.totalSteps > 0
+            ? "\(summary.stepsCovered) of \(summary.totalSteps) steps covered"
+            : "Study and review your repertoire"
+    }
     private var connectionsDetail: String {
         let count = [store.integrations.google.connected, store.integrations.gmail.connected, store.integrations.todoist.connected].filter { $0 }.count
         return count == 0 ? "Google Calendar, Gmail, and Todoist" : "\(count) of 3 connected"
+    }
+    private var pairingDetail: String {
+        guard let credentials = store.credentials else { return "Pair with your Mac" }
+        return store.hasWorkspaceAccess
+            ? "Full Workspace · " + (credentials.url.host ?? "paired Mac")
+            : "Health only · Pair again for every area"
     }
 }
 
@@ -2686,6 +2753,1204 @@ private struct MoreDestinationRow: View {
                 Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
         }
+    }
+}
+
+// MARK: - Chess
+
+struct ChessWorkspaceView: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    @State private var reviewCard: ChessReviewCard?
+
+    var body: some View {
+        List {
+            WorkspaceStatusBanner(openPairing: nil)
+            EditorErrorSection(area: .chess)
+
+            Section("Study progress") {
+                LabeledContent("Reviews due", value: store.chess.summary.reviewsDue.formatted())
+                LabeledContent(
+                    "Steps covered",
+                    value: "\(store.chess.summary.stepsCovered) of \(store.chess.summary.totalSteps)"
+                )
+                if let accuracy = store.chess.summary.recentReviewAccuracy {
+                    LabeledContent(
+                        "Recent accuracy",
+                        value: accuracy.formatted(.percent.precision(.fractionLength(0)))
+                    )
+                }
+                if let next = store.chess.summary.nextDueAt, store.chess.summary.reviewsDue == 0 {
+                    LabeledContent("Next review", value: displayTimestamp(next))
+                }
+            }
+
+            Section {
+                if let first = store.chess.reviewQueue.first {
+                    Button {
+                        reviewCard = first
+                    } label: {
+                        Label(
+                            store.chess.summary.reviewsDue == 1 ? "Start 1 review" : "Start \(store.chess.summary.reviewsDue) reviews",
+                            systemImage: "play.fill"
+                        )
+                    }
+                    .disabled(!store.chess.capability.canWrite || store.isLoading(.chess))
+                } else {
+                    EmptyRow(
+                        icon: "checkmark.seal.fill",
+                        title: "Reviews are clear",
+                        detail: store.chess.summary.nextDueAt.map { "The next card is due \(displayTimestamp($0))." }
+                            ?? "New lesson steps will appear here for review."
+                    )
+                }
+            } header: {
+                Text("Review")
+            } footer: {
+                if !store.chess.reviewQueue.isEmpty {
+                    Text("Choose a move on the board, then explain why it works. Your Mac grades and schedules each card.")
+                }
+            }
+
+            Section("Courses") {
+                if store.chess.catalog.courses.isEmpty {
+                    EmptyRow(
+                        icon: "checkerboard.rectangle",
+                        title: "No chess catalog loaded",
+                        detail: store.isPaired ? "Refresh after the paired Mac finishes loading Chess." : "Pair with your Mac to load Chess."
+                    )
+                } else {
+                    ForEach(store.chess.catalog.courses) { course in
+                        let progress = courseProgress(course)
+                        NavigationLink {
+                            ChessCourseDetailView(course: course)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text(course.title).font(.headline).foregroundStyle(.primary)
+                                    Spacer()
+                                    Text(course.level).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Text(course.description)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                ProgressView(value: progress.total == 0 ? 0 : Double(progress.covered) / Double(progress.total))
+                                    .tint(.indigo)
+                                Text("\(progress.covered) of \(progress.total) trainer steps covered")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Chess")
+        .task { await store.load(.chess) }
+        .refreshable { await store.load(.chess, force: true) }
+        .sheet(item: $reviewCard) { card in
+            ChessReviewSessionView(firstCard: card)
+        }
+    }
+
+    private func courseProgress(_ course: ChessCourse) -> (covered: Int, total: Int) {
+        let lessonIds = Set(course.lessonIds)
+        let totalIds = Set(
+            store.chess.catalog.lessons
+                .filter { $0.courseId == course.id && lessonIds.contains($0.id) }
+                .flatMap { lesson in lesson.segments.flatMap { $0.steps ?? [] } }
+                .map(\.id)
+        )
+        let coveredIds = Set(
+            store.chess.state.progress
+                .filter { $0.courseId == course.id && lessonIds.contains($0.lessonId) }
+                .flatMap(\.completedStepIds)
+        )
+        return (coveredIds.intersection(totalIds).count, totalIds.count)
+    }
+}
+
+private struct ChessCourseDetailView: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    let course: ChessCourse
+
+    private var lessons: [ChessLesson] {
+        course.lessonIds.compactMap { id in
+            store.chess.catalog.lessons.first { $0.courseId == course.id && $0.id == id }
+        }
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Text(course.description).foregroundStyle(.secondary)
+                LabeledContent("Level", value: course.level)
+            }
+            Section("Lessons") {
+                ForEach(lessons) { lesson in
+                    NavigationLink {
+                        ChessLessonReaderView(lesson: lesson)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(lesson.title).foregroundStyle(.primary)
+                            Text(lessonProgressLabel(lesson))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle(course.title)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func lessonProgressLabel(_ lesson: ChessLesson) -> String {
+        let total = lesson.segments.flatMap { $0.steps ?? [] }.count
+        let covered = store.chess.state.progress
+            .first { $0.courseId == course.id && $0.lessonId == lesson.id }?
+            .completedStepIds.count ?? 0
+        return "\(min(covered, total)) of \(total) trainer steps covered"
+    }
+}
+
+private enum ChessLearnFeedbackKind {
+    case idle
+    case correct
+    case incorrect
+    case revealed
+}
+
+private struct ChessLessonReaderView: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    let lesson: ChessLesson
+
+    @State private var initialized = false
+    @State private var segmentIndex = 0
+    @State private var stepIndexBySegment: [String: Int] = [:]
+    @State private var completedStepIds: [String] = []
+    @State private var boardFen = ""
+    @State private var selectedFrom: String?
+    @State private var moveUci: String?
+    @State private var hintIndex = -1
+    @State private var revealedMove: String?
+    @State private var feedbackKind: ChessLearnFeedbackKind = .idle
+    @State private var feedbackText = "Read the idea, then use the board when the lesson asks for a move."
+    @State private var pendingProgress: ChessProgressRequest?
+    @State private var touchedStepIds: [String] = []
+    @State private var sessionRequest: ChessSessionRequest?
+    @State private var sessionSaved = false
+    @State private var reviewCard: ChessReviewCard?
+
+    private let startedAt = WorkspaceFormat.timestamp()
+
+    private var dueCards: [ChessReviewCard] {
+        store.chess.reviewQueue.filter { $0.courseId == lesson.courseId && $0.lessonId == lesson.id }
+    }
+
+    private var currentSegment: ChessLessonSegment? {
+        guard lesson.segments.indices.contains(segmentIndex) else { return nil }
+        return lesson.segments[segmentIndex]
+    }
+
+    private var currentStep: ChessTrainerStep? {
+        guard let segment = currentSegment, segment.type == .trainer, let steps = segment.steps else { return nil }
+        let index = stepIndexBySegment[segment.id] ?? 0
+        return steps.indices.contains(index) ? steps[index] : nil
+    }
+
+    private var allSteps: [ChessTrainerStep] {
+        lesson.segments.flatMap { $0.steps ?? [] }
+    }
+
+    var body: some View {
+        List {
+            if !initialized {
+                Section { ProgressView("Loading saved lesson position…") }
+            } else if let segment = currentSegment {
+                Section {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Section \(segmentIndex + 1) of \(lesson.segments.count)")
+                            Spacer()
+                            Text("\(coveredCount) of \(allSteps.count) steps")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        ProgressView(value: lesson.segments.isEmpty ? 0 : Double(segmentIndex + 1) / Double(lesson.segments.count))
+                            .tint(.indigo)
+                    }
+                    Menu {
+                        ForEach(lesson.segments.indices, id: \.self) { index in
+                            Button {
+                                moveToSegment(index)
+                            } label: {
+                                if index == segmentIndex {
+                                    Label(lesson.segments[index].title, systemImage: "checkmark")
+                                } else {
+                                    Text(lesson.segments[index].title)
+                                }
+                            }
+                            .disabled(pendingProgress != nil || store.isLoading(.chess))
+                        }
+                    } label: {
+                        Label("Choose lesson section", systemImage: "list.number")
+                    }
+                }
+
+                Section {
+                    ForEach(segment.body, id: \.self) { paragraph in
+                        Text(paragraph).font(.subheadline)
+                    }
+                } header: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(segment.type == .trainer ? trainerSectionLabel(segment) : segment.type.rawValue.capitalized)
+                            .font(.caption)
+                        Text(segment.title)
+                    }
+                }
+
+                if let step = currentStep {
+                    Section {
+                        Text(step.prompt).font(.headline)
+                        ChessBoardView(
+                            fen: boardFen,
+                            orientation: step.boardOrientation ?? segment.boardOrientation ?? .white,
+                            selectedFrom: $selectedFrom,
+                            moveUci: $moveUci,
+                            disabled: pendingProgress != nil || store.isLoading(.chess) || sessionSaved,
+                            onMove: attemptMove
+                        )
+                        Label(feedbackText, systemImage: feedbackIcon)
+                            .font(.subheadline)
+                            .foregroundStyle(feedbackColor)
+                        if hintIndex >= 0, step.hints.indices.contains(hintIndex) {
+                            Label(step.hints[hintIndex], systemImage: "lightbulb.fill")
+                                .font(.subheadline)
+                                .foregroundStyle(.orange)
+                        }
+                        if let revealedMove {
+                            LabeledContent("Lesson move", value: revealedMove.uppercased())
+                        }
+                        HStack {
+                            Button(hintIndex < 0 ? "Hint" : "Another hint", systemImage: "lightbulb") {
+                                revealHint()
+                            }
+                            .disabled(step.hints.isEmpty || hintIndex >= step.hints.count - 1 || pendingProgress != nil)
+                            Spacer()
+                            Button("Reveal", systemImage: "scope") {
+                                revealLessonMove()
+                            }
+                            .disabled(revealedMove != nil || pendingProgress != nil)
+                        }
+                        Button("Reset position", systemImage: "arrow.counterclockwise") {
+                            resetPosition(segment: segment, step: step)
+                        }
+                        .disabled(pendingProgress != nil)
+                    } header: {
+                        Text("Position")
+                    } footer: {
+                        Text("Tap your piece, then its destination. Legal moves that differ from the authored lesson move stay available to retry. Reveal counts as covered, not mastered.")
+                    }
+                } else {
+                    Section("Position") {
+                        ChessBoardView(
+                            fen: boardFen,
+                            orientation: segment.boardOrientation ?? .white,
+                            selectedFrom: .constant(nil),
+                            moveUci: .constant(nil),
+                            disabled: true
+                        )
+                    }
+                }
+
+                EditorErrorSection(area: .chess)
+
+                if let pendingProgress, store.areaErrors[.chess] != nil {
+                    Section {
+                        Button(store.chessProgressNeedsRebase ? "Retry with latest progress" : "Retry saved progress") {
+                            retryProgress(pendingProgress)
+                        }
+                        .disabled(store.isLoading(.chess))
+                    } footer: {
+                        Text(store.chessProgressNeedsRebase
+                            ? "The latest Mac revision is loaded. Your lesson position and covered steps are still here and will be saved as a new request."
+                            : "Workspace will retry the identical request ID and lesson state, so an uncertain response cannot skip or duplicate progress.")
+                    }
+                }
+
+                if sessionSaved {
+                    Section {
+                        Label("Lesson session saved", systemImage: "checkmark.seal.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+
+                Section {
+                    HStack {
+                        Button("Previous", systemImage: "chevron.left") {
+                            moveToSegment(segmentIndex - 1)
+                        }
+                        .disabled(segmentIndex == 0 || pendingProgress != nil || store.isLoading(.chess) || sessionSaved)
+                        Spacer()
+                        Button(isFinalPosition ? "Finish lesson" : "Continue", systemImage: "chevron.right") {
+                            advance()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.indigo)
+                        .disabled(!canAdvance || pendingProgress != nil || store.isLoading(.chess) || sessionSaved)
+                    }
+                }
+
+                if let first = dueCards.first {
+                    Section("Review") {
+                        Button {
+                            reviewCard = first
+                        } label: {
+                            Label(
+                                dueCards.count == 1 ? "Review 1 due position" : "Review \(dueCards.count) due positions",
+                                systemImage: "play.fill"
+                            )
+                        }
+                        .disabled(pendingProgress != nil || store.isLoading(.chess))
+                    }
+                }
+            }
+        }
+        .navigationTitle(lesson.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .task { initializeLesson() }
+        .sheet(item: $reviewCard) { card in
+            ChessReviewSessionView(firstCard: card)
+        }
+    }
+
+    private var coveredCount: Int {
+        Set(completedStepIds).intersection(Set(allSteps.map(\.id))).count
+    }
+
+    private var canAdvance: Bool {
+        guard let step = currentStep else { return true }
+        return completedStepIds.contains(step.id)
+    }
+
+    private var isFinalPosition: Bool {
+        guard let segment = currentSegment else { return true }
+        let finalSegment = segmentIndex == lesson.segments.count - 1
+        guard segment.type == .trainer, let steps = segment.steps else { return finalSegment }
+        return finalSegment && (stepIndexBySegment[segment.id] ?? 0) == steps.count - 1
+    }
+
+    private var feedbackColor: Color {
+        switch feedbackKind {
+        case .idle: .secondary
+        case .correct: .green
+        case .incorrect: .orange
+        case .revealed: .indigo
+        }
+    }
+
+    private var feedbackIcon: String {
+        switch feedbackKind {
+        case .idle: "circle.dashed"
+        case .correct: "checkmark.circle.fill"
+        case .incorrect: "exclamationmark.circle.fill"
+        case .revealed: "scope"
+        }
+    }
+
+    private func trainerSectionLabel(_ segment: ChessLessonSegment) -> String {
+        let index = stepIndexBySegment[segment.id] ?? 0
+        return "Practice \(index + 1) of \(segment.steps?.count ?? 0)"
+    }
+
+    private func initializeLesson() {
+        guard !initialized else { return }
+        let saved = store.chess.state.progress.first {
+            $0.courseId == lesson.courseId && $0.lessonId == lesson.id
+        }
+        completedStepIds = saved?.completedStepIds ?? []
+        if let saved, let index = lesson.segments.firstIndex(where: { $0.id == saved.currentSegmentId }) {
+            segmentIndex = index
+            if let currentStepId = saved.currentStepId,
+               let steps = lesson.segments[index].steps,
+               let stepIndex = steps.firstIndex(where: { $0.id == currentStepId }) {
+                stepIndexBySegment[lesson.segments[index].id] = stepIndex
+            }
+        }
+        initialized = true
+        let segment = lesson.segments.indices.contains(segmentIndex) ? lesson.segments[segmentIndex] : nil
+        let step = segment?.steps.flatMap { steps in
+            let index = stepIndexBySegment[segment?.id ?? ""] ?? 0
+            return steps.indices.contains(index) ? steps[index] : nil
+        }
+        resetPosition(segment: segment, step: step)
+    }
+
+    private func resetPosition(segment: ChessLessonSegment?, step: ChessTrainerStep?) {
+        boardFen = step?.fen ?? segment?.fen ?? lesson.initialFen
+        selectedFrom = nil
+        moveUci = nil
+        hintIndex = -1
+        revealedMove = nil
+        if let step, completedStepIds.contains(step.id) {
+            feedbackKind = .idle
+            feedbackText = "This step is covered. Try it again or continue when you are ready."
+        } else {
+            feedbackKind = .idle
+            feedbackText = "Find the lesson move on the board."
+        }
+    }
+
+    private func attemptMove(_ candidate: String) {
+        guard pendingProgress == nil, let segment = currentSegment, let step = currentStep else { return }
+        guard var position = ChessBoardPosition(fen: step.fen).applying(candidate) else {
+            selectedFrom = nil
+            moveUci = nil
+            feedbackKind = .incorrect
+            feedbackText = "That move is illegal in this position. Try another square."
+            return
+        }
+        let normalized = candidate.lowercased()
+        guard step.acceptedMoves.map({ $0.lowercased() }).contains(normalized) else {
+            selectedFrom = nil
+            moveUci = nil
+            feedbackKind = .incorrect
+            feedbackText = "\(normalized.uppercased()) is legal, but it is not the authored lesson move. Try the central idea again or use a hint."
+            return
+        }
+        for reply in step.opponentReplies ?? [] {
+            guard let replied = position.applying(reply.lowercased()) else { break }
+            position = replied
+        }
+        boardFen = position.fen
+        feedbackKind = .correct
+        feedbackText = "\(normalized.uppercased()) is right. \(step.explanation)"
+        complete(step, in: segment)
+    }
+
+    private func revealHint() {
+        guard let step = currentStep, !step.hints.isEmpty else { return }
+        hintIndex = min(hintIndex + 1, step.hints.count - 1)
+    }
+
+    private func revealLessonMove() {
+        guard pendingProgress == nil, let segment = currentSegment, let step = currentStep,
+              let solution = step.acceptedMoves.first else { return }
+        boardFen = step.fen
+        selectedFrom = String(solution.prefix(2))
+        moveUci = solution.lowercased()
+        revealedMove = solution
+        feedbackKind = .revealed
+        feedbackText = "The lesson move is \(solution.uppercased()). \(step.explanation)"
+        complete(step, in: segment)
+    }
+
+    private func complete(_ step: ChessTrainerStep, in segment: ChessLessonSegment) {
+        if !completedStepIds.contains(step.id) { completedStepIds.append(step.id) }
+        if !touchedStepIds.contains(step.id) { touchedStepIds.append(step.id) }
+        beginProgressSave(segment: segment, step: step, completed: completedStepIds)
+    }
+
+    private func moveToSegment(_ requestedIndex: Int) {
+        guard pendingProgress == nil, !store.isLoading(.chess), !sessionSaved, !lesson.segments.isEmpty else { return }
+        let nextIndex = max(0, min(lesson.segments.count - 1, requestedIndex))
+        let segment = lesson.segments[nextIndex]
+        let stepIndex = stepIndexBySegment[segment.id] ?? 0
+        let step = segment.steps.flatMap { $0.indices.contains(stepIndex) ? $0[stepIndex] : nil }
+        segmentIndex = nextIndex
+        resetPosition(segment: segment, step: step)
+        beginProgressSave(segment: segment, step: step, completed: completedStepIds)
+    }
+
+    private func advance() {
+        guard pendingProgress == nil, let segment = currentSegment else { return }
+        if let steps = segment.steps {
+            let currentIndex = stepIndexBySegment[segment.id] ?? 0
+            if currentIndex + 1 < steps.count {
+                var indices = stepIndexBySegment
+                indices[segment.id] = currentIndex + 1
+                stepIndexBySegment = indices
+                let nextStep = steps[currentIndex + 1]
+                resetPosition(segment: segment, step: nextStep)
+                beginProgressSave(segment: segment, step: nextStep, completed: completedStepIds)
+                return
+            }
+        }
+        if segmentIndex + 1 < lesson.segments.count {
+            moveToSegment(segmentIndex + 1)
+        } else {
+            finishLesson()
+        }
+    }
+
+    private func beginProgressSave(
+        segment: ChessLessonSegment,
+        step: ChessTrainerStep?,
+        completed: [String]
+    ) {
+        guard pendingProgress == nil else { return }
+        let request = ChessProgressRequest(
+            revision: store.chess.state.revision,
+            courseId: lesson.courseId,
+            lessonId: lesson.id,
+            currentSegmentId: segment.id,
+            currentStepId: step?.id,
+            completedStepIds: completed
+        )
+        pendingProgress = request
+        saveProgress(request)
+    }
+
+    private func retryProgress(_ saved: ChessProgressRequest) {
+        var request = saved
+        if store.chessProgressNeedsRebase {
+            request.revision = store.chess.state.revision
+            request.requestId = UUID().uuidString.lowercased()
+            pendingProgress = request
+            store.prepareRebasedChessProgress()
+        }
+        saveProgress(request)
+    }
+
+    private func saveProgress(_ request: ChessProgressRequest) {
+        Task {
+            if await store.saveChessProgress(request), pendingProgress?.requestId == request.requestId {
+                pendingProgress = nil
+            }
+        }
+    }
+
+    private func finishLesson() {
+        guard pendingProgress == nil else { return }
+        if store.chessSessionNeedsRebase {
+            sessionRequest = nil
+            store.prepareRebasedChessSession()
+        }
+        let request = sessionRequest ?? ChessSessionRequest(
+            revision: store.chess.state.revision,
+            mode: .lesson,
+            courseId: lesson.courseId,
+            lessonId: lesson.id,
+            startedAt: startedAt,
+            endedAt: WorkspaceFormat.timestamp(),
+            stepIds: touchedStepIds,
+            reviewAttemptIds: []
+        )
+        sessionRequest = request
+        Task {
+            if await store.saveChessSession(request) != nil {
+                sessionRequest = nil
+                sessionSaved = true
+            }
+        }
+    }
+}
+
+private struct ChessReviewSessionView: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    @Environment(\.dismiss) private var dismiss
+
+    private let courseId: String
+    private let lessonId: String
+    private let startedAt: String
+
+    @State private var card: ChessReviewCard
+    @State private var selectedFrom: String?
+    @State private var moveUci: String?
+    @State private var reasonChoiceId: String?
+    @State private var pendingReview: ChessReviewRequest?
+    @State private var result: ChessReviewResult?
+    @State private var reviewedStepIds: [String] = []
+    @State private var reviewAttemptIds: [String] = []
+    @State private var sessionRequest: ChessSessionRequest?
+
+    init(firstCard: ChessReviewCard) {
+        courseId = firstCard.courseId
+        lessonId = firstCard.lessonId
+        startedAt = WorkspaceFormat.timestamp()
+        _card = State(initialValue: firstCard)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(card.courseTitle).font(.caption.weight(.semibold)).foregroundStyle(.indigo)
+                        Text(card.lessonTitle).font(.headline)
+                        Text(card.prompt).font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    ChessBoardView(
+                        fen: card.fen,
+                        orientation: card.boardOrientation,
+                        selectedFrom: $selectedFrom,
+                        moveUci: $moveUci,
+                        disabled: pendingReview != nil || result != nil
+                    )
+
+                    if let moveUci {
+                        HStack {
+                            LabeledContent("Your move", value: moveUci.uppercased())
+                            if pendingReview == nil, result == nil {
+                                Button("Reset") {
+                                    selectedFrom = nil
+                                    self.moveUci = nil
+                                }
+                                .font(.caption.weight(.semibold))
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("Tap the piece you want to move, then its destination square. Promotions default to a queen.")
+                }
+
+                Section(card.question) {
+                    ForEach(card.choices) { choice in
+                        Button {
+                            reasonChoiceId = choice.id
+                        } label: {
+                            HStack(alignment: .top, spacing: 10) {
+                                Image(systemName: reasonChoiceId == choice.id ? "largecircle.fill.circle" : "circle")
+                                    .foregroundStyle(reasonChoiceId == choice.id ? Color.indigo : Color.secondary)
+                                Text(choice.text).foregroundStyle(.primary)
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(pendingReview != nil || result != nil)
+                    }
+                }
+
+                EditorErrorSection(area: .chess)
+
+                if let result {
+                    Section {
+                        Label(
+                            result.grade == .good ? "Move and reason correct" : "Review this position again",
+                            systemImage: result.grade == .good ? "checkmark.seal.fill" : "arrow.clockwise.circle.fill"
+                        )
+                        .foregroundStyle(result.grade == .good ? Color.green : Color.orange)
+                        LabeledContent("Move", value: result.moveCorrect ? "Correct" : "Needs another look")
+                        LabeledContent("Reason", value: result.reasonCorrect ? "Correct" : "Needs another look")
+                        Text(card.step.explanation)
+                            .font(.subheadline)
+                        if result.grade == .again, let accepted = card.step.acceptedMoves.first {
+                            Text("Study move: \(accepted.uppercased())")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                    } header: {
+                        Text("Result")
+                    } footer: {
+                        Text("Scheduled for \(displayTimestamp(result.dueAt)).")
+                    }
+
+                    Section {
+                        Button(sessionRequest == nil ? nextActionTitle : "Retry saving session") {
+                            if let next = nextCard {
+                                show(next)
+                            } else {
+                                Task { await finishSession() }
+                            }
+                        }
+                        .disabled(store.isLoading(.chess))
+                    }
+                } else {
+                    Section {
+                        if pendingReview != nil, store.chessReviewNoLongerDue {
+                            Button("Return to current review queue") {
+                                store.dismissStaleChessReview()
+                                dismiss()
+                            }
+                        } else {
+                            Button(pendingReview == nil ? "Check answer" : "Retry saved answer") {
+                                Task { await submitReview() }
+                            }
+                            .disabled(
+                                moveUci == nil || reasonChoiceId == nil || store.isLoading(.chess)
+                            )
+                            if pendingReview != nil, store.chessReviewCanChangeAnswer {
+                                Button("Change answer") {
+                                    pendingReview = nil
+                                    selectedFrom = nil
+                                    moveUci = nil
+                                    reasonChoiceId = nil
+                                    store.changeChessReviewAnswer()
+                                }
+                            }
+                        }
+                    } footer: {
+                        if pendingReview != nil, store.chessReviewNoLongerDue {
+                            Text("This position was completed in another view and is no longer due. The current queue has been loaded from your Mac.")
+                        } else if pendingReview != nil, store.chessReviewCanChangeAnswer {
+                            Text("The Mac rejected this answer before saving it. Change the move or reason, then submit a new request.")
+                        } else if pendingReview != nil {
+                            Text("The same saved answer and request ID will be retried, so a dropped response cannot create a second attempt.")
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Chess review")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private var nextCard: ChessReviewCard? {
+        store.chess.reviewQueue.first {
+            $0.courseId == courseId && $0.lessonId == lessonId && $0.stepId != card.stepId
+        }
+    }
+
+    private var nextActionTitle: String {
+        nextCard == nil ? "Save session and finish" : "Next review"
+    }
+
+    private func submitReview() async {
+        guard let moveUci, let reasonChoiceId else { return }
+        let request = pendingReview ?? ChessReviewRequest(
+            revision: store.chess.state.revision,
+            courseId: card.courseId,
+            lessonId: card.lessonId,
+            stepId: card.stepId,
+            moveUci: moveUci,
+            reasonChoiceId: reasonChoiceId
+        )
+        pendingReview = request
+        guard let saved = await store.submitChessReview(request) else { return }
+        pendingReview = nil
+        result = saved
+        if !reviewedStepIds.contains(card.stepId) { reviewedStepIds.append(card.stepId) }
+        if !reviewAttemptIds.contains(saved.attemptId) { reviewAttemptIds.append(saved.attemptId) }
+    }
+
+    private func show(_ next: ChessReviewCard) {
+        card = next
+        selectedFrom = nil
+        moveUci = nil
+        reasonChoiceId = nil
+        pendingReview = nil
+        result = nil
+    }
+
+    private func finishSession() async {
+        guard !reviewAttemptIds.isEmpty else {
+            dismiss()
+            return
+        }
+        if store.chessSessionNeedsRebase {
+            sessionRequest = nil
+            store.prepareRebasedChessSession()
+        }
+        let request = sessionRequest ?? ChessSessionRequest(
+            revision: store.chess.state.revision,
+            mode: .review,
+            courseId: courseId,
+            lessonId: lessonId,
+            startedAt: startedAt,
+            endedAt: WorkspaceFormat.timestamp(),
+            stepIds: reviewedStepIds,
+            reviewAttemptIds: reviewAttemptIds
+        )
+        sessionRequest = request
+        if await store.saveChessSession(request) != nil {
+            sessionRequest = nil
+            dismiss()
+        }
+    }
+}
+
+private struct ChessBoardPosition {
+    var activeColor: ChessBoardOrientation
+    var pieces: [String: Character]
+    var castling: String
+    var enPassant: String?
+    var halfmoveClock: Int
+    var fullmoveNumber: Int
+
+    init(fen: String) {
+        let fields = fen.split(separator: " ").map(String.init)
+        activeColor = fields.indices.contains(1) && fields[1] == "b" ? .black : .white
+        castling = fields.indices.contains(2) ? fields[2] : "-"
+        enPassant = fields.indices.contains(3) && fields[3] != "-" ? fields[3] : nil
+        halfmoveClock = fields.indices.contains(4) ? Int(fields[4]) ?? 0 : 0
+        fullmoveNumber = fields.indices.contains(5) ? Int(fields[5]) ?? 1 : 1
+        var parsed: [String: Character] = [:]
+        let rows = fields.first?.split(separator: "/") ?? []
+        for (rowIndex, row) in rows.prefix(8).enumerated() {
+            var fileIndex = 0
+            for symbol in row {
+                if let count = symbol.wholeNumberValue {
+                    fileIndex += count
+                } else if fileIndex < 8 {
+                    let file = Array("abcdefgh")[fileIndex]
+                    parsed["\(file)\(8 - rowIndex)"] = symbol
+                    fileIndex += 1
+                }
+            }
+        }
+        pieces = parsed
+    }
+
+    var fen: String {
+        var rows: [String] = []
+        for rank in (1...8).reversed() {
+            var row = ""
+            var empty = 0
+            for file in Array("abcdefgh") {
+                if let piece = pieces["\(file)\(rank)"] {
+                    if empty > 0 { row += String(empty); empty = 0 }
+                    row.append(piece)
+                } else {
+                    empty += 1
+                }
+            }
+            if empty > 0 { row += String(empty) }
+            rows.append(row)
+        }
+        return [
+            rows.joined(separator: "/"),
+            activeColor == .white ? "w" : "b",
+            castling.isEmpty || castling == "-" ? "-" : castling,
+            enPassant ?? "-",
+            String(halfmoveClock),
+            String(fullmoveNumber),
+        ].joined(separator: " ")
+    }
+
+    func canMovePiece(on square: String) -> Bool {
+        guard let piece = pieces[square] else { return false }
+        return color(of: piece) == activeColor
+    }
+
+    func applying(_ uci: String) -> ChessBoardPosition? {
+        let normalized = uci.lowercased()
+        guard normalized.count == 4 || normalized.count == 5 else { return nil }
+        let symbols = Array(normalized)
+        let from = String(symbols[0...1])
+        let to = String(symbols[2...3])
+        let promotion = symbols.count == 5 ? symbols[4] : nil
+        guard let source = coordinate(from), let target = coordinate(to),
+              let piece = pieces[from], color(of: piece) == activeColor,
+              pieces[to].map({ color(of: $0) != activeColor && $0.lowercased() != "k" }) ?? true,
+              pseudoLegal(piece: piece, from: source, to: target, promotion: promotion) else { return nil }
+
+        var next = self
+        let captured = next.pieces[to]
+        next.pieces.removeValue(forKey: from)
+
+        if piece.lowercased() == "p", source.file != target.file, captured == nil {
+            guard enPassant == to else { return nil }
+            next.pieces.removeValue(forKey: square(file: target.file, rank: source.rank))
+        }
+
+        var movedPiece = piece
+        if piece.lowercased() == "p", target.rank == 1 || target.rank == 8 {
+            guard let promotion, "qrbn".contains(promotion) else { return nil }
+            movedPiece = activeColor == .white ? Character(String(promotion).uppercased()) : promotion
+        } else if promotion != nil {
+            return nil
+        }
+        next.pieces[to] = movedPiece
+
+        if piece.lowercased() == "k", abs(target.file - source.file) == 2 {
+            let kingSide = target.file > source.file
+            let rookFrom = square(file: kingSide ? 7 : 0, rank: source.rank)
+            let rookTo = square(file: kingSide ? 5 : 3, rank: source.rank)
+            guard let rook = next.pieces.removeValue(forKey: rookFrom) else { return nil }
+            next.pieces[rookTo] = rook
+        }
+
+        next.removeCastlingRights(forMovedPiece: piece, from: from, captured: captured, at: to)
+        if piece.lowercased() == "p", abs(target.rank - source.rank) == 2 {
+            next.enPassant = square(file: source.file, rank: (source.rank + target.rank) / 2)
+        } else {
+            next.enPassant = nil
+        }
+        next.halfmoveClock = piece.lowercased() == "p" || captured != nil ? 0 : halfmoveClock + 1
+        if activeColor == .black { next.fullmoveNumber += 1 }
+        guard !next.kingIsAttacked(activeColor) else { return nil }
+        next.activeColor = activeColor == .white ? .black : .white
+        return next
+    }
+
+    private func pseudoLegal(
+        piece: Character,
+        from: (file: Int, rank: Int),
+        to: (file: Int, rank: Int),
+        promotion: Character?
+    ) -> Bool {
+        let dx = to.file - from.file
+        let dy = to.rank - from.rank
+        let targetSquare = square(file: to.file, rank: to.rank)
+        switch piece.lowercased() {
+        case "p":
+            let direction = activeColor == .white ? 1 : -1
+            let homeRank = activeColor == .white ? 2 : 7
+            let promotionRank = activeColor == .white ? 8 : 1
+            if to.rank == promotionRank {
+                guard let promotion, "qrbn".contains(promotion) else { return false }
+            } else if promotion != nil {
+                return false
+            }
+            if dx == 0, dy == direction { return pieces[targetSquare] == nil }
+            if dx == 0, dy == 2 * direction, from.rank == homeRank {
+                return pieces[targetSquare] == nil
+                    && pieces[square(file: from.file, rank: from.rank + direction)] == nil
+            }
+            if abs(dx) == 1, dy == direction {
+                return pieces[targetSquare] != nil || enPassant == targetSquare
+            }
+            return false
+        case "n":
+            return (abs(dx), abs(dy)) == (1, 2) || (abs(dx), abs(dy)) == (2, 1)
+        case "b":
+            return abs(dx) == abs(dy) && pathIsClear(from: from, to: to)
+        case "r":
+            return (dx == 0 || dy == 0) && pathIsClear(from: from, to: to)
+        case "q":
+            return (dx == 0 || dy == 0 || abs(dx) == abs(dy)) && pathIsClear(from: from, to: to)
+        case "k":
+            if max(abs(dx), abs(dy)) == 1 { return true }
+            return canCastle(from: from, to: to)
+        default:
+            return false
+        }
+    }
+
+    private func canCastle(from: (file: Int, rank: Int), to: (file: Int, rank: Int)) -> Bool {
+        guard from.file == 4, from.rank == (activeColor == .white ? 1 : 8),
+              to.rank == from.rank, abs(to.file - from.file) == 2 else { return false }
+        let kingSide = to.file > from.file
+        let right: Character = activeColor == .white
+            ? (kingSide ? "K" : "Q")
+            : (kingSide ? "k" : "q")
+        guard castling.contains(right) else { return false }
+        let between = kingSide ? [5, 6] : [1, 2, 3]
+        guard between.allSatisfy({ pieces[square(file: $0, rank: from.rank)] == nil }) else { return false }
+        let rookSquare = square(file: kingSide ? 7 : 0, rank: from.rank)
+        guard let rook = pieces[rookSquare], rook.lowercased() == "r", color(of: rook) == activeColor else { return false }
+        let enemy: ChessBoardOrientation = activeColor == .white ? .black : .white
+        let transit = kingSide ? [4, 5, 6] : [4, 3, 2]
+        return transit.allSatisfy { !isAttacked(square(file: $0, rank: from.rank), by: enemy) }
+    }
+
+    private func pathIsClear(from: (file: Int, rank: Int), to: (file: Int, rank: Int)) -> Bool {
+        let stepFile = (to.file - from.file).signum()
+        let stepRank = (to.rank - from.rank).signum()
+        var file = from.file + stepFile
+        var rank = from.rank + stepRank
+        while file != to.file || rank != to.rank {
+            if pieces[square(file: file, rank: rank)] != nil { return false }
+            file += stepFile
+            rank += stepRank
+        }
+        return true
+    }
+
+    private func kingIsAttacked(_ color: ChessBoardOrientation) -> Bool {
+        guard let king = pieces.first(where: {
+            $0.value == (color == .white ? Character("K") : Character("k"))
+        })?.key else { return true }
+        let enemy: ChessBoardOrientation = color == .white ? .black : .white
+        return isAttacked(king, by: enemy)
+    }
+
+    private func isAttacked(_ target: String, by attacker: ChessBoardOrientation) -> Bool {
+        guard let destination = coordinate(target) else { return false }
+        for (sourceSquare, piece) in pieces where color(of: piece) == attacker {
+            guard let source = coordinate(sourceSquare) else { continue }
+            let dx = destination.file - source.file
+            let dy = destination.rank - source.rank
+            switch piece.lowercased() {
+            case "p":
+                let direction = attacker == .white ? 1 : -1
+                if abs(dx) == 1 && dy == direction { return true }
+            case "n":
+                if (abs(dx), abs(dy)) == (1, 2) || (abs(dx), abs(dy)) == (2, 1) { return true }
+            case "b":
+                if abs(dx) == abs(dy) && pathIsClear(from: source, to: destination) { return true }
+            case "r":
+                if (dx == 0 || dy == 0) && pathIsClear(from: source, to: destination) { return true }
+            case "q":
+                if (dx == 0 || dy == 0 || abs(dx) == abs(dy)) && pathIsClear(from: source, to: destination) { return true }
+            case "k":
+                if max(abs(dx), abs(dy)) == 1 { return true }
+            default:
+                continue
+            }
+        }
+        return false
+    }
+
+    private mutating func removeCastlingRights(
+        forMovedPiece piece: Character,
+        from: String,
+        captured: Character?,
+        at target: String
+    ) {
+        var removed = Set<Character>()
+        if piece == "K" { removed.formUnion(["K", "Q"]) }
+        if piece == "k" { removed.formUnion(["k", "q"]) }
+        if piece == "R", from == "a1" { removed.insert("Q") }
+        if piece == "R", from == "h1" { removed.insert("K") }
+        if piece == "r", from == "a8" { removed.insert("q") }
+        if piece == "r", from == "h8" { removed.insert("k") }
+        if captured == "R", target == "a1" { removed.insert("Q") }
+        if captured == "R", target == "h1" { removed.insert("K") }
+        if captured == "r", target == "a8" { removed.insert("q") }
+        if captured == "r", target == "h8" { removed.insert("k") }
+        castling = String(castling.filter { !removed.contains($0) })
+        if castling.isEmpty { castling = "-" }
+    }
+
+    private func coordinate(_ square: String) -> (file: Int, rank: Int)? {
+        let symbols = Array(square)
+        guard symbols.count == 2,
+              let file = Array("abcdefgh").firstIndex(of: symbols[0]),
+              let rank = symbols[1].wholeNumberValue,
+              (1...8).contains(rank) else { return nil }
+        return (file, rank)
+    }
+
+    private func square(file: Int, rank: Int) -> String {
+        guard (0..<8).contains(file), (1...8).contains(rank) else { return "" }
+        return "\(Array("abcdefgh")[file])\(rank)"
+    }
+
+    private func color(of piece: Character) -> ChessBoardOrientation {
+        piece.isUppercase ? .white : .black
+    }
+}
+
+private struct ChessBoardView: View {
+    let fen: String
+    let orientation: ChessBoardOrientation
+    @Binding var selectedFrom: String?
+    @Binding var moveUci: String?
+    let disabled: Bool
+    var onMove: ((String) -> Void)? = nil
+
+    private var position: ChessBoardPosition { ChessBoardPosition(fen: fen) }
+    private var files: [Character] {
+        let values = Array("abcdefgh")
+        return orientation == .white ? values : values.reversed()
+    }
+    private var ranks: [Int] {
+        orientation == .white ? Array((1...8).reversed()) : Array(1...8)
+    }
+    private var squares: [String] {
+        ranks.flatMap { rank in files.map { "\($0)\(rank)" } }
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            let size = proxy.size.width / 8
+            LazyVGrid(columns: Array(repeating: GridItem(.fixed(size), spacing: 0), count: 8), spacing: 0) {
+                ForEach(squares, id: \.self) { square in
+                    Button {
+                        choose(square)
+                    } label: {
+                        ZStack {
+                            squareColor(square)
+                            if let piece = position.pieces[square] {
+                                Text(pieceGlyph(piece))
+                                    .font(.system(size: max(18, size * 0.64)))
+                                    .foregroundStyle(piece.isUppercase ? Color.white : Color.black)
+                                    .shadow(color: piece.isUppercase ? .black.opacity(0.55) : .white.opacity(0.35), radius: 0.5)
+                            }
+                            if selectedFrom == square || moveUci?.hasSuffix(square) == true {
+                                Rectangle().stroke(Color.yellow, lineWidth: 3)
+                            }
+                        }
+                        .frame(width: size, height: size)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(disabled)
+                    .accessibilityLabel(accessibilityLabel(square))
+                }
+            }
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.35)))
+    }
+
+    private func choose(_ square: String) {
+        guard !disabled else { return }
+        if position.canMovePiece(on: square) {
+            selectedFrom = square
+            moveUci = nil
+            return
+        }
+        guard let from = selectedFrom, from != square else {
+            selectedFrom = nil
+            moveUci = nil
+            return
+        }
+        let promotion = promotionSuffix(from: from, to: square)
+        let candidate = from + square + promotion
+        moveUci = candidate
+        onMove?(candidate)
+    }
+
+    private func promotionSuffix(from: String, to: String) -> String {
+        guard let piece = position.pieces[from], piece.lowercased() == "p",
+              to.last == "1" || to.last == "8" else { return "" }
+        return "q"
+    }
+
+    private func squareColor(_ square: String) -> Color {
+        let file = square.first.flatMap { Array("abcdefgh").firstIndex(of: $0) } ?? 0
+        let rank = Int(String(square.last ?? "1")) ?? 1
+        return (file + rank).isMultiple(of: 2)
+            ? Color(red: 0.82, green: 0.86, blue: 0.78)
+            : Color(red: 0.33, green: 0.45, blue: 0.35)
+    }
+
+    private func pieceGlyph(_ piece: Character) -> String {
+        switch piece {
+        case "K": "♔"
+        case "Q": "♕"
+        case "R": "♖"
+        case "B": "♗"
+        case "N": "♘"
+        case "P": "♙"
+        case "k": "♚"
+        case "q": "♛"
+        case "r": "♜"
+        case "b": "♝"
+        case "n": "♞"
+        case "p": "♟"
+        default: ""
+        }
+    }
+
+    private func accessibilityLabel(_ square: String) -> String {
+        guard let piece = position.pieces[square] else { return "Empty \(square)" }
+        return "\(pieceName(piece)) on \(square)"
+    }
+
+    private func pieceName(_ piece: Character) -> String {
+        let color = piece.isUppercase ? "White" : "Black"
+        let name: String
+        switch piece.lowercased() {
+        case "k": name = "king"
+        case "q": name = "queen"
+        case "r": name = "rook"
+        case "b": name = "bishop"
+        case "n": name = "knight"
+        default: name = "pawn"
+        }
+        return "\(color) \(name)"
     }
 }
 
@@ -2853,6 +4118,7 @@ private struct MailWorkspaceView: View {
                     else { Image(systemName: "arrow.clockwise") }
                 }
                 .disabled(!store.hasWorkspaceAccess || store.isLoading(.integrations))
+                .accessibilityLabel("Refresh mail")
             }
         }
         .refreshable { await store.refreshIntegrations() }
@@ -3244,6 +4510,13 @@ private struct FinanceWorkspaceView: View {
 
     var body: some View {
         List {
+            EditorErrorSection(area: .finance)
+            if store.finance.environment == .sandbox {
+                Section {
+                    Label("Sandbox mode · sample bank data", systemImage: "testtube.2")
+                        .foregroundStyle(.orange)
+                }
+            }
             if !store.finance.configured {
                 ContentUnavailableView {
                     Label("Set up Plaid on your Mac", systemImage: "building.columns")
@@ -3267,6 +4540,14 @@ private struct FinanceWorkspaceView: View {
                         }
                         if let error = bank.error?.nilIfEmpty {
                             Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+                        }
+                        if bank.updateStatus == "NOT_READY" {
+                            Text("Transactions are still being prepared by the bank.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let lastSynced = bank.lastSynced?.nilIfEmpty {
+                            LabeledContent("Last checked", value: displayTimestamp(lastSynced))
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -3377,6 +4658,7 @@ private struct WritingWorkspaceView: View {
 
     var body: some View {
         List {
+            EditorErrorSection(area: .writing)
             if !store.writing.available {
                 ContentUnavailableView {
                     Label("Connect your site on the Mac", systemImage: "folder.badge.questionmark")
@@ -3422,6 +4704,7 @@ private struct WritingWorkspaceView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Button { draft = .new() } label: { Image(systemName: "square.and.pencil") }
                     .disabled(!store.writing.available)
+                    .accessibilityLabel("New writing draft")
             }
         }
         .refreshable { await store.load(.writing, force: true) }
@@ -3499,6 +4782,7 @@ private struct ConnectionsView: View {
 
     var body: some View {
         List {
+            EditorErrorSection(area: .integrations)
             Section("Providers") {
                 ConnectionProviderRow(name: "Google Calendar", symbol: "calendar", color: .blue, state: store.integrations.google)
                 GmailConnectionProviderRow(state: store.integrations.gmail)
@@ -3537,6 +4821,7 @@ private struct ConnectionsView: View {
                     if store.isLoading(.integrations) { ProgressView() } else { Image(systemName: "arrow.clockwise") }
                 }
                 .disabled(!store.hasWorkspaceAccess || store.isLoading(.integrations))
+                .accessibilityLabel("Refresh connections")
             }
         }
         .refreshable { await store.refreshIntegrations() }
@@ -3651,7 +4936,7 @@ private struct PairingSyncView: View {
         .fileImporter(isPresented: $showingPicker, allowedContentTypes: [.json]) { result in
             switch result {
             case .success(let url): Task { await store.pair(url) }
-            case .failure(let error): store.error = error.localizedDescription
+            case .failure(let error): store.report(error, area: .pairing)
             }
         }
         .confirmationDialog("Unpair this iPhone?", isPresented: $confirmUnpair, titleVisibility: .visible) {

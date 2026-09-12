@@ -5,6 +5,7 @@ import Foundation
 enum WorkspaceArea: String, CaseIterable, Hashable, Sendable {
     case workspace
     case climbing
+    case chess
     case finance
     case writing
     case integrations
@@ -659,6 +660,364 @@ struct ClimbingState: Codable, Equatable, Sendable {
         routines = try values.decode([ClimbingRoutine].self, forKey: .routines)
         plans = try values.decodeIfPresent([ClimbingPlan].self, forKey: .plans) ?? []
     }
+}
+
+// MARK: - Chess study
+
+enum ChessBoardOrientation: String, Codable, Hashable, Sendable {
+    case white
+    case black
+}
+
+enum ChessSegmentType: String, Codable, Hashable, Sendable {
+    case theory
+    case diagram
+    case trainer
+}
+
+enum ChessReviewGrade: String, Codable, Hashable, Sendable {
+    case again
+    case good
+}
+
+enum ChessStudyMode: String, Codable, CaseIterable, Hashable, Sendable {
+    case lesson
+    case review
+    case mixed
+}
+
+struct ChessCourse: Codable, Identifiable, Hashable, Sendable {
+    var description: String
+    var id: String
+    var lessonIds: [String]
+    var level: String
+    var title: String
+}
+
+struct ChessReviewChoice: Codable, Identifiable, Hashable, Sendable {
+    var id: String
+    var isCorrect: Bool
+    var text: String
+}
+
+struct ChessReviewPrompt: Codable, Hashable, Sendable {
+    var choices: [ChessReviewChoice]
+    var question: String
+}
+
+struct ChessTrainerStep: Codable, Identifiable, Hashable, Sendable {
+    var acceptedMoves: [String]
+    var boardOrientation: ChessBoardOrientation?
+    var explanation: String
+    var fen: String
+    var hints: [String]
+    var id: String
+    var opponentReplies: [String]?
+    var prompt: String
+    var review: ChessReviewPrompt
+}
+
+struct ChessLessonSegment: Codable, Identifiable, Hashable, Sendable {
+    var body: [String]
+    var boardOrientation: ChessBoardOrientation?
+    var fen: String?
+    var id: String
+    var steps: [ChessTrainerStep]?
+    var title: String
+    var type: ChessSegmentType
+}
+
+struct ChessLesson: Codable, Identifiable, Hashable, Sendable {
+    var courseId: String
+    var id: String
+    var initialFen: String
+    var segments: [ChessLessonSegment]
+    var title: String
+}
+
+struct ChessCatalog: Codable, Hashable, Sendable {
+    var courses: [ChessCourse]
+    var lessons: [ChessLesson]
+}
+
+struct ChessLessonProgress: Codable, Identifiable, Hashable, Sendable {
+    var courseId: String
+    var lessonId: String
+    var currentSegmentId: String
+    var currentStepId: String?
+    var completedStepIds: [String]
+    var updatedAt: String
+
+    var id: String { "\(courseId):\(lessonId)" }
+}
+
+struct ChessReviewCardSchedule: Codable, Identifiable, Hashable, Sendable {
+    var courseId: String
+    var lessonId: String
+    var stepId: String
+    var dueAt: String
+    var intervalDays: Int
+    var ease: Double
+    var lapses: Int
+    var consecutiveCorrect: Int
+    var lastResult: ChessReviewGrade?
+    var updatedAt: String
+
+    var id: String { "\(courseId):\(lessonId):\(stepId)" }
+}
+
+struct ChessReviewAttempt: Codable, Identifiable, Hashable, Sendable {
+    var id: String
+    var requestId: String
+    var courseId: String
+    var lessonId: String
+    var stepId: String
+    var moveUci: String
+    var reasonChoiceId: String
+    var moveCorrect: Bool
+    var reasonCorrect: Bool
+    var grade: ChessReviewGrade
+    var attemptedAt: String
+    var dueAt: String
+}
+
+struct ChessStudySession: Codable, Identifiable, Hashable, Sendable {
+    var id: String
+    var requestId: String
+    var mode: ChessStudyMode
+    var courseId: String?
+    var lessonId: String?
+    var startedAt: String
+    var endedAt: String
+    var stepIds: [String]
+    var reviewAttemptIds: [String]
+    var createdAt: String
+}
+
+struct ChessState: Codable, Equatable, Sendable {
+    var version: Int
+    var revision: Int
+    var progress: [ChessLessonProgress]
+    var reviewCards: [ChessReviewCardSchedule]
+    var reviewAttempts: [ChessReviewAttempt]
+    var studySessions: [ChessStudySession]
+
+    static let empty = ChessState(
+        version: 1,
+        revision: 0,
+        progress: [],
+        reviewCards: [],
+        reviewAttempts: [],
+        studySessions: []
+    )
+}
+
+struct ChessSummary: Codable, Equatable, Sendable {
+    var currentCourseId: String?
+    var currentLessonId: String?
+    var nextDueAt: String?
+    var recentReviewAccuracy: Double?
+    var resumePath: String?
+    var reviewsDue: Int
+    var stepsCovered: Int
+    var totalCards: Int
+    var totalSteps: Int
+
+    static let empty = ChessSummary(
+        currentCourseId: nil,
+        currentLessonId: nil,
+        nextDueAt: nil,
+        recentReviewAccuracy: nil,
+        resumePath: nil,
+        reviewsDue: 0,
+        stepsCovered: 0,
+        totalCards: 0,
+        totalSteps: 0
+    )
+}
+
+struct ChessCapability: Codable, Equatable, Sendable {
+    var id: String
+    var version: Int
+    var canWrite: Bool
+}
+
+struct ChessReviewCard: Codable, Identifiable, Hashable, Sendable {
+    var boardOrientation: ChessBoardOrientation
+    var choices: [ChessReviewChoice]
+    var courseId: String
+    var courseTitle: String
+    var fen: String
+    var id: String
+    var lessonId: String
+    var lessonTitle: String
+    var prompt: String
+    var question: String
+    var step: ChessTrainerStep
+    var stepId: String
+}
+
+struct ChessView: Codable, Equatable, Sendable {
+    var capability: ChessCapability
+    var catalog: ChessCatalog
+    var reviewQueue: [ChessReviewCard]
+    var state: ChessState
+    var summary: ChessSummary
+
+    static let empty = ChessView(
+        capability: ChessCapability(id: "chess", version: 1, canWrite: false),
+        catalog: ChessCatalog(courses: [], lessons: []),
+        reviewQueue: [],
+        state: .empty,
+        summary: .empty
+    )
+}
+
+struct ChessProgressRequest: Codable, Hashable, Sendable {
+    var revision: Int
+    var requestId: String
+    var courseId: String
+    var lessonId: String
+    var currentSegmentId: String
+    var currentStepId: String?
+    var completedStepIds: [String]
+
+    init(
+        revision: Int,
+        requestId: String = UUID().uuidString.lowercased(),
+        courseId: String,
+        lessonId: String,
+        currentSegmentId: String,
+        currentStepId: String?,
+        completedStepIds: [String]
+    ) {
+        self.revision = revision
+        self.requestId = requestId
+        self.courseId = courseId
+        self.lessonId = lessonId
+        self.currentSegmentId = currentSegmentId
+        self.currentStepId = currentStepId
+        self.completedStepIds = completedStepIds
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case revision, requestId, courseId, lessonId, currentSegmentId, currentStepId, completedStepIds
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(revision, forKey: .revision)
+        try values.encode(requestId, forKey: .requestId)
+        try values.encode(courseId, forKey: .courseId)
+        try values.encode(lessonId, forKey: .lessonId)
+        try values.encode(currentSegmentId, forKey: .currentSegmentId)
+        try values.encodeNullable(currentStepId, forKey: .currentStepId)
+        try values.encode(completedStepIds, forKey: .completedStepIds)
+    }
+}
+
+struct ChessReviewRequest: Codable, Hashable, Sendable {
+    var revision: Int
+    var requestId: String
+    var courseId: String
+    var lessonId: String
+    var stepId: String
+    var moveUci: String
+    var reasonChoiceId: String
+
+    init(
+        revision: Int,
+        requestId: String = UUID().uuidString.lowercased(),
+        courseId: String,
+        lessonId: String,
+        stepId: String,
+        moveUci: String,
+        reasonChoiceId: String
+    ) {
+        self.revision = revision
+        self.requestId = requestId
+        self.courseId = courseId
+        self.lessonId = lessonId
+        self.stepId = stepId
+        self.moveUci = moveUci
+        self.reasonChoiceId = reasonChoiceId
+    }
+}
+
+struct ChessSessionRequest: Codable, Hashable, Sendable {
+    var revision: Int
+    var requestId: String
+    var mode: ChessStudyMode
+    var courseId: String?
+    var lessonId: String?
+    var startedAt: String
+    var endedAt: String
+    var stepIds: [String]
+    var reviewAttemptIds: [String]
+
+    init(
+        revision: Int,
+        requestId: String = UUID().uuidString.lowercased(),
+        mode: ChessStudyMode,
+        courseId: String?,
+        lessonId: String?,
+        startedAt: String,
+        endedAt: String,
+        stepIds: [String],
+        reviewAttemptIds: [String]
+    ) {
+        self.revision = revision
+        self.requestId = requestId
+        self.mode = mode
+        self.courseId = courseId
+        self.lessonId = lessonId
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.stepIds = stepIds
+        self.reviewAttemptIds = reviewAttemptIds
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case revision, requestId, mode, courseId, lessonId, startedAt, endedAt, stepIds, reviewAttemptIds
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(revision, forKey: .revision)
+        try values.encode(requestId, forKey: .requestId)
+        try values.encode(mode, forKey: .mode)
+        try values.encodeNullable(courseId, forKey: .courseId)
+        try values.encodeNullable(lessonId, forKey: .lessonId)
+        try values.encode(startedAt, forKey: .startedAt)
+        try values.encode(endedAt, forKey: .endedAt)
+        try values.encode(stepIds, forKey: .stepIds)
+        try values.encode(reviewAttemptIds, forKey: .reviewAttemptIds)
+    }
+}
+
+struct ChessProgressResponse: Codable, Sendable {
+    var view: ChessView
+    var replayed: Bool
+}
+
+struct ChessReviewResult: Codable, Hashable, Sendable {
+    var attemptId: String
+    var moveCorrect: Bool
+    var reasonCorrect: Bool
+    var grade: ChessReviewGrade
+    var dueAt: String
+}
+
+struct ChessReviewResponse: Codable, Sendable {
+    var view: ChessView
+    var result: ChessReviewResult
+    var replayed: Bool
+}
+
+struct ChessSessionResponse: Codable, Sendable {
+    var view: ChessView
+    var session: ChessStudySession
+    var replayed: Bool
 }
 
 // MARK: - Health view returned by the Mac

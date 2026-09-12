@@ -10,12 +10,12 @@ const label=(text:string)=>text.charAt(0).toUpperCase()+text.slice(1);
 const inputOf=(draft:WritingDraft):WritingInput=>{const {updatedAt,exported,...input}=draft;void updatedAt;void exported;return input;};
 function newDraft():WritingInput{return {id:crypto.randomUUID(),revision:0,title:"",slug:"",summary:"",body:"",timeframe:String(new Date().getFullYear()),kind:"writing",format:"Note",primaryThread:"writing",threads:["writing"],topics:[],relatedEntries:[]};}
 
-export function WritingPanel(){
+export function WritingPanel({active=true}:{active?:boolean}){
   const [view,setView]=useState<WritingView>(emptyWriting);const [loaded,setLoaded]=useState(false);const [error,setError]=useState("");const [busy,setBusy]=useState(false);const locked=useRef(false);
   const [draft,setDraft]=useState<WritingInput|null>(null);const [saved,setSaved]=useState<WritingInput|null>(null);const [confirm,setConfirm]=useState(false);const [notice,setNotice]=useState("");const [discard,setDiscard]=useState(false);const [settings,setSettings]=useState(false);
   const dirty=!!draft&&JSON.stringify(draft)!==JSON.stringify(saved);
   const load=useCallback(async()=>{const response=await fetch("/api/writing",{cache:"no-store"});const value=await response.json() as WritingView & {error:string};if(!response.ok)throw new Error(value.error);setView(value);setLoaded(true);},[]);
-  useEffect(()=>{void load().catch(e=>setError(e.message));},[load]);
+  useEffect(()=>{if(!active)return;const initial=setTimeout(()=>void load().catch(e=>setError(e.message)),0);return()=>clearTimeout(initial);},[active,load]);
   useEffect(()=>{if(!dirty)return;const warn=(e:BeforeUnloadEvent)=>{e.preventDefault();};window.addEventListener("beforeunload",warn);return()=>window.removeEventListener("beforeunload",warn);},[dirty]);
   async function perform(path:string,body:object){if(locked.current)return null;locked.current=true;setBusy(true);setError("");setNotice("");try{const response=await fetch(`/api/writing${path}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});const value=await response.json() as WritingView & {error:string};if(!response.ok)throw new Error(value.error);setView(value);return value as WritingView;}catch(e){setError(e instanceof Error?e.message:"The draft could not be saved.");await load().catch(()=>{});return null;}finally{locked.current=false;setBusy(false);}}
   async function save(){if(!draft)return;const parsed=writingInputSchema.safeParse(draft);if(!parsed.success){setError(parsed.error.issues[0]?.message||"Check your draft.");return;}const result=await perform("/save",parsed.data);const latest=result?.drafts.find(d=>d.id===draft.id);if(latest){const next=inputOf(latest);setDraft(next);setSaved(next);setNotice("Draft saved in Workspace.");}}

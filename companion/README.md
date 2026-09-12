@@ -1,12 +1,13 @@
 # Workspace for iPhone
 
-Workspace for iPhone is the native companion to the personal Workspace on your Mac. It presents the same daily planning, Climbing, Health, Finance, Writing, Google Calendar, Gmail, and Todoist data through a direct local connection. The Mac remains the source of truth and no Workspace cloud service is involved.
+Workspace for iPhone is the native companion to the personal Workspace on your Mac. It presents the same daily planning, Climbing, Chess, Health, Finance, Writing, Google Calendar, Gmail, and Todoist data through a direct local connection. The Mac remains the source of truth and no Workspace cloud service is involved.
 
 ## What is available on iPhone
 
 - **Today** combines local priorities and plans with the selected personal Google Calendar and Todoist project. You can add or edit local items, review provider changes, and complete Todoist tasks.
 - **Inbox** captures thoughts, turns them into priorities, and shows unscheduled Personal tasks from Todoist.
 - **Climbing** manages sessions, plans, goals, and versioned training routines. Plans can be linked to reviewed Calendar events, goal actions can be linked to reviewed Todoist tasks, and sessions can reference an Apple Health workout without changing it.
+- **Chess** shows the bundled Sicilian/Najdorf course, lesson progress, due reviews, and recent accuracy. Lessons and reviews use a tap-to-move board with move validation, hints, authored explanations, and safe progress sync to the same private record as the Mac.
 - **Health** reads the Apple Health categories you allow, syncs recent summaries and detailed sleep data, imports older sleep history in batches, and asks for confirmation before saving a requested weight entry.
 - **More** includes Mail for reviewing the bounded personal Gmail inbox, marking messages read, starring or archiving them, moving a message to Gmail Trash after confirmation, and composing or replying after an explicit Send action. It also shows Finance balances and transactions, edits local finance annotations, saves Writing drafts, shows provider status and climbing links, and manages pairing and sync.
 
@@ -28,7 +29,7 @@ The project targets iOS 17 or later and has no third-party app dependencies. A f
 3. AirDrop the JSON file to the iPhone. In **More → Pairing & Sync**, choose the file. It expires after ten minutes and can be used once. Delete the transferred file after pairing.
 4. Return to Today or pull to refresh. The app can reach the Mac only while Workspace is running on the same network.
 
-Version 2 pairing explicitly grants this iPhone access to the personal Workspace areas exposed by the phone allowlist. Pairing replaces the previous phone token. An older version 1 Health pairing remains valid for Health sync only and cannot read planning, Climbing, Finance, Writing, Calendar, Gmail, or Todoist data; download and import a new file to use those areas.
+Version 2 pairing explicitly grants this iPhone access to the personal Workspace areas exposed by the phone allowlist. Pairing replaces the previous phone token. An older version 1 Health pairing remains valid for Health sync only and cannot read planning, Climbing, Chess, Finance, Writing, Calendar, Gmail, or Todoist data; download and import a new file to use those areas.
 
 If the connection fails, check that the Mac is awake, Workspace is running, the saved Wi-Fi IP is still current, and the network does not isolate devices. A changed IP, renewed certificate, expired certificate, revoked token, or disabled iPhone connection requires a new pairing.
 
@@ -52,4 +53,4 @@ The pairing file pins the Mac certificate fingerprint. The iPhone accepts only H
 
 Sync is on demand and when the app becomes active. There is no background Mac service, cloud relay, iCloud transport, or remote-network access. Keep the Mac app running on the same Wi-Fi for reads and writes. The app preserves an open draft when a service rejects a write and uses revision checks for Mac-owned state, but the Mac remains the place to resolve provider setup and account-level changes.
 
-The source passes an unsigned iOS Simulator build. Installation, Health permissions, Local Network permission, certificate validation on device, and a real HealthKit and provider round trip still need verification on the physical iPhone.
+The app has been signed, installed, and launched on Jordan’s iPhone. Health and Local Network permissions, certificate validation across network changes, and real HealthKit/provider round trips remain dependent on the connected device and services.

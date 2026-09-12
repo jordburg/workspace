@@ -51,7 +51,7 @@ final class HealthStore: @unchecked Sendable {
     private(set) var calendar = Calendar(identifier: .gregorian)
     func refreshCalendar() { var next = Calendar(identifier: .gregorian); next.timeZone = .current; calendar = next }
     func authorize() async throws {
-        guard HKHealthStore.isHealthDataAvailable() else { throw BridgeError.message("Health data is available on a supported iPhone.") }
+        guard HKHealthStore.isHealthDataAvailable() else { throw BridgeError.message("Health data requires a supported iPhone.") }
         try await store.requestAuthorization(toShare: [weight], read: [steps, sleep, heart, weight, HKWorkoutType.workoutType(), HKQuantityType(.heartRateVariabilitySDNN), HKQuantityType(.activeEnergyBurned), HKQuantityType(.appleExerciseTime), HKQuantityType(.respiratoryRate), HKQuantityType(.oxygenSaturation)])
     }
     private func key(_ date: Date) -> String { let format = DateFormatter(); format.calendar = calendar; format.locale = Locale(identifier: "en_US_POSIX"); format.timeZone = calendar.timeZone; format.dateFormat = "yyyy-MM-dd"; return format.string(from: date) }
