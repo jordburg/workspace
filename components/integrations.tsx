@@ -1,6 +1,6 @@
 "use client";
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
-import { CalendarDays, Check, ExternalLink, Link2, LoaderCircle, Mail, Plus, RefreshCw, Settings2, Trash2 } from "lucide-react";
+import { CalendarDays, Check, ExternalLink, LoaderCircle, Mail, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
@@ -15,7 +15,7 @@ export type RemoteDraft = {
   link?: Pick<IntegrationLink, "entityKind" | "entityId" | "role">;
   description?: string;
 };
-type IntegrationContextType={view:SyncView;busy:boolean;error:string;date:string;setDate:(date:string)=>void;openSettings:()=>void;openEditor:(draft:RemoteDraft)=>void;refresh:()=>Promise<void>;perform:(path:string,body:unknown)=>Promise<unknown>};
+type IntegrationContextType={view:SyncView;busy:boolean;error:string;date:string;setDate:(date:string)=>void;openSettings:()=>void;openEditor:(draft:RemoteDraft)=>void;refresh:()=>Promise<void>;reload:()=>Promise<void>;perform:(path:string,body:unknown)=>Promise<unknown>};
 const IntegrationContext=createContext<IntegrationContextType|null>(null);
 export function useIntegrations(){const context=useContext(IntegrationContext);if(!context)throw new Error("Integration provider missing");return context;}
 const zone=()=>Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -26,10 +26,10 @@ export function IntegrationProvider({children}:{children:ReactNode}) {
   const [view,setView]=useState<SyncView>(emptySync);
   const [busy,setBusy]=useState(false);const busyRef=useRef(false);
   const [error,setError]=useState("");const [date,setDate]=useState("");
-  const [settings,setSettings]=useState(false);const [draft,setDraft]=useState<RemoteDraft|null>(null);
+  const [draft,setDraft]=useState<RemoteDraft|null>(null);
   const opener=useRef<HTMLElement|null>(null);
   const load=useCallback(async()=>{const response=await fetch("/api/integrations",{cache:"no-store"});if(!response.ok)throw new Error("Connections could not be loaded. Your local plans are still available.");setView(await response.json() as SyncView);},[]);
-  useEffect(()=>{const timer=setTimeout(()=>{if(new URLSearchParams(location.search).get("connections")==="1")setSettings(true);void load().catch(err=>setError(message(err)));},0);return()=>clearTimeout(timer);},[load]);
+  useEffect(()=>{const timer=setTimeout(()=>{if(new URLSearchParams(location.search).get("connections")==="1")window.dispatchEvent(new CustomEvent("workspace:open-settings"));void load().catch(err=>setError(message(err)));},0);return()=>clearTimeout(timer);},[load]);
   const perform=useCallback(async(path:string,body:unknown)=>{
     if(busyRef.current)throw new Error("Wait for the current sync to finish.");
     busyRef.current=true;setBusy(true);setError("");
@@ -41,31 +41,24 @@ export function IntegrationProvider({children}:{children:ReactNode}) {
   const refresh=useCallback(async()=>{if(!date || busyRef.current)return;try{await perform("/sync",{date,timeZone:zone()});}catch{}},[date,perform]);
   const connected=view.todoist.connected||view.google.connected||view.gmail.connected;
   useEffect(()=>{if(!connected||!date)return;let retry:ReturnType<typeof setTimeout>|undefined;const attempt=()=>{if(busyRef.current){retry=setTimeout(attempt,1000);return;}void refresh();};attempt();const timer=setInterval(()=>{if(document.visibilityState==="visible")attempt();},300000);return()=>{clearInterval(timer);if(retry)clearTimeout(retry);};},[connected,date,refresh]);
-  useEffect(()=>{if(!settings)return;const timer=setInterval(()=>{if(!busyRef.current)void load().catch(()=>{});},5000);return()=>clearInterval(timer);},[settings,load]);
   function captureFocus(){opener.current=document.activeElement instanceof HTMLElement?document.activeElement:null;}
-  const context={view,busy,error,date,setDate,refresh,perform,openSettings:()=>{captureFocus();setError("");setSettings(true);},openEditor:(next:RemoteDraft)=>{captureFocus();setError("");setDraft(next);}};
+  const context={view,busy,error,date,setDate,refresh,reload:load,perform,openSettings:()=>{setError("");window.dispatchEvent(new CustomEvent("workspace:open-settings"));},openEditor:(next:RemoteDraft)=>{captureFocus();setError("");setDraft(next);}};
   const restoreFocus=(event:Event)=>{event.preventDefault();if(opener.current?.isConnected)opener.current.focus();else document.getElementById("connection-settings")?.focus();};
   return <IntegrationContext.Provider value={context}>{children}
-    <Dialog open={settings} onOpenChange={open=>{if(!busy){setSettings(open);setError("");}}}><DialogContent className="editor-dialog connection-dialog" onCloseAutoFocus={restoreFocus}><ConnectionSettings onClose={()=>setSettings(false)}/></DialogContent></Dialog>
     <Dialog open={!!draft} onOpenChange={open=>{if(!open&&!busy){setDraft(null);setError("");}}}><DialogContent className="editor-dialog" onCloseAutoFocus={restoreFocus} onInteractOutside={event=>event.preventDefault()}>{draft&&<RemoteEditor key={`${draft.provider}:${draft.item?.id||"new"}`} draft={draft} onClose={()=>setDraft(null)}/>}</DialogContent></Dialog>
   </IntegrationContext.Provider>;
 }
-export function ConnectionsBar({date}:{date:string}) {
-  const {view,busy,error,setDate,openSettings,refresh}=useIntegrations();
-  useEffect(()=>{if(date)setDate(date);},[date,setDate]);
-  const connectedCount=[view.todoist.connected,view.google.connected,view.gmail.connected].filter(Boolean).length;
-  const connected=connectedCount>0;
-  const providerErrors=[view.todoist.error,view.google.error,view.gmail.error].filter(Boolean);
-  return <section className="connections-wrap" aria-label="App connections"><div className="connections-bar"><span><Link2 size={16}/>{connected?`${connectedCount} connected ${connectedCount===1?"app":"apps"}`:"Bring your plans together"}</span><div className="connection-actions">{connected&&<button disabled={busy} onClick={()=>void refresh()}><RefreshCw size={15} className={busy?"spin":""}/>{busy?"Syncing…":"Sync now"}</button>}<button id="connection-settings" onClick={openSettings}><Settings2 size={15}/>{connected?"Connections":"Connect your apps"}</button></div></div>{connected&&<p className="sync-caption">Personal sources only · Two-way sync where supported · Refreshes every 5 minutes while open</p>}{(error||providerErrors.length>0)&&<div className="sync-error" role="status">{error||providerErrors.join(" ")}<button onClick={openSettings}>Review connection</button></div>}</section>;
-}
-function ConnectionSettings({onClose}:{onClose:()=>void}) {
-  const {view,busy,error,perform}=useIntegrations();const [token,setToken]=useState("");const [authUrl,setAuthUrl]=useState("");const [gmailAuthUrl,setGmailAuthUrl]=useState("");const [localError,setLocalError]=useState("");
+export function IntegrationSettings() {
+  const {view,busy,error,perform,refresh,reload}=useIntegrations();const [token,setToken]=useState("");const [authUrl,setAuthUrl]=useState("");const [gmailAuthUrl,setGmailAuthUrl]=useState("");const [localError,setLocalError]=useState("");
   const [googleFileState,setGoogleFileState]=useState<"unchanged"|"uploading"|"saved"|"error">("unchanged");
+  useEffect(()=>{const timer=setInterval(()=>{if(document.visibilityState==="visible"&&!busy)void reload().catch(()=>{});},5000);return()=>clearInterval(timer);},[busy,reload]);
   const connectTodoist=async()=>{setLocalError("");try{await perform("/todoist/connect",{token});setToken("");}catch{}};
   const uploadGoogle=async(file?:File)=>{if(!file)return;setAuthUrl("");setLocalError("");setGoogleFileState("uploading");try{if(file.size>64000)throw new Error("Choose the small Desktop OAuth client JSON file.");let client:unknown;try{client=JSON.parse(await file.text());}catch{throw new Error("This file is not valid JSON. Choose the downloaded Google Desktop app client file.");}await perform("/google/configure",client);setGoogleFileState("saved");}catch(err){setGoogleFileState("error");setLocalError(message(err));}};
   const connectGoogle=async()=>{setAuthUrl("");try{const result=await perform("/google/start",{}) as {url:string};setAuthUrl(result.url);}catch{}};
   const connectGmail=async()=>{setGmailAuthUrl("");try{const result=await perform("/gmail/start",{}) as {url:string};setGmailAuthUrl(result.url);}catch{}};
-  return <><DialogTitle>Your connected apps</DialogTitle><DialogDescription>Sync your personal plans without bringing your work workspace along.</DialogDescription>
+  const connectedCount=[view.todoist.connected,view.google.connected,view.gmail.connected].filter(Boolean).length;
+  const providerErrors=[view.todoist.error,view.google.error,view.gmail.error].filter(Boolean);
+  return <div className="settings-stack"><div className="settings-section-heading"><div><h2>Planning and mail</h2><p>Personal providers only. Work accounts and the Artek project tree stay excluded.</p></div>{connectedCount>0&&<Button variant="outline" disabled={busy} onClick={()=>void refresh()}><RefreshCw size={15} className={busy?"spin":""}/>{busy?"Syncing…":"Sync now"}</Button>}</div>
     <div className="connection-card"><div className="connection-card-heading"><span className="service-symbol todoist-symbol"><Check size={20}/></span><div><h3>Todoist</h3><p>Personal project and its subprojects</p></div><span className={`connection-state ${view.todoist.connected?"connected":""}`}>{view.todoist.connected?"Connected":"Not connected"}</span></div>
       {view.todoist.connected?<><p className="connection-detail">{view.todoist.sources.map(source=>source.name).join(" · ")}</p><p className="connection-detail">{view.todoist.lastSynced?`Last synced ${new Date(view.todoist.lastSynced).toLocaleString()}`:"Ready for the first sync"}</p><button className="text-button" disabled={busy} onClick={()=>void perform("/disconnect",{provider:"todoist"}).catch(()=>{})}>Disconnect Todoist</button></>:<><p className="connection-detail">Paste your personal API token from <a href="https://app.todoist.com/app/settings/integrations/developer" target="_blank" rel="noreferrer">Todoist’s developer settings <ExternalLink size={12}/></a>. It stays on this Mac. This enables creating, editing, completing, and deleting tasks in Personal.</p><label className="connection-label" htmlFor="todoist-token">Todoist API token</label><div className="token-row"><Input id="todoist-token" type="password" autoComplete="off" value={token} disabled={busy} onChange={e=>setToken(e.target.value)}/><Button disabled={busy||token.trim().length<20} onClick={()=>void connectTodoist()}>Connect</Button></div><p className="connection-detail">A Personal project must exist. The Inbox and Artek project tree are excluded.</p></>}
     </div>
@@ -76,9 +69,9 @@ function ConnectionSettings({onClose}:{onClose:()=>void}) {
       {view.gmail.connected?<><p className="connection-detail">{view.gmail.unreadCount} unread in the recent inbox view{view.gmail.lastSynced?` · Last synced ${new Date(view.gmail.lastSynced).toLocaleString()}`:""}</p><p className="connection-detail">Workspace can read mail, compose and send, and move messages to Gmail Trash. It never permanently erases mail.</p><button className="text-button" disabled={busy} onClick={()=>void perform("/disconnect",{provider:"gmail"}).catch(()=>{})}>Disconnect Gmail</button></>:<><p className="connection-detail">Enable the <a href="https://developers.google.com/workspace/gmail/api/quickstart/nodejs" target="_blank" rel="noreferrer">Gmail API <ExternalLink size={12}/></a> in the same personal Google Cloud project, then reuse the Google OAuth client uploaded above. Workspace will accept only {PERSONAL_CALENDAR}.</p><p className="connection-detail">Google’s Gmail modify permission covers reading mail, composing and sending, and moving messages to Trash. Workspace does not permanently erase messages or send anything without your final Send click.</p><Button className="google-connect" disabled={busy||!view.gmail.configured} onClick={()=>void connectGmail()}>Connect Gmail</Button>{gmailAuthUrl&&<p className="connection-detail">Finish authorization in your default browser. <a href={gmailAuthUrl} target="_blank" rel="noreferrer">Open authorization again</a></p>}{!view.gmail.configured&&<p className="connection-detail">Upload a Google Desktop OAuth client in the Google Calendar card first.</p>}</>}
     </div>
     <p className="connection-detail">Solo calendar events can be edited here. Meetings with guests stay in Google Calendar. Local priorities and notes remain local until you create an item in a connected app.</p>
-    {(localError||error)&&<p className="form-error" role="alert">{localError||error}</p>}
-    <div className="connection-close"><Button variant="outline" disabled={busy} onClick={onClose}>Done</Button></div>
-  </>;
+    {(localError||error||providerErrors.length>0)&&<p className="form-error" role="alert">{localError||error||providerErrors.join(" ")}</p>}
+    <p className="sync-caption">Two-way sync where supported · Refreshes every five minutes while Workspace is open</p>
+  </div>;
 }
 export function TodoistTasks({day,area,inbox=false}:{day:string;area:string;inbox?:boolean}) {
   const {view,busy,openEditor,perform}=useIntegrations();if(!view.todoist.connected||area==="independent")return null;
