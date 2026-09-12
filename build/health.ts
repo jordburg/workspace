@@ -16,8 +16,8 @@ type PhoneScope="health"|"workspace";
 type State={version:1;enabled:boolean;address?:string;tokenHash?:string;tokenScope?:PhoneScope;pairing?:{hash:string;expires:number;scope?:PhoneScope};snapshot:HealthSnapshot|null;lastSynced:string|null;commands:WeightCommand[]};
 type WorkspaceResponse={status:number;data:unknown};
 type WorkspaceRequest=(path:string,method:"GET"|"POST"|"PUT",body?:unknown)=>Promise<WorkspaceResponse>;
-type HealthServiceOptions={addresses?:()=>string[];port?:number;workspaceRequest?:WorkspaceRequest};
-class HealthError extends Error {readonly status:number;constructor(message:string,status=400){super(message);this.status=status;}}
+type HealthServiceOptions={addresses?:()=>string[];port?:number;workspaceRequest?:WorkspaceRequest;onPhoneWorkspaceMutationAuthorized?:(path:string)=>void};
+export class HealthError extends Error {readonly status:number;constructor(message:string,status=400){super(message);this.status=status;}}
 const hash=(value:string)=>createHash("sha256").update(value).digest("hex");
 const matches=(value:string,expected?:string)=>!!expected&&expected.length===64&&timingSafeEqual(Buffer.from(hash(value),"hex"),Buffer.from(expected,"hex"));
 export const lanAddresses=()=>Object.values(networkInterfaces()).flatMap(entries=>entries||[]).filter(a=>a.family==="IPv4"&&!a.internal&&/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address)).map(a=>a.address).filter((a,i,all)=>all.indexOf(a)===i);
@@ -66,12 +66,24 @@ export function createHealthService(directory:string,options:HealthServiceOption
       if(!matches(credential,initial.tokenHash))throw new HealthError("Pair this iPhone again.",401);
       if(path==="/capabilities"&&req.method==="GET"){send(res,200,{version:2,scope:initial.tokenScope??"health",workspace:(initial.tokenScope??"health")==="workspace",health:true});return;}
       if(path==="/commands"&&req.method==="GET"){send(res,200,{commands:initial.commands.filter(c=>c.status==="pending")});return;}
+      if(path==="/unpair"&&req.method==="POST"){
+        z.object({}).strict().parse(await body(req,1_000));
+        const result=await exclusive(async()=>{const s=await read();if(!s.enabled||!matches(credential,s.tokenHash))throw new HealthError("Pair this iPhone again.",401);delete s.tokenHash;delete s.tokenScope;delete s.pairing;await write(s);return {revoked:true};});
+        send(res,200,result);return;
+      }
       const workspaceRoute=phoneWorkspaceRoutes[`${req.method} ${path}`];
       if(workspaceRoute){
         if((initial.tokenScope??"health")!=="workspace")throw new HealthError("This phone is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
         if(!options.workspaceRequest)throw new HealthError("Workspace data is unavailable. Keep the desktop Workspace open and try again.",503);
-        const input=req.method==="POST"?await body(req,workspaceRoute.max??2_000_000):undefined;
-        let result:WorkspaceResponse;try{result=await options.workspaceRequest(workspaceRoute.path,workspaceRoute.method,input);}catch{throw new HealthError("The desktop Workspace could not complete this request. Its saved data has been kept.",503);}
+        let input:unknown;
+        if(req.method==="POST"){
+          options.onPhoneWorkspaceMutationAuthorized?.(path??"");
+          input=await body(req,workspaceRoute.max??2_000_000);
+          const current=await read();
+          if(!current.enabled||!matches(credential,current.tokenHash))throw new HealthError("Pair this iPhone again.",401);
+          if((current.tokenScope??"health")!=="workspace")throw new HealthError("This phone is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
+        }
+        let result:WorkspaceResponse;try{result=await options.workspaceRequest(workspaceRoute.path,workspaceRoute.method,input);}catch(e){if(e instanceof HealthError)throw e;throw new HealthError("The desktop Workspace could not complete this request. Its saved data has been kept.",503);}
         send(res,result.status,result.data);return;
       }
       if(req.method!=="POST")throw new HealthError("Unknown health endpoint.",404);
@@ -139,12 +151,22 @@ export function createHealthService(directory:string,options:HealthServiceOption
   return {handle,resume,stop};
 }
 const hashBuffer=(value:Buffer)=>createHash("sha256").update(value).digest("hex");
-async function loopbackWorkspace(server:ViteDevServer,path:string,method:"GET"|"POST"|"PUT",body?:unknown):Promise<WorkspaceResponse>{
+const MAX_PHONE_WORKSPACE_RESPONSE_BYTES=10_000_000;
+async function cappedResponseText(response:Response,max=MAX_PHONE_WORKSPACE_RESPONSE_BYTES){
+  const declared=Number(response.headers.get("content-length"));
+  if(Number.isFinite(declared)&&declared>max){await response.body?.cancel().catch(()=>{});throw new HealthError("This Workspace response is too large for the phone. Narrow the requested history on the Mac.",413);}
+  if(!response.body)return "";
+  const reader=response.body.getReader();const chunks:Buffer[]=[];let size=0;
+  try{
+    while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>max){await reader.cancel().catch(()=>{});throw new HealthError("This Workspace response is too large for the phone. Narrow the requested history on the Mac.",413);}chunks.push(Buffer.from(value));}
+  }finally{reader.releaseLock();}
+  return Buffer.concat(chunks,size).toString("utf8");
+}
+export async function loopbackWorkspace(server:ViteDevServer,path:string,method:"GET"|"POST"|"PUT",body?:unknown):Promise<WorkspaceResponse>{
   const address=server.httpServer?.address();
   if(!address||typeof address==="string")throw new HealthError("The desktop Workspace is not listening yet.",503);
   const response=await fetch(`http://127.0.0.1:${address.port}${path}`,{method,headers:body===undefined?undefined:{"Content-Type":"application/json"},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(45_000)});
-  const text=await response.text();
-  if(Buffer.byteLength(text)>10_000_000)throw new HealthError("This Workspace response is too large for the phone. Narrow the requested history on the Mac.",413);
+  const text=await cappedResponseText(response);
   let data:unknown;try{data=JSON.parse(text||"{}");}catch{throw new HealthError("The desktop Workspace returned an unreadable response.",502);}
   return {status:response.status,data};
 }

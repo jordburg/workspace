@@ -38,9 +38,9 @@ export function localWorkspace(): Plugin {
             try {
               await mkdir(directory, { recursive: true, mode: 0o700 });
               try { lock = await open(lockPath, "wx", 0o600); await lock.writeFile(String(process.pid)); }
-              catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") { send(409, { error: "The workspace is busy. Try again. If a save was interrupted and this continues, follow the recovery steps in the project README." }); return; } throw error; }
+              catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") { send(409, { code: "store_busy", error: "The workspace is busy. Try again. If a save was interrupted and this continues, follow the recovery steps in the project README." }); return; } throw error; }
               const current = await read();
-              if (next.revision !== current.revision) { send(409, { error: "Your workspace changed in another window. The latest version is loaded; your draft is still here. Save again to apply it." }); return; }
+              if (next.revision !== current.revision) { send(409, { code: "revision_conflict", error: "Your workspace changed in another window. The latest version is loaded; your draft is still here. Save again to apply it." }); return; }
               next.revision = current.revision + 1;
               await writeFile(join(directory, "workspace.backup.json"), JSON.stringify(current, null, 2), { mode: 0o600 });
               const temp = await open(tempPath, "w", 0o600);

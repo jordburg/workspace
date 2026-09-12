@@ -7,13 +7,23 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHealthService } from '../build/health.ts';
-import { healthSnapshotSchema } from '../lib/health.ts';
+import { createHealthService, HealthError, loopbackWorkspace } from '../build/health.ts';
+import { healthSnapshotSchema, healthWorkoutDay, healthWorkoutTimeZone, uniqueHealthWorkouts } from '../lib/health.ts';
 
 test('Health snapshots preserve missing values and reject incomplete date ranges',()=>{
   const sample={version:1,id:randomUUID(),generatedAt:new Date().toISOString(),timeZone:'America/Los_Angeles',from:'2026-09-11',to:'2026-09-11',days:[{date:'2026-09-11',steps:null,sleepMinutes:null,restingHeartRate:null,weightKg:null}],workouts:[]};
   assert.equal(healthSnapshotSchema.parse(sample).days[0].steps,null);
   assert.equal(healthSnapshotSchema.safeParse({...sample,to:'2026-09-12'}).success,false);
+});
+test('Health wire offsets validate and workout dates prefer recorded zones with case-insensitive UUID dedupe',()=>{
+  const id=randomUUID(),base={id,name:'Climbing',start:'2026-09-11T06:30:00Z',end:'2026-09-11T08:00:00Z',minutes:90,activity:'climbing',sourceId:null,sourceName:null};
+  const recorded={...base,timeZone:'America/Los_Angeles'};
+  assert.equal(healthWorkoutTimeZone(recorded,'UTC'),'America/Los_Angeles');
+  assert.equal(healthWorkoutDay(recorded,'UTC'),'2026-09-10');
+  assert.equal(healthWorkoutDay({...base,timeZone:null},'UTC'),'2026-09-11');
+  assert.equal(uniqueHealthWorkouts([recorded,{...recorded,id:id.toUpperCase()}]).length,1);
+  const sample={version:1,id:randomUUID(),generatedAt:new Date().toISOString(),timeZone:'-07:00',from:'2026-09-11',to:'2026-09-11',days:[{date:'2026-09-11',steps:null,sleepMinutes:null,restingHeartRate:null,weightKg:null}],workouts:[{...recorded,timeZone:'+05:30'}]};
+  assert.equal(healthSnapshotSchema.parse(sample).timeZone,'-07:00');
 });
 test('Health workouts accept legacy snapshots and preserve enriched climbing provenance',()=>{
   const base={version:1,id:randomUUID(),generatedAt:new Date().toISOString(),timeZone:'America/Los_Angeles',from:'2026-09-11',to:'2026-09-11',days:[{date:'2026-09-11',steps:null,sleepMinutes:null,restingHeartRate:null,weightKg:null}]};
@@ -25,8 +35,20 @@ test('Health workouts accept legacy snapshots and preserve enriched climbing pro
   assert.equal(healthSnapshotSchema.safeParse({...base,workouts:[{...climbing,activity:'stair-climbing'}]}).success,false);
   assert.equal(healthSnapshotSchema.safeParse({...base,workouts:[{...climbing,timeZone:'Not/A_Time_Zone'}]}).success,false);
 });
+test('Workspace loopback stops a chunked response above the 10 MB phone limit',async()=>{
+  const desktop=createServer((_req,res)=>{
+    res.writeHead(200,{'Content-Type':'application/json'});res.write('{"value":"');
+    const chunk=Buffer.alloc(100_000,120);for(let index=0;index<101;index++)res.write(chunk);res.end('"}');
+  });
+  await new Promise(resolve=>desktop.listen(0,'127.0.0.1',resolve));
+  try{
+    await assert.rejects(loopbackWorkspace({httpServer:desktop},'/large','GET'),error=>{
+      assert.equal(error instanceof HealthError,true);assert.equal(error.status,413);assert.match(error.message,/too large for the phone/);return true;
+    });
+  }finally{desktop.closeAllConnections();await new Promise(resolve=>desktop.close(resolve));}
+});
 test('Health HTTPS pairing, private device scope, and confirmed weight receipts',async()=>{
-  const directory=await mkdtemp(join(tmpdir(),'workspace-health-'));const proxyCalls=[];const app=createHealthService(directory,{addresses:()=>['127.0.0.1'],port:0,workspaceRequest:async(path,method,body)=>{proxyCalls.push({path,method,body});if(path==='/api/workspace'&&method==='GET')return {status:200,data:{version:1,revision:4,items:[]}};if(path==='/api/workspace'&&method==='PUT')return {status:200,data:{...body,revision:body.revision+1}};return {status:404,data:{error:'Unknown local route'}};}});const server=createServer(app.handle);await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin=`http://127.0.0.1:${server.address().port}`;
+  const directory=await mkdtemp(join(tmpdir(),'workspace-health-'));const proxyCalls=[];let mutationAuthorized;const app=createHealthService(directory,{addresses:()=>['127.0.0.1'],port:0,onPhoneWorkspaceMutationAuthorized:path=>mutationAuthorized?.(path),workspaceRequest:async(path,method,body)=>{proxyCalls.push({path,method,body});if(path==='/api/workspace'&&method==='GET')return {status:200,data:{version:1,revision:4,items:[]}};if(path==='/api/workspace'&&method==='PUT')return {status:200,data:{...body,revision:body.revision+1}};if(path==='/api/writing')throw new HealthError('This Workspace response is too large for the phone. Narrow the requested history on the Mac.',413);return {status:404,data:{error:'Unknown local route'}};}});const server=createServer(app.handle);await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin=`http://127.0.0.1:${server.address().port}`;
   const local=async(path,body={})=>{const r=await fetch(origin+'/api/health'+path,{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:JSON.stringify(body)});return {status:r.status,data:await r.json()};};
   try{
     let publicView=await (await fetch(origin+'/api/health')).json();assert.equal(publicView.enabled,false);
@@ -35,6 +57,11 @@ test('Health HTTPS pairing, private device scope, and confirmed weight receipts'
     const phone=(path,token,body,pin=pairing.fingerprint)=>new Promise((resolve,reject)=>{
       const req=request(pairing.url+path,{method:body===undefined?'GET':'POST',ca:cert,headers:{Authorization:'Bearer '+token,...(body===undefined?{}:{'Content-Type':'application/json'})},checkServerIdentity:(host,certificate)=>checkServerIdentity(host,certificate)||(createHash('sha256').update(certificate.raw).digest('hex')!==pin?new Error('Certificate pin mismatch'):undefined)},res=>{const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>resolve({status:res.statusCode,data:JSON.parse(Buffer.concat(chunks).toString())}));});req.on('error',reject);req.end(body===undefined?undefined:JSON.stringify(body));
     });
+    const heldPhonePost=(path,token,payload)=>{
+      const split=Math.max(1,Math.floor(payload.length/2));let req;
+      const result=new Promise((resolve,reject)=>{req=request(pairing.url+path,{method:'POST',ca:cert,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json','Content-Length':Buffer.byteLength(payload)},checkServerIdentity:(host,certificate)=>checkServerIdentity(host,certificate)||(createHash('sha256').update(certificate.raw).digest('hex')!==pairing.fingerprint?new Error('Certificate pin mismatch'):undefined)},res=>{const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>resolve({status:res.statusCode,data:JSON.parse(Buffer.concat(chunks).toString())}));});req.on('error',reject);req.write(payload.slice(0,split));});
+      return {result,finish:()=>req.end(payload.slice(split))};
+    };
     await assert.rejects(phone('/commands','wrong',undefined,'0'.repeat(64)),/pin mismatch/);
     const paired=await phone('/pair',pairing.code,{});assert.equal(paired.status,200);const token=paired.data.token;
     assert.equal((await phone('/pair',pairing.code,{})).status,401);assert.equal((await phone('/commands','wrong')).status,401);
@@ -43,6 +70,7 @@ test('Health HTTPS pairing, private device scope, and confirmed weight receipts'
     assert.deepEqual((await phone('/v1/workspace',token)).data,{version:1,revision:4,items:[]});
     const changed={version:1,revision:4,items:[{id:randomUUID(),kind:'note',title:'From iPhone',area:'personal',date:null,time:null,endTime:null,done:false}]};
     assert.equal((await phone('/v1/workspace',token,changed)).data.revision,5);assert.deepEqual(proxyCalls.slice(-2),[{path:'/api/workspace',method:'GET',body:undefined},{path:'/api/workspace',method:'PUT',body:changed}]);
+    const oversized=await phone('/v1/writing',token);assert.equal(oversized.status,413);assert.match(oversized.data.error,/too large for the phone/);
     const sample={version:1,id:randomUUID(),generatedAt:new Date().toISOString(),timeZone:'America/Los_Angeles',from:'2026-09-11',to:'2026-09-11',days:[{date:'2026-09-11',steps:1234,sleepMinutes:null,restingHeartRate:60,weightKg:null}],workouts:[]};
     assert.equal((await phone('/snapshot',token,sample)).status,200);
     assert.equal((await phone('/snapshot',token,{...sample,generatedAt:'2026-01-01T00:00:00Z'})).status,409);
@@ -66,6 +94,14 @@ test('Health HTTPS pairing, private device scope, and confirmed weight receipts'
     assert.equal((await fetch(origin+'/api/health',{headers:{Origin:'https://example.com'}})).status,403);
     const saved=JSON.parse(await readFile(join(directory,'health.private.json'),'utf8'));saved.tokenScope='health';await writeFile(join(directory,'health.private.json'),JSON.stringify(saved));
     assert.equal((await phone('/v1/workspace',token)).status,403);assert.equal((await phone('/commands',token)).status,200);
+    saved.tokenScope='workspace';await writeFile(join(directory,'health.private.json'),JSON.stringify(saved));
+    assert.equal((await phone('/unpair',token)).status,404);
+    const authorized=new Promise(resolve=>{mutationAuthorized=resolve;});const beforeRevocation=proxyCalls.length;const held=heldPhonePost('/v1/workspace',token,JSON.stringify({...changed,revision:5}));
+    assert.equal(await authorized,'/v1/workspace');mutationAuthorized=undefined;assert.deepEqual((await phone('/unpair',token,{})).data,{revoked:true});held.finish();const revokedWrite=await held.result;assert.equal(revokedWrite.status,401);assert.equal(proxyCalls.length,beforeRevocation);assert.equal((await phone('/commands',token)).status,401);
+    publicView=await (await fetch(origin+'/api/health')).json();assert.equal(publicView.paired,false);
+    const legacyPairing=(await local('/pairing')).data;const legacyPaired=await phone('/pair',legacyPairing.code,{});const legacyToken=legacyPaired.data.token;
+    const legacySaved=JSON.parse(await readFile(join(directory,'health.private.json'),'utf8'));delete legacySaved.tokenScope;await writeFile(join(directory,'health.private.json'),JSON.stringify(legacySaved));
+    assert.deepEqual((await phone('/capabilities',legacyToken)).data,{version:2,scope:'health',workspace:false,health:true});assert.equal((await phone('/v1/workspace',legacyToken)).status,403);assert.equal((await phone('/commands',legacyToken)).status,200);assert.deepEqual((await phone('/unpair',legacyToken,{})).data,{revoked:true});assert.equal((await phone('/commands',legacyToken)).status,401);
     await local('/disable');assert.equal((await (await fetch(origin+'/api/health')).json()).paired,false);
   }finally{await app.stop();await new Promise(r=>server.close(r));await rm(directory,{recursive:true,force:true});}
 });

@@ -1,43 +1,55 @@
-# Workspace Health for iPhone
+# Workspace for iPhone
 
-This companion reads permitted Apple Health data and sends it directly to your Mac. It also presents weight requests from the workspace for explicit confirmation before saving to Apple Health. It does not use a cloud service.
+Workspace for iPhone is the native companion to the personal Workspace on your Mac. It presents the same daily planning, Climbing, Health, Finance, Writing, Google Calendar, and Todoist data through a direct local connection. The Mac remains the source of truth and no Workspace cloud service is involved.
+
+## What is available on iPhone
+
+- **Today** combines local priorities and plans with the selected personal Google Calendar and Todoist project. You can add or edit local items, review provider changes, and complete Todoist tasks.
+- **Inbox** captures thoughts, turns them into priorities, and shows unscheduled Personal tasks from Todoist.
+- **Climbing** manages sessions, plans, goals, and versioned training routines. Plans can be linked to reviewed Calendar events, goal actions can be linked to reviewed Todoist tasks, and sessions can reference an Apple Health workout without changing it.
+- **Health** reads the Apple Health categories you allow, syncs recent summaries and detailed sleep data, imports older sleep history in batches, and asks for confirmation before saving a requested weight entry.
+- **More** shows Finance balances and transactions, edits local finance annotations, saves Writing drafts, shows provider status and climbing links, and manages pairing and sync.
+
+Plaid credentials and bank connection changes, Google OAuth, Todoist token setup, personal account/source selection, site export and recovery, and detailed sleep analysis remain in Workspace on the Mac. Bank transactions and Apple Health workouts are read-only. Writing on iPhone saves a Workspace draft; publishing to the site remains a separate, reviewable Mac action.
 
 ## Install
 
-1. Open `WorkspaceHealth.xcodeproj` in Xcode on the Mac.
-2. Install the iOS platform component shown as required in **Xcode → Settings → Components** if it is missing. The current iOS device build has been verified with the installed Xcode platform.
-3. Select the **WorkspaceHealth** target → **Signing & Capabilities** → your personal Apple development team. The HealthKit entitlement is already included. If the bundle identifier is unavailable for your team, use a unique personal identifier.
-4. Connect and unlock your iPhone, select it as the run destination, and follow Apple's device setup prompts. Developer Mode must be enabled on the iPhone when required. These device/security steps are performed by you.
-5. Build and run. Free Personal Team provisioning expires after seven days and needs renewal/reinstallation through Xcode. A paid developer membership is optional for this personal prototype.
+1. Open `WorkspaceHealth.xcodeproj` in Xcode.
+2. If Xcode requests it, install the iOS platform component under **Xcode → Settings → Components**.
+3. Select the **WorkspaceHealth** target, open **Signing & Capabilities**, and choose your personal Apple development team. HealthKit is already enabled. If `com.jordburg.workspace.health` is unavailable to your team, choose a unique personal bundle identifier.
+4. Connect and unlock the iPhone, select it as the run destination, then build and run. Follow Apple's prompts for trust and Developer Mode when shown.
 
-The project targets iOS 17 or later. There are no third-party app dependencies. Basic HealthKit access is supported with Personal Team signing; real data and local-network privacy behavior require a physical iPhone. A Simulator build alone does not verify either.
+The project targets iOS 17 or later and has no third-party app dependencies. A free Personal Team is sufficient for this prototype, although its provisioning normally expires after seven days. HealthKit data and Local Network permission require a physical iPhone; the Simulator cannot verify them.
 
-## Pair and sync
+## Pair with the Mac
 
-1. Leave the Mac workspace running. Put the Mac and iPhone on the same private Wi-Fi.
-2. On the Mac, choose **Health → iPhone setup → Enable iPhone sync** using the current Wi-Fi address. This enables only the dedicated HTTPS health listener; it does not expose finances or the daily workspace.
-3. Download the pairing JSON and AirDrop it to the iPhone. In the companion, choose **Import pairing file** and select it. Pairing expires after ten minutes and can be used once. Delete the pairing file after use.
-4. Choose **Review Health permissions** and allow the measurements you want to share. Weight write permission is needed only for confirmed weight entries. Allow the Local Network prompt for direct access to your Mac.
-5. Tap **Sync now**. The Mac's Health view updates within ten seconds. Opening the companion also requests a sync after Health permissions have been reviewed.
+1. Start the desktop Workspace and leave the Mac awake. Connect both devices to the same private Wi-Fi.
+2. On the Mac, open **Health → iPhone setup**, enable the iPhone connection for the current Wi-Fi address, and download a new Workspace pairing file.
+3. AirDrop the JSON file to the iPhone. In **More → Pairing & Sync**, choose the file. It expires after ten minutes and can be used once. Delete the transferred file after pairing.
+4. Return to Today or pull to refresh. The app can reach the Mac only while Workspace is running on the same network.
 
-If the connection fails, verify the Mac is awake, Workspace is running, the Wi-Fi IP still matches, and both devices are on the same network. Guest networks may isolate devices. No firewall rules or privacy settings are changed by the workspace. A changed certificate, expired certificate, revoked token, or changed IP requires re-pairing. A new pairing replaces the previous phone token.
+Version 2 pairing explicitly grants this iPhone access to the personal Workspace areas exposed by the phone allowlist. Pairing replaces the previous phone token. An older version 1 Health pairing remains valid for Health sync only and cannot read planning, Climbing, Finance, Writing, Calendar, or Todoist data; download and import a new file to use those tabs.
 
-## Weight entries
+If the connection fails, check that the Mac is awake, Workspace is running, the saved Wi-Fi IP is still current, and the network does not isolate devices. A changed IP, renewed certificate, expired certificate, revoked token, or disabled iPhone connection requires a new pairing.
 
-On the Mac, **Log weight** accepts pounds or kilograms and the actual measurement time. The request remains pending until the companion receives it and you select **Save measurement** in its confirmation dialog. The companion saves a manual body-mass sample with a stable HealthKit sync identifier and acknowledges the exact payload hash. If the receipt cannot reach the Mac, the next sync retries acknowledgement without saving another sample.
+## Apple Health
 
-No new workouts, calories, medications, diagnoses, or measurements are inferred from calendar plans. The current write feature is body mass only.
+Open **Health**, choose **Review Health permissions**, and allow only the categories you want to share. **Sync now** sends the current 30-day snapshot plus recent sleep stages and daily context directly to the Mac. **Import older sleep history** processes the chosen range in complete 30-day batches while the app stays open; stopping keeps completed batches, and retrying is safe.
 
-## Validation
+Workspace cannot determine whether an empty HealthKit read means no records or denied read permission, so missing values remain missing. Review permissions before retrying an empty import. No workout, calorie, medication, diagnosis, or measurement is inferred from a plan or climbing session.
 
-The JavaScript test suite exercises TLS pairing, wrong certificate pins, one-use pairing, stale snapshots, scope checks, duplicate command IDs, and matching receipts using temporary stores. Swift source checking uses the installed iOS SDK. Physical installation, HealthKit permission behavior, Apple trust evaluation, and a real measurement round trip must still be verified on the user's iPhone after Xcode/device setup.
+Workout grouping uses the workout start day in its saved HealthKit timezone, with the snapshot timezone as a fallback. An overnight workout therefore belongs to its start day. Metadata-free workouts can shift calendar day when old data is synced while traveling, and HealthKit queries still use the snapshot calendar boundaries, so an item very near an import boundary may appear in the next sync.
 
-## Sleep update
+**Log weight** on the Mac creates a pending request. The iPhone shows the exact value and measurement time and saves it only after **Save to Apple Health** is selected. Stable HealthKit identifiers, payload hashes, and local receipts prevent duplicate writes after an uncertain network response. Body mass is the only supported Health write.
 
-Run this updated app from Xcode on the same iPhone; its pairing stays in Keychain. Choose **Review Health permissions** to review sleep, HRV, active energy, exercise minutes, respiratory rate and oxygen saturation alongside the existing measurements. Tap **Sync now** for 30 days of detailed sleep and daily context, then choose a start date under **Sleep history** and tap **Import sleep history** for the older archive.
+## Connection security
 
-Import runs in 30-day batches while the app remains open. **Stop import** finishes the active batch, then stops; completed ranges remain saved. Retrying is safe and starts at the chosen date. Reimport an older range to reflect deletions, corrections or changed read visibility. HealthKit cannot tell the app whether empty reads mean revoked permission or no records, so review permissions first. No background history import is promised.
+The desktop web server and ordinary data APIs stay on loopback. Enabling iPhone sync starts a separate HTTPS listener on the selected private IPv4 address, normally port 5174. That listener exposes an exact set of versioned phone routes and requires the scope-bearing bearer token created during one-use pairing.
 
-Sleep snapshots include original sample IDs, stages (including unspecified sleep and in-bed), source/device model, software version and optional timezone metadata. Unavailable daily context is sent as null. Context uses HealthKit cumulative statistics for steps/active energy/exercise and daily averages for resting HR/HRV/respiration/oxygen. The Mac keeps sources separate for sleep and does not diagnose conditions from these readings.
+The pairing file pins the Mac certificate fingerprint. The iPhone accepts only HTTPS on a private IPv4 address, validates that certificate for the paired host, requires TLS 1.2 or later, refuses redirects, disables cookies and cellular access, and stores the token and Health receipts in non-synchronizing, unlocked-device-only Keychain storage. App Transport Security has no insecure HTTP exception. Provider credentials and private data files are never returned to the phone.
 
-The expanded companion passed a full unsigned iOS device build. Installation, renewed Health permissions and an actual sleep-history round trip still require verification on the physical iPhone.
+## Current operating limits
+
+Sync is on demand and when the app becomes active. There is no background Mac service, cloud relay, iCloud transport, or remote-network access. Keep the Mac app running on the same Wi-Fi for reads and writes. The app preserves an open draft when a service rejects a write and uses revision checks for Mac-owned state, but the Mac remains the place to resolve provider setup and account-level changes.
+
+The source passes an unsigned iOS Simulator build. Installation, Health permissions, Local Network permission, certificate validation on device, and a real HealthKit and provider round trip still need verification on the physical iPhone.

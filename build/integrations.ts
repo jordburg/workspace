@@ -7,7 +7,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 import { z } from "zod";
 import { daySchema } from "../lib/workspace.ts";
-import { emptySync, googleSources, todoistSources, personalProjects, normalizeTask, normalizeEvent, integrationLinkSchema, integrationLinksSchema, syncRequestSchema, PERSONAL_CALENDAR, isArtek, type IntegrationLink, type SyncView, type Source, type RemoteTask, type RemoteEvent } from "../lib/integrations/model.ts";
+import { emptySync, googleSources, todoistSources, personalProjects, normalizeTask, normalizeEvent, integrationLinkSchema, integrationLinksSchema, syncRequestSchema, PERSONAL_CALENDAR, type IntegrationLink, type SyncView, type Source, type RemoteTask, type RemoteEvent } from "../lib/integrations/model.ts";
 import { StoreBusyError, withPrivateLock, writePrivateJson } from "./private-store.ts";
 
 const TODOIST = "https://api.todoist.com/api/v1";
@@ -83,6 +83,15 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
     if(result.sync_status?.[uuid]!=="ok")throw new PublicError("Todoist did not apply this change. Refresh and review the task before trying again.",409);
     return result;
   }
+  function linkConflict(state:SecretState,input:Mutation):IntegrationLink|undefined {
+    if(!input.link)return undefined;
+    return state.view.links.find(link=>link.entityKind===input.link!.entityKind&&link.entityId===input.link!.entityId&&link.role===input.link!.role&&link.requestId!==input.requestId);
+  }
+  function linkConflictError(role:"goal-next-step"|"scheduled-session"):PublicError {
+    return role==="goal-next-step"
+      ? new PublicError("This climbing goal already has a Todoist next step. Unlink it before creating another one.",409)
+      : new PublicError("This climbing plan already has a Calendar event. Unlink it before creating another one.",409);
+  }
   function ensureIntegrationLink(state:SecretState,input:Mutation):IntegrationLink|null {
     if(!input.link)return null;
     const receipt=state.receipts[input.requestId];
@@ -92,16 +101,16 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
       if(existing.provider!==input.provider||existing.remoteId!==receipt.id||existing.entityKind!==input.link.entityKind||existing.entityId!==input.link.entityId||existing.role!==input.link.role)throw new PublicError("This integration request is already linked to a different item.",409);
       return existing;
     }
-    if(input.link.role==="scheduled-session"&&state.view.links.some(link=>link.role==="scheduled-session"&&link.entityId===input.link!.entityId))throw new PublicError("This climbing plan already has a Calendar event. Edit the linked event instead of creating another one.",409);
+    if(linkConflict(state,input))throw linkConflictError(input.link.role);
     const link=integrationLinkSchema.parse({id:randomUUID(),...input.link,provider:input.provider,remoteId:receipt.id,requestId:input.requestId,createdAt:new Date().toISOString()});
     state.view.links=integrationLinksSchema.parse([...state.view.links,link]);return link;
   }
   function checkLinkAvailability(state:SecretState,input:Mutation) {
-    if(input.link?.role==="scheduled-session"&&state.view.links.some(link=>link.role==="scheduled-session"&&link.entityId===input.link!.entityId&&link.requestId!==input.requestId))throw new PublicError("This climbing plan already has a Calendar event. Edit the linked event instead of creating another one.",409);
+    if(input.link&&linkConflict(state,input))throw linkConflictError(input.link.role);
   }
   async function mutate(state:SecretState,input:Mutation) {
     const hash=createHash("sha256").update(JSON.stringify(input)).digest("hex");
-    if(state.detachedRequests.includes(input.requestId))throw new PublicError("This integration request was detached. Start a fresh link from the climbing plan.",409);
+    if(state.detachedRequests.includes(input.requestId))throw new PublicError(`This integration request was detached. Start a fresh link from the climbing ${input.link?.entityKind||"item"}.`,409);
     if(state.requests[input.requestId] && state.requests[input.requestId]!==hash)throw new PublicError("This request was already used for a different edit. Close the editor and start a fresh edit.",409);
     if(state.receipts[input.requestId]){ensureIntegrationLink(state,input);return;}
     checkLinkAvailability(state,input);

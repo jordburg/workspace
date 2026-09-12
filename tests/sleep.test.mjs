@@ -47,5 +47,7 @@ test('authoritative batch retries/corrections retain other history, diary and se
   const corrected=mergeSleepBatch(merged,{...batch,samples:[]});assert.equal(corrected.samples.length,3);assert.equal(corrected.notes[0].text,'User observation');assert.equal(corrected.days.length,2);
   assert.throws(()=>mergeSleepBatch(merged,{...batch,generatedAt:'2026-09-11T09:00:00Z'}),/newer/);
   assert.equal(sleepBatchSchema.safeParse({...batch,days:[]}).success,false);assert.equal(sleepBatchSchema.safeParse({...batch,samples:[...batch.samples,batch.samples[0]]}).success,false);
+  assert.equal(sleepBatchSchema.safeParse({...batch,timeZone:'-07:00',from:'2026-09-10T07:00:00Z',to:'2026-09-11T07:00:00Z',samples:[],days:[context(day)]}).success,true);
+  assert.equal(sleepBatchSchema.safeParse({...batch,samples:batch.samples.map(sample=>({...sample,timeZone:'+05:30'}))}).success,true);
   assert.equal(sleepBatchSchema.safeParse({...batch,timeZone:'Invalid/Zone'}).success,false);
 });

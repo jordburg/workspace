@@ -56,6 +56,10 @@ struct BridgeCapabilities: Codable, Hashable, Sendable {
     let health: Bool
 }
 
+private struct BridgeRevocationResponse: Decodable, Sendable {
+    let revoked: Bool
+}
+
 enum BridgeHTTPMethod: String, Sendable {
     case get = "GET"
     case post = "POST"
@@ -174,8 +178,17 @@ final class BridgeClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, 
 
     init(_ credentials: BridgeCredentials) throws {
         let url = credentials.url
-        let octets = (url.host ?? "").split(separator: ".").compactMap { Int($0) }
-        let privateIP = octets.count == 4 && octets.allSatisfy { (0...255).contains($0) }
+        let labels = (url.host ?? "").split(separator: ".", omittingEmptySubsequences: false)
+        let parsed = labels.map { label -> Int? in
+            guard !label.isEmpty,
+                  label.allSatisfy({ $0.isASCII && $0.isNumber }),
+                  (label == "0" || label.first != "0"),
+                  let value = Int(label),
+                  (0...255).contains(value) else { return nil }
+            return value
+        }
+        let octets = parsed.compactMap { $0 }
+        let privateIP = labels.count == 4 && octets.count == 4
             && (octets[0] == 10
                 || (octets[0] == 192 && octets[1] == 168)
                 || (octets[0] == 172 && (16...31).contains(octets[1])))
@@ -293,6 +306,17 @@ final class BridgeClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, 
 
     func negotiateCapabilities() async throws -> BridgeCapabilities {
         try await get("capabilities")
+    }
+
+    func revokePairing() async throws {
+        let response: BridgeRevocationResponse = try await call(
+            "unpair",
+            method: .post,
+            body: Data("{}".utf8)
+        )
+        guard response.revoked else {
+            throw BridgeError.message("The Mac did not confirm that this pairing was revoked.")
+        }
     }
 
     static func pair(_ file: PairingFile) async throws -> BridgeCredentials {

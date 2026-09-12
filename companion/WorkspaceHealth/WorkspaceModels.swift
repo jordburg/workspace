@@ -17,14 +17,145 @@ enum LifeArea: String, Codable, CaseIterable, Hashable, Sendable {
     case independent
 }
 
+struct UnifiedHealthWorkout: Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+    let start: Date
+    let timeZoneIdentifier: String?
+    let snapshotTimeZoneIdentifier: String?
+    let minutes: Double
+    let activity: String
+    let source: String
+
+    var timeZone: TimeZone {
+        WorkspaceFormat.resolvedTimeZone(
+            primaryIdentifier: timeZoneIdentifier,
+            fallbackIdentifier: snapshotTimeZoneIdentifier
+        )
+    }
+}
+
 enum WorkspaceFormat {
-    static func dayKey(_ date: Date = Date()) -> String {
+    static func resolvedTimeZone(
+        primaryIdentifier: String?,
+        fallbackIdentifier: String?
+    ) -> TimeZone {
+        primaryIdentifier.flatMap(timeZone(fromWireIdentifier:))
+            ?? fallbackIdentifier.flatMap(timeZone(fromWireIdentifier:))
+            ?? .current
+    }
+
+    /// Returns a timezone spelling accepted by the bridge's JavaScript Intl
+    /// validator. Foundation represents fixed offsets as `GMT-0700`, while
+    /// Intl uses `-07:00`; named IANA zones are preserved so DST rules survive.
+    static func wireTimeZoneIdentifier(_ timeZone: TimeZone, at date: Date = Date()) -> String {
+        let identifier = timeZone.identifier
+        if identifier == "GMT" { return "UTC" }
+        if TimeZone.knownTimeZoneIdentifiers.contains(identifier), fixedOffsetSeconds(from: identifier) == nil {
+            return identifier
+        }
+        return wireOffsetIdentifier(secondsFromGMT: timeZone.secondsFromGMT(for: date))
+    }
+
+    static func wireTimeZoneIdentifier(_ identifier: String?, at date: Date) -> String? {
+        guard let identifier, !identifier.isEmpty else { return nil }
+        if fixedOffsetSeconds(from: identifier) == nil,
+           TimeZone.knownTimeZoneIdentifiers.contains(identifier) {
+            return identifier
+        }
+        guard let timeZone = timeZone(fromWireIdentifier: identifier) else { return nil }
+        return wireTimeZoneIdentifier(timeZone, at: date)
+    }
+
+    static func timeZone(fromWireIdentifier identifier: String) -> TimeZone? {
+        if let seconds = fixedOffsetSeconds(from: identifier) {
+            return TimeZone(secondsFromGMT: seconds)
+        }
+        return TimeZone(identifier: identifier)
+    }
+
+    private static func fixedOffsetSeconds(from identifier: String) -> Int? {
+        var value = identifier.uppercased()
+        if value.hasPrefix("GMT") || value.hasPrefix("UTC") { value.removeFirst(3) }
+        guard let sign = value.first, sign == "+" || sign == "-" else { return nil }
+        value.removeFirst()
+
+        let hourText: String
+        let minuteText: String
+        if let colon = value.firstIndex(of: ":") {
+            hourText = String(value[..<colon])
+            minuteText = String(value[value.index(after: colon)...])
+            guard minuteText.count == 2 else { return nil }
+        } else if value.count <= 2 {
+            hourText = value
+            minuteText = "0"
+        } else if value.count == 3 || value.count == 4 {
+            hourText = String(value.dropLast(2))
+            minuteText = String(value.suffix(2))
+        } else {
+            return nil
+        }
+        guard !hourText.isEmpty,
+              hourText.allSatisfy(\.isNumber),
+              minuteText.allSatisfy(\.isNumber),
+              let hours = Int(hourText),
+              let minutes = Int(minuteText),
+              hours <= 23,
+              minutes < 60 else { return nil }
+        let seconds = (hours * 60 + minutes) * 60
+        return sign == "-" ? -seconds : seconds
+    }
+
+    private static func wireOffsetIdentifier(secondsFromGMT: Int) -> String {
+        let roundedMinutes = Int((Double(abs(secondsFromGMT)) / 60).rounded())
+        let hours = roundedMinutes / 60
+        let minutes = roundedMinutes % 60
+        let sign = secondsFromGMT < 0 ? "-" : "+"
+        return String(format: "%@%02d:%02d", sign, hours, minutes)
+    }
+
+    static func dayKey(
+        _ date: Date = Date(),
+        timeZoneIdentifier: String? = nil,
+        fallbackTimeZoneIdentifier: String? = nil
+    ) -> String {
+        dayKey(
+            date,
+            in: resolvedTimeZone(
+                primaryIdentifier: timeZoneIdentifier,
+                fallbackIdentifier: fallbackTimeZoneIdentifier
+            )
+        )
+    }
+
+    static func dayKey(_ date: Date, in timeZone: TimeZone) -> String {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .current
+        formatter.timeZone = timeZone
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter.string(from: date)
+    }
+
+    static func timeLabel(_ date: Date, in timeZone: TimeZone) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.timeZone = timeZone
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    static func preferredHealthWorkouts(
+        on day: String,
+        local: [UnifiedHealthWorkout],
+        remote: [UnifiedHealthWorkout]
+    ) -> [UnifiedHealthWorkout] {
+        var seen = Set<String>()
+        let preferred = (local + remote).filter {
+            seen.insert($0.id.lowercased()).inserted
+        }
+        return preferred.filter { dayKey($0.start, in: $0.timeZone) == day }
     }
 
     static func timestamp(_ date: Date = Date()) -> String {
@@ -896,6 +1027,14 @@ struct IntegrationMutation: Codable, Hashable, Sendable {
     var location: String?
     var link: IntegrationLinkRequest?
     var timeZone: String
+    // Transport-only intent. It is deliberately excluded from CodingKeys so the
+    // strict server schema sees either `date`, `date: null`, or no key at all.
+    var encodesNilDate = false
+
+    enum CodingKeys: String, CodingKey {
+        case provider, action, id, version, requestId, sourceId, anchorDate, title, date, endDate
+        case time, endTime, allDay, location, link, timeZone
+    }
 
     init(
         provider: IntegrationProvider,
@@ -931,6 +1070,32 @@ struct IntegrationMutation: Codable, Hashable, Sendable {
         self.location = location
         self.link = link
         self.timeZone = timeZone
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(provider, forKey: .provider)
+        try values.encode(action, forKey: .action)
+        try values.encodeIfPresent(id, forKey: .id)
+        try values.encodeIfPresent(version, forKey: .version)
+        try values.encode(requestId, forKey: .requestId)
+        try values.encodeIfPresent(sourceId, forKey: .sourceId)
+        try values.encodeIfPresent(anchorDate, forKey: .anchorDate)
+        try values.encodeIfPresent(title, forKey: .title)
+        if encodesNilDate {
+            // The Todoist contract distinguishes an omitted date (leave it unchanged)
+            // from JSON null (remove the due date).
+            try values.encodeNullable(date, forKey: .date)
+        } else {
+            try values.encodeIfPresent(date, forKey: .date)
+        }
+        try values.encodeIfPresent(endDate, forKey: .endDate)
+        try values.encodeIfPresent(time, forKey: .time)
+        try values.encodeIfPresent(endTime, forKey: .endTime)
+        try values.encodeIfPresent(allDay, forKey: .allDay)
+        try values.encodeIfPresent(location, forKey: .location)
+        try values.encodeIfPresent(link, forKey: .link)
+        try values.encode(timeZone, forKey: .timeZone)
     }
 }
 

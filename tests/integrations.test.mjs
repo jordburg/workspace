@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { createIntegrationService } from '../build/integrations.ts';
-import { integrationLinkSchema, todoistSources, personalProjects, normalizeEvent, eventOnDay, PERSONAL_CALENDAR } from '../lib/integrations/model.ts';
+import { integrationLinkSchema, integrationLinksSchema, todoistSources, personalProjects, normalizeEvent, eventOnDay, PERSONAL_CALENDAR } from '../lib/integrations/model.ts';
 
 const zone='America/Los_Angeles';
 const source={id:PERSONAL_CALENDAR,name:'Personal',area:'personal',blocked:false};
@@ -116,7 +116,7 @@ test('Todoist sync and guarded write-back',async t=>{
 });
 
 test('linked provider creates retain exact remote identities',async t=>{
-  await t.test('Todoist goal task persists its link across replay, sync, and disconnect',async()=>{
+  await t.test('Todoist goal task requires an explicit unlink before replacement even when its task is absent from the cache',async()=>{
     const h=await harness();try{
       assert.equal((await h.post('/todoist/connect',{token:'linked-todoist-token-for-tests'})).status,200);
       const entityId=randomUUID();const requestId=randomUUID();
@@ -124,9 +124,13 @@ test('linked provider creates retain exact remote identities',async t=>{
       const created=await h.post('/mutate',mutation);assert.equal(created.status,200);assert.equal(created.data.links.length,1);
       const link=integrationLinkSchema.parse(created.data.links[0]);assert.deepEqual({...link,id:undefined,createdAt:undefined},{id:undefined,createdAt:undefined,entityKind:'goal',entityId,role:'goal-next-step',provider:'todoist',remoteId:'created-task',requestId});
       const writes=h.remote.todoistWrites;const replay=await h.post('/mutate',mutation);assert.equal(replay.status,200);assert.equal(h.remote.todoistWrites,writes);assert.equal(replay.data.links[0].id,link.id);
-      const refreshed=await h.post('/sync',{date:'2026-09-18',timeZone:zone});assert.equal(refreshed.data.links[0].id,link.id);
+      const refreshed=await h.post('/sync',{date:'2026-09-18',timeZone:zone});assert.equal(refreshed.data.links[0].id,link.id);assert.equal(refreshed.data.tasks.some(task=>task.id===link.remoteId),false);
+      const duplicate=await h.post('/mutate',{...mutation,requestId:randomUUID(),title:'[Climbing] Duplicate next step'});assert.equal(duplicate.status,409);assert.equal(h.remote.todoistWrites,writes);
+      const detached=await h.post('/unlink',{id:link.id});assert.equal(detached.status,200);assert.deepEqual(detached.data.links,[]);assert.equal(h.remote.todoistWrites,writes);
+      const retiredReplay=await h.post('/mutate',mutation);assert.equal(retiredReplay.status,409);assert.equal(h.remote.todoistWrites,writes);
+      const replacement=await h.post('/mutate',{...mutation,requestId:randomUUID(),title:'[Climbing] Replacement next step'});assert.equal(replacement.status,200);assert.equal(replacement.data.links.length,1);assert.equal(h.remote.todoistWrites,writes+1);
       const disconnected=await h.post('/disconnect',{provider:'todoist'});assert.equal(disconnected.status,200);assert.equal(disconnected.data.links[0].remoteId,'created-task');
-      const saved=JSON.parse(await readFile(join(h.directory,'integrations.private.json'),'utf8'));assert.equal(saved.receipts[requestId].id,'created-task');assert.equal(saved.view.links[0].id,link.id);
+      const saved=JSON.parse(await readFile(join(h.directory,'integrations.private.json'),'utf8'));assert.equal(saved.receipts[requestId].id,'created-task');assert.equal(saved.detachedRequests.includes(requestId),true);assert.equal(saved.view.links[0].id,replacement.data.links[0].id);
     }finally{await h.cleanup();}
   });
   await t.test('Google scheduled session persists location and allows only one event per plan',async()=>{
@@ -136,6 +140,7 @@ test('linked provider creates retain exact remote identities',async t=>{
       const created=await h.post('/mutate',mutation);assert.equal(created.status,200);assert.equal(h.remote.googleWrites.at(-1).location,'Movement Portland');
       const link=integrationLinkSchema.parse(created.data.links[0]);assert.equal(link.remoteId,requestId.replaceAll('-',''));assert.equal(link.entityId,entityId);assert.equal(link.role,'scheduled-session');
       const writes=h.remote.googleWrites.length;const replay=await h.post('/mutate',mutation);assert.equal(replay.status,200);assert.equal(h.remote.googleWrites.length,writes);assert.equal(replay.data.links[0].id,link.id);
+      h.remote.event={...h.remote.event,status:'cancelled'};const missing=await h.post('/sync',{date:'2026-09-19',timeZone:zone});assert.deepEqual(missing.data.events,[]);assert.equal(missing.data.links[0].id,link.id);
       const duplicate=await h.post('/mutate',{...mutation,requestId:randomUUID(),title:'Duplicate climbing block'});assert.equal(duplicate.status,409);assert.equal(h.remote.googleWrites.length,writes);
       const detached=await h.post('/unlink',{id:link.id});assert.equal(detached.status,200);assert.deepEqual(detached.data.links,[]);
       const retiredReplay=await h.post('/mutate',mutation);assert.equal(retiredReplay.status,409);assert.equal(h.remote.googleWrites.length,writes);
@@ -168,6 +173,15 @@ test('integration link validation rejects mismatched or non-create mutations',as
     assert.equal((await h.post('/mutate',{provider:'google',action:'update',id:'event1',version:'"v1"',requestId:randomUUID(),title:'Cannot add link',date:'2026-09-11',endDate:'2026-09-11',time:'09:00',endTime:'10:00',allDay:false,timeZone:zone,link:plan})).status,400);
     assert.equal((await h.post('/mutate',{provider:'todoist',action:'create',requestId:randomUUID(),title:'No Todoist location',location:'Gym',timeZone:zone})).status,400);
   }finally{await h.cleanup();}
+});
+
+test('integration link collections allow only one current link for each climbing goal or plan',()=>{
+  const goalId=randomUUID();const planId=randomUUID();const now=new Date().toISOString();
+  const goalLink={id:randomUUID(),entityKind:'goal',entityId:goalId,role:'goal-next-step',provider:'todoist',remoteId:'task-a',requestId:randomUUID(),createdAt:now};
+  const planLink={id:randomUUID(),entityKind:'plan',entityId:planId,role:'scheduled-session',provider:'google',remoteId:'event-a',requestId:randomUUID(),createdAt:now};
+  assert.equal(integrationLinksSchema.safeParse([goalLink,{...goalLink,id:randomUUID(),remoteId:'task-b',requestId:randomUUID()}]).success,false);
+  assert.equal(integrationLinksSchema.safeParse([planLink,{...planLink,id:randomUUID(),remoteId:'event-b',requestId:randomUUID()}]).success,false);
+  assert.equal(integrationLinksSchema.safeParse([goalLink,planLink]).success,true);
 });
 
 test('saved integration views without links migrate to an empty link list',async()=>{

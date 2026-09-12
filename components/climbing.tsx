@@ -17,7 +17,7 @@ import {
   type Climb, type ClimbingGoal, type ClimbingPlan, type ClimbingSession, type ClimbingState, type GradeSystem,
   type Routine, type RoutineExecution, type RoutineStep,
 } from "@/lib/climbing";
-import type { HealthView, HealthWorkout } from "@/lib/health";
+import { healthWorkoutDay, healthWorkoutTimeZone, uniqueHealthWorkouts, type HealthView, type HealthWorkout } from "@/lib/health";
 import type { IntegrationLink, RemoteEvent, RemoteTask } from "@/lib/integrations/model";
 import { dateKey } from "@/lib/workspace";
 
@@ -43,12 +43,7 @@ const gradeFits = (discipline: Climb["discipline"], system: GradeSystem | null) 
 const linkFor = (links: IntegrationLink[], role: IntegrationLink["role"], entityId: string) => links.find(link => link.role === role && link.entityId === entityId);
 const remoteFor = <T extends { id: string }>(items: T[], link?: IntegrationLink) => link ? items.find(item => item.id === link.remoteId) : undefined;
 
-function localDay(value: string, timeZone: string) {
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(value));
-  const part = (type: string) => parts.find(item => item.type === type)?.value ?? "";
-  return `${part("year")}-${part("month")}-${part("day")}`;
-}
-function workoutTime(workout: HealthWorkout, timeZone: string) { return new Date(workout.start).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZone }); }
+function workoutTime(workout: HealthWorkout, snapshotTimeZone: string) { return new Date(workout.start).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZone: healthWorkoutTimeZone(workout, snapshotTimeZone) }); }
 function workoutActivity(workout: HealthWorkout) {
   const names: Record<string, string> = { climbing: "Climbing", walking: "Walking", running: "Running", cycling: "Cycling", swimming: "Swimming", hiking: "Hiking", yoga: "Yoga", "traditional-strength-training": "Traditional strength training", "functional-strength-training": "Functional strength training", hiit: "HIIT", other: "Other workout" };
   return names[workout.activity ?? "other"] ?? "Other workout";
@@ -346,11 +341,13 @@ function SessionEditor({ draft, dirtyRef, busy, blocked, health, healthLoaded, h
   const updateClimb = (id: string, update: Partial<Climb>) => setValue(current => ({ ...current, climbs: current.climbs.map(climb => climb.id === id ? { ...climb, ...update } : climb) }));
   const updateRoutine = (update: RoutineExecution) => setValue(current => ({ ...current, routine: update }));
   const snapshot = health?.snapshot;
-  const usedWorkoutIds = new Set(allSessions.filter(session => session.id !== value.id && session.healthWorkoutId).map(session => session.healthWorkoutId));
-  const linkedWorkout = value.healthWorkoutId ? snapshot?.workouts.find(workout => workout.id === value.healthWorkoutId) : undefined;
-  const workouts = snapshot?.workouts.filter(workout => localDay(workout.start, snapshot.timeZone) === value.date && (!usedWorkoutIds.has(workout.id) || workout.id === value.healthWorkoutId)).sort((a, b) => Number((b.activity ?? "other") === "climbing") - Number((a.activity ?? "other") === "climbing") || a.start.localeCompare(b.start)) ?? [];
+  const selectedWorkoutId = value.healthWorkoutId?.toLowerCase() ?? null;
+  const usedWorkoutIds = new Set(allSessions.flatMap(session => session.id !== value.id && session.healthWorkoutId ? [session.healthWorkoutId.toLowerCase()] : []));
+  const snapshotWorkouts = snapshot ? uniqueHealthWorkouts(snapshot.workouts) : [];
+  const linkedWorkout = selectedWorkoutId ? snapshotWorkouts.find(workout => workout.id.toLowerCase() === selectedWorkoutId) : undefined;
+  const workouts = snapshot ? snapshotWorkouts.filter(workout => healthWorkoutDay(workout, snapshot.timeZone) === value.date && (!usedWorkoutIds.has(workout.id.toLowerCase()) || workout.id.toLowerCase() === selectedWorkoutId)).sort((a, b) => Number((b.activity ?? "other") === "climbing") - Number((a.activity ?? "other") === "climbing") || a.start.localeCompare(b.start)) : [];
   const healthDay = snapshot?.days.find(day => day.date === value.date);
-  const linkedWorkoutDay = linkedWorkout && snapshot ? localDay(linkedWorkout.start, snapshot.timeZone) : null;
+  const linkedWorkoutDay = linkedWorkout && snapshot ? healthWorkoutDay(linkedWorkout, snapshot.timeZone) : null;
   return <form className="climbing-form" onSubmit={event => { event.preventDefault(); void save({ ...draft, value }); }}>
     {value.planId && <section className="climbing-connected-context"><CalendarClock/><div><strong>This session comes from a saved plan.</strong><p>Saving logs the session and completes the local plan together. Actual duration and results remain yours to record.</p></div></section>}
     <div className="climbing-form-grid three"><label>Date<Input required type="date" max={today} disabled={busy} value={value.date} onChange={event => setValue({ ...value, date: event.target.value })}/></label><label>Setting<select disabled={busy} value={value.environment} onChange={event => setValue({ ...value, environment: event.target.value as ClimbingSession["environment"] })}><option value="indoor">Gym</option><option value="outdoor">Outside</option></select></label><label>Session type<select disabled={busy} value={value.focus} onChange={event => setValue({ ...value, focus: event.target.value as ClimbingSession["focus"] })}>{Object.entries(focusNames).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></label></div>
@@ -380,7 +377,7 @@ function HealthContext({ health, healthLoaded, error, day, healthDay, workouts, 
       <div className="health-day-metrics"><span><strong>{metric(healthDay?.steps)}</strong><small>Steps within this day</small></span><span><strong>{healthDay?.sleepMinutes == null ? "No accessible data" : minutesLabel(Math.round(healthDay.sleepMinutes))}</strong><small>Asleep within this day</small></span><span><strong>{metric(healthDay?.restingHeartRate, " bpm")}</strong><small>Latest resting heart rate</small></span></div>
       {selectedId && <div className={`linked-workout ${missingLink ? "missing" : ""}`}><HeartPulse/><div>{linkedWorkout ? <><strong>{linkedWorkout.name}</strong><p>{workoutActivity(linkedWorkout)} · {workoutTime(linkedWorkout, snapshot.timeZone)} · {Math.round(linkedWorkout.minutes)} min{linkedWorkout.sourceName ? ` · ${linkedWorkout.sourceName}` : ""}</p>{linkedWorkoutDay !== day && <small>This workout is on {linkedWorkoutDay ? dayLabel(linkedWorkoutDay) : "another day"}; review the session date or unlink it.</small>}</> : <><strong>Linked workout unavailable</strong><p>{missingMessage}</p></>}</div><div>{copiedMinutes !== null && copiedMinutes >= 5 && copiedMinutes <= 900 && copiedMinutes !== duration && <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => applyDuration(copiedMinutes)}>Use {copiedMinutes} min</Button>}<button type="button" className="climbing-quiet-action" disabled={busy} onClick={() => choose(null)}>Unlink workout</button></div></div>}
       {!selectedId && <div className="health-workout-picker"><h4>Same-day workouts</h4>{workouts.length ? workouts.map(workout => <button type="button" key={workout.id} disabled={busy} onClick={() => choose(workout.id)} aria-label={`Link ${workout.name} at ${workoutTime(workout, snapshot.timeZone)}`}><span className={`health-workout-icon ${(workout.activity ?? "other") === "climbing" ? "recommended" : ""}`}><Activity/></span><span><strong>{workout.name}</strong><small>{workoutActivity(workout)} · {workoutTime(workout, snapshot.timeZone)}{workout.sourceName ? ` · ${workout.sourceName}` : ""}</small></span><span>{Math.round(workout.minutes)} min{(workout.activity ?? "other") === "climbing" && <small>Suggested match</small>}</span></button>) : <p>No accessible workouts for this day.</p>}</div>}
-      <p className="health-context-caption">Calendar-day metrics use {snapshot.timeZone}. Workouts already linked to another climbing session are hidden.</p>
+      <p className="health-context-caption">Daily metrics use {snapshot.timeZone}. Each workout uses its recorded timezone when available. Workouts already linked to another climbing session are hidden.</p>
     </>}
   </section>;
 }

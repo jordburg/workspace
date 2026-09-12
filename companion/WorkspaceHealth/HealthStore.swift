@@ -109,9 +109,15 @@ final class HealthStore: @unchecked Sendable {
                 activity: workoutActivity(workout.workoutActivityType),
                 sourceId: source.source.bundleIdentifier + (product.isEmpty ? "" : "|" + product),
                 sourceName: source.source.name + (product.isEmpty ? "" : " · " + product),
-                timeZone: metadataZone.flatMap { TimeZone(identifier: $0) == nil ? nil : $0 })
+                timeZone: WorkspaceFormat.wireTimeZoneIdentifier(metadataZone, at: workout.startDate))
         }
-        return HealthSnapshot(timeZone: calendar.timeZone.identifier, from: key(from), to: key(today), days: days, workouts: workouts)
+        return HealthSnapshot(
+            timeZone: WorkspaceFormat.wireTimeZoneIdentifier(calendar.timeZone, at: today),
+            from: key(from),
+            to: key(today),
+            days: days,
+            workouts: workouts
+        )
     }
     private func dailyQuantity(_ identifier: HKQuantityTypeIdentifier, unit: HKUnit, cumulative: Bool = false, from: Date, to: Date) async throws -> [String: Double] {
         try await withCheckedThrowingContinuation { continuation in
@@ -145,7 +151,7 @@ final class HealthStore: @unchecked Sendable {
             return SleepRecord(id: sample.uuid, start: sample.startDate, end: sample.endDate, stage: stage,
                 sourceId: source.source.bundleIdentifier + "|" + product,
                 sourceName: source.source.name + (product.isEmpty ? "" : " · " + product),
-                timeZone: metadataZone.flatMap { TimeZone(identifier: $0) == nil ? nil : $0 }, sourceVersion: source.version)
+                timeZone: WorkspaceFormat.wireTimeZoneIdentifier(metadataZone, at: sample.startDate), sourceVersion: source.version)
         }
         guard records.count <= 30000 else { throw BridgeError.message("This sleep range has too many records. Import a shorter range.") }
         var days: [SleepContextDay] = [], day = from
@@ -154,7 +160,13 @@ final class HealthStore: @unchecked Sendable {
             days.append(SleepContextDay(date: date, steps: steps[date], restingHeartRate: heart[date], hrv: hrv[date], activeEnergy: energy[date], exerciseMinutes: exercise[date], respiratoryRate: respiration[date], oxygenSaturation: oxygen[date].map { $0 * 100 }))
             day = calendar.date(byAdding: .day, value: 1, to: day)!
         }
-        return SleepBatch(timeZone: calendar.timeZone.identifier, from: from, to: to, samples: records, days: days)
+        return SleepBatch(
+            timeZone: WorkspaceFormat.wireTimeZoneIdentifier(calendar.timeZone, at: from),
+            from: from,
+            to: to,
+            samples: records,
+            days: days
+        )
     }
     private func workoutName(_ type: HKWorkoutActivityType) -> String { switch type { case .climbing: return "Climbing"; case .walking: return "Walking"; case .running: return "Running"; case .cycling: return "Cycling"; case .swimming: return "Swimming"; case .hiking: return "Hiking"; case .yoga: return "Yoga"; case .traditionalStrengthTraining, .functionalStrengthTraining: return "Strength training"; case .highIntensityIntervalTraining: return "HIIT"; default: return "Workout" } }
     private func workoutActivity(_ type: HKWorkoutActivityType) -> String { switch type { case .climbing: return "climbing"; case .walking: return "walking"; case .running: return "running"; case .cycling: return "cycling"; case .swimming: return "swimming"; case .hiking: return "hiking"; case .yoga: return "yoga"; case .traditionalStrengthTraining: return "traditional-strength-training"; case .functionalStrengthTraining: return "functional-strength-training"; case .highIntensityIntervalTraining: return "hiit"; default: return "other" } }

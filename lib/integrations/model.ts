@@ -19,6 +19,8 @@ export const integrationLinkSchema = z.object({
 export const integrationLinksSchema = z.array(integrationLinkSchema).max(10000).superRefine((links, ctx) => {
   if (new Set(links.map(link => link.id)).size !== links.length) ctx.addIssue({ code: "custom", message: "Integration link IDs must be unique." });
   if (new Set(links.map(link => link.requestId)).size !== links.length) ctx.addIssue({ code: "custom", message: "Each integration request can create only one link." });
+  const goalNextSteps = links.filter(link => link.role === "goal-next-step").map(link => link.entityId);
+  if (new Set(goalNextSteps).size !== goalNextSteps.length) ctx.addIssue({ code: "custom", message: "A climbing goal can link to only one Todoist next step." });
   const scheduledPlans = links.filter(link => link.role === "scheduled-session").map(link => link.entityId);
   if (new Set(scheduledPlans).size !== scheduledPlans.length) ctx.addIssue({ code: "custom", message: "A climbing plan can link to only one Calendar event." });
 });

@@ -12,6 +12,26 @@ private struct EmptyBridgeBody: Codable, Sendable {}
 private struct SavedBridgeResponse: Decodable, Sendable { let saved: Bool }
 private struct WeightCommandsResponse: Decodable, Sendable { let commands: [WeightCommand] }
 
+private enum WorkspaceItemChange: Sendable {
+    case upsert(WorkspaceItem)
+    case remove(String)
+
+    func applying(to state: WorkspaceState) -> WorkspaceState {
+        var result = state
+        switch self {
+        case .upsert(let item):
+            if let index = result.items.firstIndex(where: { $0.id == item.id }) {
+                result.items[index] = item
+            } else {
+                result.items.append(item)
+            }
+        case .remove(let id):
+            result.items.removeAll { $0.id == id }
+        }
+        return result
+    }
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published private(set) var credentials: BridgeCredentials?
@@ -40,6 +60,11 @@ final class WorkspaceStore: ObservableObject {
 
     let health: HealthStore
     private var cancelHistoryRequested = false
+    private var clearAfterUnpair = false
+    private var pairingEpoch = 0
+    private var unpairing = false
+    private var postUnpairStatus: String?
+    private var workspaceConflictChange: WorkspaceItemChange?
 
     var isPaired: Bool { credentials != nil }
     var hasWorkspaceAccess: Bool {
@@ -78,8 +103,14 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func pair(_ url: URL) async {
+        guard !unpairing, busyAreas.isEmpty else {
+            record(BridgeError.message("Wait for the current sync or save to finish before changing the Mac pairing."), area: .pairing)
+            return
+        }
         guard begin(.pairing) else { return }
         defer { finish(.pairing) }
+        postUnpairStatus = nil
+        let expectedEpoch = pairingEpoch
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         do {
@@ -89,6 +120,10 @@ final class WorkspaceStore: ObservableObject {
             }
             let pairing = try bridgeDecoder().decode(PairingFile.self, from: data)
             let paired = try await BridgeClient.pair(pairing)
+            guard expectedEpoch == pairingEpoch else {
+                BridgeKeychain.remove()
+                return
+            }
             resetWorkspaceState()
             credentials = paired
             status = paired.scope == .workspace
@@ -106,21 +141,58 @@ final class WorkspaceStore: ObservableObject {
 
     func useCredentials(_ newCredentials: BridgeCredentials?) {
         guard newCredentials != credentials else { return }
+        pairingEpoch += 1
         resetWorkspaceState()
         credentials = newCredentials
         status = newCredentials == nil ? "Pair with your Mac to begin." : "Ready to connect to your Mac."
     }
 
-    func unpair() {
+    func unpair() async {
+        guard !unpairing else { return }
+        guard !busyAreas.contains(.pairing) else {
+            record(
+                BridgeError.message("Wait for pairing or the current Workspace refresh to finish before unpairing."),
+                area: .pairing
+            )
+            return
+        }
+        unpairing = true
+        pairingEpoch += 1
+        clearAfterUnpair = true
+        let hadCredentials = credentials != nil
+        let savedClient = credentials.flatMap { try? BridgeClient($0) }
+        var completionStatus = "Pair with your Mac to begin."
         BridgeKeychain.remove()
         credentials = nil
         resetWorkspaceState()
-        commands = []
-        healthSnapshot = nil
-        status = "Pair with your Mac to begin."
+        let revokingStatus = "This iPhone is unpaired locally. Asking the Mac to revoke its saved token…"
+        postUnpairStatus = revokingStatus
+        status = revokingStatus
+        defer {
+            BridgeKeychain.remove()
+            credentials = nil
+            resetWorkspaceState()
+            postUnpairStatus = completionStatus
+            status = completionStatus
+            unpairing = false
+            if busyAreas.isEmpty { clearAfterUnpair = false }
+        }
+        guard let savedClient else {
+            if hadCredentials {
+                completionStatus = "This iPhone is unpaired locally. The Mac did not confirm revocation, so disable iPhone sync on the Mac to invalidate its saved token."
+            }
+            return
+        }
+        do {
+            try await savedClient.revokePairing()
+        } catch {
+            completionStatus = "This iPhone is unpaired locally. The Mac did not confirm revocation, so disable iPhone sync on the Mac to invalidate its saved token."
+        }
     }
 
     func loadInitial() async {
+        guard begin(.pairing) else { return }
+        defer { finish(.pairing) }
         guard let client = makeClient() else { return }
         do {
             try await negotiateCapabilities(using: client)
@@ -130,11 +202,14 @@ final class WorkspaceStore: ObservableObject {
         }
         guard hasWorkspaceAccess else { return }
         await load(.workspace)
+        await load(.climbing)
         await load(.integrations)
         await load(.health)
     }
 
     func refreshAll() async {
+        guard begin(.pairing) else { return }
+        defer { finish(.pairing) }
         guard let client = makeClient() else { return }
         do {
             try await negotiateCapabilities(using: client)
@@ -205,20 +280,52 @@ final class WorkspaceStore: ObservableObject {
 
     @discardableResult
     func saveWorkspace(_ draft: WorkspaceState) async -> Bool {
+        guard allowWorkspaceMutation() else { return false }
+        return await persistWorkspace(draft)
+    }
+
+    @discardableResult
+    private func persistWorkspace(
+        _ draft: WorkspaceState,
+        change: WorkspaceItemChange? = nil
+    ) async -> Bool {
         guard begin(.workspace) else { return false }
         defer { finish(.workspace) }
         guard let client = workspaceClient(area: .workspace) else { return false }
         do {
             workspace = try await client.send("v1/workspace", input: draft)
             workspaceConflict = nil
+            workspaceConflictChange = nil
             loadedAreas.insert(.workspace)
             clearRecordedError(.workspace)
             status = "Workspace saved."
             return true
         } catch let bridge as BridgeError where bridge.statusCode == 409 {
-            let latest = (try? await client.get("v1/workspace") as WorkspaceState) ?? workspace
-            workspace = latest
-            workspaceConflict = RevisionConflict(draft: draft, latest: latest, message: bridge.localizedDescription)
+            let latest = try? await client.get("v1/workspace") as WorkspaceState
+            let revisionChanged = latest.map { $0.revision != draft.revision } ?? false
+            let isRevisionConflict: Bool
+            switch bridge.responseCode {
+            case "store_busy":
+                isRevisionConflict = false
+            case "revision_conflict":
+                isRevisionConflict = true
+            default:
+                // Older bridge builds did not always identify their 409s. Only
+                // those missing or unknown codes need revision-based inference.
+                isRevisionConflict = revisionChanged
+            }
+            if isRevisionConflict {
+                let savedLatest = latest ?? workspace
+                var retainedDraft = latest.flatMap { change?.applying(to: $0) } ?? draft
+                retainedDraft.revision = savedLatest.revision
+                workspace = savedLatest
+                workspaceConflict = RevisionConflict(draft: retainedDraft, latest: savedLatest, message: bridge.localizedDescription)
+                workspaceConflictChange = change
+            } else {
+                // The loopback store also uses 409 while its short write lock is held.
+                // Keep any earlier actionable conflict, but do not invent a new one.
+                if workspaceConflict == nil, let latest { workspace = latest }
+            }
             record(bridge, area: .workspace)
             return false
         } catch {
@@ -228,41 +335,60 @@ final class WorkspaceStore: ObservableObject {
     }
 
     @discardableResult
-    func upsertWorkspaceItem(_ item: WorkspaceItem) async -> Bool {
+    func upsertWorkspaceItem(_ item: WorkspaceItem, openingState: WorkspaceState? = nil) async -> Bool {
+        guard allowWorkspaceMutation() else { return false }
         if !loadedAreas.contains(.workspace) { await load(.workspace) }
         guard loadedAreas.contains(.workspace) else { return false }
-        var draft = workspace
-        if let index = draft.items.firstIndex(where: { $0.id == item.id }) {
-            draft.items[index] = item
-        } else {
-            draft.items.append(item)
-        }
-        return await saveWorkspace(draft)
+        let change = WorkspaceItemChange.upsert(item)
+        let base = openingState ?? workspace
+        let draft = change.applying(to: base)
+        return await persistWorkspace(draft, change: change)
     }
 
     @discardableResult
-    func removeWorkspaceItem(id: String) async -> Bool {
+    func removeWorkspaceItem(id: String, openingState: WorkspaceState? = nil) async -> Bool {
+        guard allowWorkspaceMutation() else { return false }
         if !loadedAreas.contains(.workspace) { await load(.workspace) }
         guard loadedAreas.contains(.workspace) else { return false }
-        var draft = workspace
-        draft.items.removeAll { $0.id == id }
-        return await saveWorkspace(draft)
+        let change = WorkspaceItemChange.remove(id)
+        let base = openingState ?? workspace
+        let draft = change.applying(to: base)
+        return await persistWorkspace(draft, change: change)
     }
 
     @discardableResult
     func toggleWorkspaceItem(id: String) async -> Bool {
+        guard allowWorkspaceMutation() else { return false }
         if !loadedAreas.contains(.workspace) { await load(.workspace) }
         guard loadedAreas.contains(.workspace),
               let index = workspace.items.firstIndex(where: { $0.id == id }) else { return false }
-        var draft = workspace
-        draft.items[index].done.toggle()
-        return await saveWorkspace(draft)
+        let base = workspace
+        let changed = base.items[index]
+        var toggled = changed
+        toggled.done.toggle()
+        return await upsertWorkspaceItem(toggled, openingState: base)
     }
 
-    func discardWorkspaceConflict() { workspaceConflict = nil }
+    @discardableResult
+    func retryWorkspaceConflict() async -> Bool {
+        guard let conflict = workspaceConflict else { return false }
+        var draft = workspaceConflictChange?.applying(to: conflict.latest) ?? conflict.draft
+        draft.revision = conflict.latest.revision
+        return await persistWorkspace(draft, change: workspaceConflictChange)
+    }
+
+    func discardWorkspaceConflict() {
+        workspaceConflict = nil
+        workspaceConflictChange = nil
+    }
 
     @discardableResult
     func saveClimbing(_ draft: ClimbingState) async -> Bool {
+        await persistClimbing(draft)
+    }
+
+    @discardableResult
+    private func persistClimbing(_ draft: ClimbingState) async -> Bool {
         guard begin(.climbing) else { return false }
         defer { finish(.climbing) }
         guard let client = workspaceClient(area: .climbing) else { return false }
@@ -273,10 +399,26 @@ final class WorkspaceStore: ObservableObject {
             clearRecordedError(.climbing)
             status = "Climbing saved."
             return true
-        } catch let bridge as BridgeError where bridge.statusCode == 409 || bridge.responseCode == "revision_conflict" {
-            let latest = (try? await client.get("v1/climbing") as ClimbingState) ?? climbing
-            climbing = latest
-            climbingConflict = RevisionConflict(draft: draft, latest: latest, message: bridge.localizedDescription)
+        } catch let bridge as BridgeError where bridge.statusCode == 409 {
+            let latest = try? await client.get("v1/climbing") as ClimbingState
+            let revisionChanged = latest.map { $0.revision != draft.revision } ?? false
+            let isRevisionConflict: Bool
+            switch bridge.responseCode {
+            case "store_busy":
+                isRevisionConflict = false
+            case "revision_conflict":
+                isRevisionConflict = true
+            default:
+                isRevisionConflict = revisionChanged
+            }
+            if isRevisionConflict {
+                let savedLatest = latest ?? climbing
+                climbing = savedLatest
+                climbingConflict = RevisionConflict(draft: draft, latest: savedLatest, message: bridge.localizedDescription)
+            } else if let latest {
+                // A transient 409 must not be presented as a revision conflict.
+                climbing = latest
+            }
             record(bridge, area: .climbing)
             return false
         } catch {
@@ -285,7 +427,69 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    @discardableResult
+    func upsertClimbingSession(
+        _ session: ClimbingSession,
+        openingState: ClimbingState,
+        markLinkedPlanLogged: Bool
+    ) async -> Bool {
+        var draft = openingState
+        if let index = draft.sessions.firstIndex(where: { $0.id == session.id }) {
+            draft.sessions[index] = session
+        } else {
+            draft.sessions.append(session)
+        }
+        if markLinkedPlanLogged,
+           let planId = session.planId,
+           let index = draft.plans.firstIndex(where: { $0.id == planId }) {
+            draft.plans[index].status = .logged
+            draft.plans[index].sessionId = session.id
+            draft.plans[index].updatedAt = session.updatedAt
+        }
+        return await persistClimbing(draft)
+    }
+
+    @discardableResult
+    func upsertClimbingPlan(_ plan: ClimbingPlan, openingState: ClimbingState) async -> Bool {
+        var draft = openingState
+        if let index = draft.plans.firstIndex(where: { $0.id == plan.id }) {
+            draft.plans[index] = plan
+        } else {
+            draft.plans.append(plan)
+        }
+        return await persistClimbing(draft)
+    }
+
+    @discardableResult
+    func upsertClimbingGoal(_ goal: ClimbingGoal, openingState: ClimbingState) async -> Bool {
+        var draft = openingState
+        if let index = draft.goals.firstIndex(where: { $0.id == goal.id }) {
+            draft.goals[index] = goal
+        } else {
+            draft.goals.append(goal)
+        }
+        return await persistClimbing(draft)
+    }
+
+    @discardableResult
+    func upsertClimbingRoutine(_ routine: ClimbingRoutine, openingState: ClimbingState) async -> Bool {
+        var draft = openingState
+        if let index = draft.routines.firstIndex(where: { $0.id == routine.id }) {
+            draft.routines[index] = routine
+        } else {
+            draft.routines.append(routine)
+        }
+        return await persistClimbing(draft)
+    }
+
     func discardClimbingConflict() { climbingConflict = nil }
+
+    func reportStaleRow(_ noun: String, area: WorkspaceArea) {
+        record(
+            BridgeError.message("This \(noun) changed or was removed on your Mac. Refresh and try again."),
+            area: area
+        )
+    }
 
     @discardableResult
     func saveWritingDraft(_ input: WritingInput) async -> Bool {
@@ -349,7 +553,16 @@ final class WorkspaceStore: ObservableObject {
         defer { finish(.integrations) }
         guard let client = workspaceClient(area: .integrations) else { return false }
         do {
-            integrations = try await client.send("v1/integrations/mutate", input: mutation)
+            var request = mutation
+            if request.provider == .todoist,
+               request.action == .update,
+               request.date == nil,
+               let task = integrations.tasks.first(where: { $0.id == request.id }),
+               !task.recurring,
+               task.dueTime == nil {
+                request.encodesNilDate = true
+            }
+            integrations = try await client.send("v1/integrations/mutate", input: request)
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
             status = mutation.provider == .google ? "Calendar updated." : "Todoist updated."
@@ -501,7 +714,7 @@ final class WorkspaceStore: ObservableObject {
     func save(_ command: WeightCommand) async { await confirmWeight(command) }
 
     private func begin(_ area: WorkspaceArea) -> Bool {
-        guard !busyAreas.contains(area) else { return false }
+        guard !unpairing, !busyAreas.contains(area) else { return false }
         busyAreas.insert(area)
         areaErrors.removeValue(forKey: area)
         error = areaErrors.values.first
@@ -510,6 +723,15 @@ final class WorkspaceStore: ObservableObject {
 
     private func finish(_ area: WorkspaceArea) {
         busyAreas.remove(area)
+        // Unpairing is immediate even when an already-started request is winding
+        // down. Do not let that request repopulate cached data afterward.
+        if clearAfterUnpair, !unpairing {
+            BridgeKeychain.remove()
+            credentials = nil
+            resetWorkspaceState()
+            status = postUnpairStatus ?? "Pair with your Mac to begin."
+            if busyAreas.isEmpty { clearAfterUnpair = false }
+        }
     }
 
     private func makeClient() -> BridgeClient? {
@@ -560,6 +782,17 @@ final class WorkspaceStore: ObservableObject {
         error = areaErrors.values.first
     }
 
+    private func allowWorkspaceMutation() -> Bool {
+        guard workspaceConflict == nil else {
+            record(
+                BridgeError.message("Resolve the saved Workspace conflict before making another Workspace change."),
+                area: .workspace
+            )
+            return false
+        }
+        return true
+    }
+
     private func record(_ cause: Error, area: WorkspaceArea) {
         let message = cause.localizedDescription
         areaErrors[area] = message
@@ -574,7 +807,13 @@ final class WorkspaceStore: ObservableObject {
         writing = .empty
         integrations = .empty
         healthView = nil
+        healthSnapshot = nil
+        commands = []
+        dayCount = 0
+        sleepStatus = "Sleep history has not been imported in this session."
+        cancelHistoryRequested = true
         workspaceConflict = nil
+        workspaceConflictChange = nil
         climbingConflict = nil
         loadedAreas = []
         areaErrors = [:]

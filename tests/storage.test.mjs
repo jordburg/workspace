@@ -28,7 +28,12 @@ test("local workspace preserves saved records and rejects unsafe writes", async 
       assert.deepEqual(await (await get()).json(),state);
     });
     await t.test("rejects stale revisions without overwriting", async () => {
-      const response=await put({...state,revision:0,items:[]});assert.equal(response.status,409);assert.deepEqual(await (await get()).json(),state);
+      const response=await put({...state,revision:0,items:[]});assert.equal(response.status,409);assert.equal((await response.json()).code,"revision_conflict");assert.deepEqual(await (await get()).json(),state);
+    });
+    await t.test("distinguishes a busy store from a stale revision", async () => {
+      const lock=join(directory,".write-lock");await writeFile(lock,"test");
+      try {const response=await put(state);assert.equal(response.status,409);assert.equal((await response.json()).code,"store_busy");}
+      finally {await rm(lock,{force:true});}
     });
     await t.test("serializes concurrent writers; exactly one succeeds", async () => {
       const responses=await Promise.all([put({...state,items:[{...priority,title:"First edit"}]}),put({...state,items:[{...priority,title:"Second edit"}]})]);

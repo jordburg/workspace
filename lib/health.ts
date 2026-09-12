@@ -16,6 +16,12 @@ export const healthSnapshotSchema=z.object({version:z.literal(1),id:z.string().u
 export type HealthSnapshot=z.input<typeof healthSnapshotSchema>;
 export type HealthWorkout=z.input<typeof healthWorkoutSchema>;
 export type HealthWorkoutActivity=z.infer<typeof healthWorkoutActivitySchema>;
+export const healthWorkoutTimeZone=(workout:Pick<HealthWorkout,"timeZone">,snapshotTimeZone:string)=>workout.timeZone??snapshotTimeZone;
+export const healthWorkoutDay=(workout:Pick<HealthWorkout,"start"|"timeZone">,snapshotTimeZone:string)=>new Intl.DateTimeFormat("en-CA",{timeZone:healthWorkoutTimeZone(workout,snapshotTimeZone),year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date(workout.start));
+export function uniqueHealthWorkouts(workouts:HealthWorkout[]):HealthWorkout[]{
+  const seen=new Set<string>();
+  return workouts.filter(workout=>{const key=workout.id.toLowerCase();if(seen.has(key))return false;seen.add(key);return true;});
+}
 export type WeightCommand={id:string;kind:"weight";kg:number;measuredAt:string;payloadHash:string;status:"pending"|"applied";createdAt:string;appliedAt:string|null};
 export type HealthView={enabled:boolean;online:boolean;paired:boolean;phoneScope:"health"|"workspace"|null;endpoint:string|null;addresses:string[];error:string|null;lastSynced:string|null;snapshot:HealthSnapshot|null;commands:WeightCommand[]};
 export const emptyHealth=():HealthView=>({enabled:false,online:false,paired:false,phoneScope:null,endpoint:null,addresses:[],error:null,lastSynced:null,snapshot:null,commands:[]});

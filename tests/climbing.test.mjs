@@ -150,6 +150,8 @@ test('Climbing schemas preserve entered grades and enforce climb, goal, and iden
   assert.equal(climbingStateSchema.safeParse(state({ routines: [plan, plan] })).success, false);
   assert.equal(climbingStateSchema.safeParse(state({ goals: [{ ...goal, routineId: randomUUID() }] })).success, false);
   assert.equal(climbingStateSchema.safeParse(state({ goals: [{ ...goal, routineId: plan.id }], routines: [plan] })).success, true);
+  const workoutId=randomUUID();
+  assert.equal(climbingStateSchema.safeParse(state({sessions:[session({healthWorkoutId:workoutId}),session({healthWorkoutId:workoutId.toUpperCase()})]})).success,false);
 });
 
 test('Climbing plans validate schedules, status transitions, and untouched routine snapshots', () => {

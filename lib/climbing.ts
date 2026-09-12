@@ -80,7 +80,7 @@ export const climbingStateSchema = z.object({
   const sessionsByPlan = new Map<string, typeof state.sessions>();
   // Removed sessions remain here: their reciprocal plan and Health links are reserved so restoring the tombstone is safe.
   for (const session of state.sessions) if (session.planId) sessionsByPlan.set(session.planId, [...(sessionsByPlan.get(session.planId) ?? []), session]);
-  const healthWorkoutIds = state.sessions.flatMap(session => session.healthWorkoutId ? [session.healthWorkoutId] : []);
+  const healthWorkoutIds = state.sessions.flatMap(session => session.healthWorkoutId ? [session.healthWorkoutId.toLowerCase()] : []);
   if (new Set(healthWorkoutIds).size !== healthWorkoutIds.length) ctx.addIssue({ code: "custom", message: "An Apple Health workout can link to only one climbing session." });
   for (const [index, plan] of state.plans.entries()) {
     if (plan.goalId && !goalIds.has(plan.goalId)) ctx.addIssue({ code: "custom", path: ["plans", index, "goalId"], message: "A climbing plan links to a goal that no longer exists." });
