@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleDisplayName</key><string>Workspace Health</string>
+<key>CFBundleDisplayName</key><string>Workspace</string>
 <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
 <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
@@ -13,13 +13,7 @@
 <key>UILaunchScreen</key><dict/>
 <key>NSHealthShareUsageDescription</key><string>Share sleep stages, steps, workouts, resting heart rate, HRV, active energy, exercise minutes, respiratory rate, oxygen saturation, and weight with your personal workspace on your Mac.</string>
 <key>NSHealthUpdateUsageDescription</key><string>Save weight measurements you explicitly review and confirm from your personal workspace.</string>
-<key>NSLocalNetworkUsageDescription</key><string>Sync selected health data directly with your paired Mac on the same Wi-Fi using an encrypted connection.</string>
-<key>NSAppTransportSecurity</key><dict>
-<key>NSAllowsLocalNetworking</key><true/>
-<key>NSExceptionDomains</key><dict>
-<key>10.0.0.0/8</key><dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/><key>NSExceptionMinimumTLSVersion</key><string>TLSv1.2</string></dict>
-<key>172.16.0.0/12</key><dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/><key>NSExceptionMinimumTLSVersion</key><string>TLSv1.2</string></dict>
-<key>192.168.0.0/16</key><dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/><key>NSExceptionMinimumTLSVersion</key><string>TLSv1.2</string></dict>
-</dict></dict>
+<key>NSLocalNetworkUsageDescription</key><string>Connect securely to your personal Workspace on your Mac and sync selected health and workspace data over your private Wi-Fi.</string>
+<key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
 </dict></plist>

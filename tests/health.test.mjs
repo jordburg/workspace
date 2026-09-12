@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { request } from 'node:https';
 import { checkServerIdentity } from 'node:tls';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHealthService } from '../build/health.ts';
@@ -26,18 +26,23 @@ test('Health workouts accept legacy snapshots and preserve enriched climbing pro
   assert.equal(healthSnapshotSchema.safeParse({...base,workouts:[{...climbing,timeZone:'Not/A_Time_Zone'}]}).success,false);
 });
 test('Health HTTPS pairing, private device scope, and confirmed weight receipts',async()=>{
-  const directory=await mkdtemp(join(tmpdir(),'workspace-health-'));const app=createHealthService(directory,{addresses:()=>['127.0.0.1'],port:0});const server=createServer(app.handle);await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin=`http://127.0.0.1:${server.address().port}`;
+  const directory=await mkdtemp(join(tmpdir(),'workspace-health-'));const proxyCalls=[];const app=createHealthService(directory,{addresses:()=>['127.0.0.1'],port:0,workspaceRequest:async(path,method,body)=>{proxyCalls.push({path,method,body});if(path==='/api/workspace'&&method==='GET')return {status:200,data:{version:1,revision:4,items:[]}};if(path==='/api/workspace'&&method==='PUT')return {status:200,data:{...body,revision:body.revision+1}};return {status:404,data:{error:'Unknown local route'}};}});const server=createServer(app.handle);await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin=`http://127.0.0.1:${server.address().port}`;
   const local=async(path,body={})=>{const r=await fetch(origin+'/api/health'+path,{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:JSON.stringify(body)});return {status:r.status,data:await r.json()};};
   try{
     let publicView=await (await fetch(origin+'/api/health')).json();assert.equal(publicView.enabled,false);
     const enabled=await local('/enable',{address:'127.0.0.1'});assert.equal(enabled.status,200);assert.equal(enabled.data.online,true);
-    const pairing=(await local('/pairing')).data;const cert=await readFile(join(directory,'health-certificate.pem'));
+    const pairing=(await local('/pairing')).data;assert.equal(pairing.version,2);assert.equal(pairing.type,'personal-workspace-pairing');assert.equal(pairing.scope,'workspace');const cert=await readFile(join(directory,'health-certificate.pem'));
     const phone=(path,token,body,pin=pairing.fingerprint)=>new Promise((resolve,reject)=>{
       const req=request(pairing.url+path,{method:body===undefined?'GET':'POST',ca:cert,headers:{Authorization:'Bearer '+token,...(body===undefined?{}:{'Content-Type':'application/json'})},checkServerIdentity:(host,certificate)=>checkServerIdentity(host,certificate)||(createHash('sha256').update(certificate.raw).digest('hex')!==pin?new Error('Certificate pin mismatch'):undefined)},res=>{const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>resolve({status:res.statusCode,data:JSON.parse(Buffer.concat(chunks).toString())}));});req.on('error',reject);req.end(body===undefined?undefined:JSON.stringify(body));
     });
     await assert.rejects(phone('/commands','wrong',undefined,'0'.repeat(64)),/pin mismatch/);
     const paired=await phone('/pair',pairing.code,{});assert.equal(paired.status,200);const token=paired.data.token;
     assert.equal((await phone('/pair',pairing.code,{})).status,401);assert.equal((await phone('/commands','wrong')).status,401);
+    assert.deepEqual((await phone('/capabilities',token)).data,{version:2,scope:'workspace',workspace:true,health:true});
+    assert.equal((await phone('/workspace','wrong')).status,401);
+    assert.deepEqual((await phone('/workspace',token)).data,{version:1,revision:4,items:[]});
+    const changed={version:1,revision:4,items:[{id:randomUUID(),kind:'note',title:'From iPhone',area:'personal',date:null,time:null,endTime:null,done:false}]};
+    assert.equal((await phone('/workspace',token,changed)).data.revision,5);assert.deepEqual(proxyCalls.slice(-2),[{path:'/api/workspace',method:'GET',body:undefined},{path:'/api/workspace',method:'PUT',body:changed}]);
     const sample={version:1,id:randomUUID(),generatedAt:new Date().toISOString(),timeZone:'America/Los_Angeles',from:'2026-09-11',to:'2026-09-11',days:[{date:'2026-09-11',steps:1234,sleepMinutes:null,restingHeartRate:60,weightKg:null}],workouts:[]};
     assert.equal((await phone('/snapshot',token,sample)).status,200);
     assert.equal((await phone('/snapshot',token,{...sample,generatedAt:'2026-01-01T00:00:00Z'})).status,409);
@@ -57,8 +62,10 @@ test('Health HTTPS pairing, private device scope, and confirmed weight receipts'
     assert.equal((await local('/weight',command)).data.commands.length,1);assert.equal((await local('/weight',{...command,kg:80})).status,409);
     const pending=(await phone('/commands',token)).data.commands[0];assert.equal((await phone('/receipt',token,{id:pending.id,payloadHash:'0'.repeat(64)})).status,409);
     assert.equal((await phone('/receipt',token,{id:pending.id,payloadHash:pending.payloadHash})).status,200);assert.equal((await phone('/commands',token)).data.commands.length,0);
-    publicView=await (await fetch(origin+'/api/health')).json();assert.equal(publicView.commands[0].status,'applied');assert.equal(publicView.snapshot.days[0].steps,1234);assert.equal(JSON.stringify(publicView).includes(token),false);assert.equal(JSON.stringify(publicView).includes(pairing.code),false);
+    publicView=await (await fetch(origin+'/api/health')).json();assert.equal(publicView.phoneScope,'workspace');assert.equal(publicView.commands[0].status,'applied');assert.equal(publicView.snapshot.days[0].steps,1234);assert.equal(JSON.stringify(publicView).includes(token),false);assert.equal(JSON.stringify(publicView).includes(pairing.code),false);
     assert.equal((await fetch(origin+'/api/health',{headers:{Origin:'https://example.com'}})).status,403);
+    const saved=JSON.parse(await readFile(join(directory,'health.private.json'),'utf8'));saved.tokenScope='health';await writeFile(join(directory,'health.private.json'),JSON.stringify(saved));
+    assert.equal((await phone('/workspace',token)).status,403);assert.equal((await phone('/commands',token)).status,200);
     await local('/disable');assert.equal((await (await fetch(origin+'/api/health')).json()).paired,false);
   }finally{await app.stop();await new Promise(r=>server.close(r));await rm(directory,{recursive:true,force:true});}
 });

@@ -17,6 +17,6 @@ export type HealthSnapshot=z.input<typeof healthSnapshotSchema>;
 export type HealthWorkout=z.input<typeof healthWorkoutSchema>;
 export type HealthWorkoutActivity=z.infer<typeof healthWorkoutActivitySchema>;
 export type WeightCommand={id:string;kind:"weight";kg:number;measuredAt:string;payloadHash:string;status:"pending"|"applied";createdAt:string;appliedAt:string|null};
-export type HealthView={enabled:boolean;online:boolean;paired:boolean;endpoint:string|null;addresses:string[];error:string|null;lastSynced:string|null;snapshot:HealthSnapshot|null;commands:WeightCommand[]};
-export const emptyHealth=():HealthView=>({enabled:false,online:false,paired:false,endpoint:null,addresses:[],error:null,lastSynced:null,snapshot:null,commands:[]});
+export type HealthView={enabled:boolean;online:boolean;paired:boolean;phoneScope:"health"|"workspace"|null;endpoint:string|null;addresses:string[];error:string|null;lastSynced:string|null;snapshot:HealthSnapshot|null;commands:WeightCommand[]};
+export const emptyHealth=():HealthView=>({enabled:false,online:false,paired:false,phoneScope:null,endpoint:null,addresses:[],error:null,lastSynced:null,snapshot:null,commands:[]});
 export const weightInputSchema=z.object({id:z.string().uuid(),kg:z.number().finite().min(1).max(700),measuredAt:timestamp}).strict();
