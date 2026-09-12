@@ -2813,6 +2813,7 @@ private struct MailWorkspaceView: View {
                                 } label: {
                                     Label("Reply", systemImage: "arrowshape.turn.up.left")
                                 }
+                                .disabled(message.replyTo.nilIfEmpty == nil)
                                 if let url = safeGmailURL(message.url) {
                                     Link(destination: url) {
                                         Label("Open in Gmail", systemImage: "arrow.up.right.square")
@@ -3009,7 +3010,7 @@ private struct MailMessageView: View {
                         } label: {
                             Label("Reply", systemImage: "arrowshape.turn.up.left")
                         }
-                        .disabled(store.isLoading(.integrations))
+                        .disabled(store.isLoading(.integrations) || message.replyTo.nilIfEmpty == nil)
                     }
                 }
             } else {
