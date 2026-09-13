@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import UIKit
 
 struct HealthDay: Encodable {
     let date: String
@@ -43,14 +44,24 @@ struct SleepBatch: Encodable {
 }
 
 final class HealthStore: @unchecked Sendable {
+    static let unavailableMessage = "Apple Health collection and writes are managed by Workspace on your iPhone. This device reads the saved health summary from your Mac."
+
     let store = HKHealthStore()
     let steps = HKQuantityType(.stepCount)
     let sleep = HKCategoryType(.sleepAnalysis)
     let heart = HKQuantityType(.restingHeartRate)
     let weight = HKQuantityType(.bodyMass)
+    let supportsLocalHealthSync: Bool
     private(set) var calendar = Calendar(identifier: .gregorian)
+
+    init(supportsLocalHealthSync: Bool? = nil) {
+        self.supportsLocalHealthSync = supportsLocalHealthSync
+            ?? (UIDevice.current.userInterfaceIdiom == .phone)
+    }
+
     func refreshCalendar() { var next = Calendar(identifier: .gregorian); next.timeZone = .current; calendar = next }
     func authorize() async throws {
+        try requireLocalHealthSync()
         guard HKHealthStore.isHealthDataAvailable() else { throw BridgeError.message("Health data requires a supported iPhone.") }
         try await store.requestAuthorization(toShare: [weight], read: [steps, sleep, heart, weight, HKWorkoutType.workoutType(), HKQuantityType(.heartRateVariabilitySDNN), HKQuantityType(.activeEnergyBurned), HKQuantityType(.appleExerciseTime), HKQuantityType(.respiratoryRate), HKQuantityType(.oxygenSaturation)])
     }
@@ -87,6 +98,7 @@ final class HealthStore: @unchecked Sendable {
         return seconds / 60
     }
     func snapshot() async throws -> HealthSnapshot {
+        try requireLocalHealthSync()
         let today = calendar.startOfDay(for: Date())
         let from = calendar.date(byAdding: .day, value: -29, to: today)!
         let end = calendar.date(byAdding: .day, value: 1, to: today)!
@@ -134,6 +146,7 @@ final class HealthStore: @unchecked Sendable {
         }
     }
     func sleepBatch(from: Date, to: Date) async throws -> SleepBatch {
+        try requireLocalHealthSync()
         async let raw = samples(sleep, from: from, to: to)
         async let stepValues = dailySteps(from: from, to: to)
         async let heartValues = dailyQuantity(.restingHeartRate, unit: .count().unitDivided(by: .minute()), from: from, to: to)
@@ -179,11 +192,18 @@ final class HealthStore: @unchecked Sendable {
         return true
     }
     func saveWeight(_ command: WeightCommand) async throws {
+        try requireLocalHealthSync()
         guard command.kg >= 1, command.kg <= 700, command.measuredAt <= Date().addingTimeInterval(300), UUID(uuidString: command.id) != nil else { throw BridgeError.message("Check the measurement and time before saving.") }
         guard store.authorizationStatus(for: weight) == .sharingAuthorized else { throw BridgeError.message("Allow this app to write body mass in Health permissions first.") }
         if try await existing(command) { return }
         let sample = HKQuantitySample(type: weight, quantity: HKQuantity(unit: .gramUnit(with: .kilo), doubleValue: command.kg), start: command.measuredAt, end: command.measuredAt, metadata: [HKMetadataKeySyncIdentifier: "workspace:" + command.id, HKMetadataKeySyncVersion: 1, HKMetadataKeyWasUserEntered: true, "workspacePayloadHash": command.payloadHash])
         do { try await store.save(sample) }
         catch { if try await existing(command) { return }; throw error }
+    }
+
+    private func requireLocalHealthSync() throws {
+        guard supportsLocalHealthSync else {
+            throw BridgeError.message(Self.unavailableMessage)
+        }
     }
 }

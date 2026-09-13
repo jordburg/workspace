@@ -23,6 +23,6 @@ export function uniqueHealthWorkouts(workouts:HealthWorkout[]):HealthWorkout[]{
   return workouts.filter(workout=>{const key=workout.id.toLowerCase();if(seen.has(key))return false;seen.add(key);return true;});
 }
 export type WeightCommand={id:string;kind:"weight";kg:number;measuredAt:string;payloadHash:string;status:"pending"|"applied";createdAt:string;appliedAt:string|null};
-export type HealthView={enabled:boolean;online:boolean;paired:boolean;phoneScope:"health"|"workspace"|null;endpoint:string|null;addresses:string[];error:string|null;lastSynced:string|null;snapshot:HealthSnapshot|null;commands:WeightCommand[]};
-export const emptyHealth=():HealthView=>({enabled:false,online:false,paired:false,phoneScope:null,endpoint:null,addresses:[],error:null,lastSynced:null,snapshot:null,commands:[]});
+export type HealthView={enabled:boolean;online:boolean;paired:boolean;pairedDeviceCount:number;healthOwnerPaired:boolean;phoneScope:"health"|"workspace"|null;endpoint:string|null;addresses:string[];error:string|null;lastSynced:string|null;snapshot:HealthSnapshot|null;commands:WeightCommand[]};
+export const emptyHealth=():HealthView=>({enabled:false,online:false,paired:false,pairedDeviceCount:0,healthOwnerPaired:false,phoneScope:null,endpoint:null,addresses:[],error:null,lastSynced:null,snapshot:null,commands:[]});
 export const weightInputSchema=z.object({id:z.string().uuid(),kg:z.number().finite().min(1).max(700),measuredAt:timestamp}).strict();

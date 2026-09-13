@@ -1,6 +1,6 @@
-# Workspace for iPhone
+# Workspace companion for iPhone and iPad
 
-Workspace for iPhone is a focused native companion to the personal Workspace on your Mac. It keeps the parts that are useful while away from the desk: the day ahead, quick capture, personal Todoist tasks, Climbing, the current Chess lesson, and a compact Apple Health summary. The phone is designed to spend most of its time away from the Mac, using a protected local snapshot between deliberate sync sessions. The Mac remains the source of truth and no Workspace cloud service is involved.
+Workspace is a native companion to the personal Workspace on your Mac. The iPhone keeps the parts that are useful away from the desk: the day ahead, quick capture, personal Todoist tasks, Climbing, the current Chess lesson, and a compact Apple Health summary. The iPad uses a desktop-style sidebar and adds wider views while the Mac is available. Both devices keep protected local snapshots of the core planning, Climbing, and Chess experience between deliberate sync sessions. The Mac remains the source of truth and no Workspace cloud service is involved.
 
 ## What is available on iPhone
 
@@ -10,33 +10,33 @@ Workspace for iPhone is a focused native companion to the personal Workspace on 
 - **Climbing** manages sessions, plans, goals, and versioned training routines. Climb projects use route-specific fields for setting, discipline, optional rope style, grade, location, attempts, target, and send status. A saved goal can keep up to 12 private beta photos, videos, and HTTPS links; individual uploads are limited to 200 MB, with the Mac enforcing the shared storage quotas. Plans can be linked to reviewed Calendar events, goal actions can be linked to reviewed Todoist tasks, and sessions can reference an Apple Health workout without changing it.
 - **Lesson** opens the current in-progress Chess lesson from the desktop Workspace. Its tap-to-move board, hints, authored explanations, and progress updates use the same private Chess record as the Mac.
 
-Open **Settings** from the gear button. It is the single place on iPhone for Mac pairing, manual sync, connection status, Apple Health permissions and history import, pending Health write approvals, and climbing links.
+Open **Settings** from the gear button or iPad sidebar. It is the single place on each device for Mac pairing, manual sync, connection status, and climbing links. Apple Health permissions, history import, and pending Health write approvals appear only on iPhone. The iPad reads the Health summary already saved on the Mac and never writes HealthKit data.
 
-Mail, Finance, Writing, the full Chess catalog and review queue, detailed Health and Sleep analysis, and a standalone Health dashboard remain in Workspace on the Mac. Plaid credentials and bank connections, Google OAuth, Todoist token setup, personal account/source selection, and site export and recovery also remain Mac actions. The phone never receives provider credentials.
+Mail, Finance, Writing, the full Chess catalog and review queue, and detailed Health views are available in the iPad layout while the Mac is reachable; they are not retained in the offline snapshot. The focused iPhone layout leaves them on the Mac. Plaid credentials and bank connections, Google OAuth, Todoist token setup, personal account/source selection, and site export and recovery remain Mac actions. Companion devices never receive provider credentials.
 
 ## Install
 
 1. Open `WorkspaceHealth.xcodeproj` in Xcode.
 2. If Xcode requests it, install the iOS platform component under **Xcode → Settings → Components**.
 3. Select the **WorkspaceHealth** target, open **Signing & Capabilities**, and choose your personal Apple development team. HealthKit is already enabled. If `com.jordburg.workspace.health` is unavailable to your team, choose a unique personal bundle identifier.
-4. Connect and unlock the iPhone, select it as the run destination, then build and run. Follow Apple's prompts for trust and Developer Mode when shown.
+4. Connect and unlock the iPhone or iPad, select it as the run destination, then build and run. Follow Apple's prompts for trust and Developer Mode when shown.
 
-The project targets iOS 17 or later and has no third-party app dependencies. A free Personal Team is sufficient for this prototype, although its provisioning normally expires after seven days. HealthKit data and Local Network permission require a physical iPhone; the Simulator cannot verify them.
+The project targets iOS/iPadOS 17 or later and has no third-party app dependencies. A free Personal Team is sufficient for this prototype, although its provisioning normally expires after seven days. HealthKit collection and writes are intentionally limited to a physical iPhone; Local Network behavior also needs a physical device for complete verification.
 
 ## Pair with the Mac
 
-1. Start the desktop Workspace and leave the Mac awake. Connect both devices to the same private Wi-Fi.
-2. On the Mac, open **Settings → iPhone and Apple Health**, enable the iPhone connection for the current Wi-Fi address, and download a new Workspace pairing file.
-3. AirDrop the JSON file to the iPhone. Open **Settings** from the gear button and choose the file. It expires after ten minutes and can be used once. Delete the transferred file after pairing.
+1. Start the desktop Workspace and leave the Mac awake. Connect the Mac and companion device to the same private Wi-Fi.
+2. On the Mac, open **Settings → Companion devices and Apple Health**, enable the companion connection for the current Wi-Fi address, and download the pairing file that matches the iPhone or iPad.
+3. Transfer the JSON file to that device. Open **Settings** in the native app and choose the file. It expires after ten minutes and can be used once. Delete the transferred file after pairing.
 4. Return to Today. The app can reach the Mac only while Workspace is running on the same network; manual refresh remains in Settings.
 
-Version 2 pairing explicitly grants this iPhone access to the focused companion allowlist for daily planning, capture, Todoist, Calendar, Climbing, the current Chess lesson, and Health. Pairing replaces the previous phone token. An older version 1 Health pairing remains valid for Health sync only and cannot read the Workspace, Climbing, Chess, Calendar, or Todoist data; download and import a new file to use those areas.
+Repeat steps 2–3 with a fresh matching file for every device. Version 2 pairing binds the one-time file to its iPhone or iPad role, gives each device its own scoped token, and adds it without revoking existing devices. Workspace accepts up to eight devices total and exactly one Health-owning iPhone; importing a new iPhone file on that same phone rotates its credential, while a second iPhone is refused. Pairing any device again with the same Mac rotates only that device’s prior token. A dropped pairing response can replay the same result during a short retry window without consuming another device slot. Unpairing from Settings revokes only that device; disabling companion sync on the Mac revokes them all. An older version 1 Health pairing remains valid on iPhone for Health sync only and cannot read the other Workspace areas; download and import a new file to use those areas. The iPad accepts Workspace iPad pairing files only.
 
-If the connection fails, check that the Mac is awake, Workspace is running, the saved Wi-Fi IP is still current, and the network does not isolate devices. A changed IP, renewed certificate, expired certificate, revoked token, or disabled iPhone connection requires a new pairing.
+If the connection fails, check that the Mac is awake, Workspace is running, the saved Wi-Fi IP is still current, and the network does not isolate devices. A changed IP, renewed certificate, expired certificate, revoked token, or disabled companion connection requires a new pairing for the affected devices.
 
 ## Apple Health
 
-Open **Settings** from the gear button, choose **Review Health permissions**, and allow only the categories you want to share. **Sync Apple Health** sends the current 30-day snapshot plus recent sleep stages and daily context directly to the Mac. **Import older sleep history** processes the chosen range in complete 30-day batches while the app stays open; stopping keeps completed batches, and retrying is safe. The latest daily values appear as a summary in Today rather than in a separate Health tab.
+On iPhone, open **Settings**, choose **Review Health permissions**, and allow only the categories you want to share. **Sync Apple Health** sends the current 30-day snapshot plus recent sleep stages and daily context directly to the Mac. **Import older sleep history** processes the chosen range in complete 30-day batches while the app stays open; stopping keeps completed batches, and retrying is safe. The latest daily values appear in Today on iPhone and in read-only Health views on iPad.
 
 Workspace cannot determine whether an empty HealthKit read means no records or denied read permission, so missing values remain missing. Review permissions before retrying an empty import. No workout, calorie, medication, diagnosis, or measurement is inferred from a plan or climbing session.
 
@@ -46,9 +46,9 @@ Workout grouping uses the workout start day in its saved HealthKit timezone, wit
 
 ## Connection security
 
-The desktop web server and ordinary data APIs stay on loopback. Enabling iPhone sync starts a separate HTTPS listener on the selected private IPv4 address, normally port 5174. That listener exposes an exact set of versioned phone routes and requires the scope-bearing bearer token created during one-use pairing. It has no Mail, Finance, Writing, or Chess-review mutation routes. Integration responses sent through it omit Gmail state and message summaries.
+The desktop web server and ordinary data APIs stay on loopback. Enabling companion sync starts a separate HTTPS listener on the selected private IPv4 address, normally port 5174. That listener exposes an exact set of versioned native routes and requires the calling device’s scope-bearing bearer token created during pairing. Shared companion routes cover the focused planning experience; additional Mail, Finance, Writing, Chess-review, read-only Health, and Gmail relationship operations require an iPad token. Apple Health uploads, commands, and receipts require the single iPhone token. iPhone integration responses omit Gmail state and message summaries, while iPad Mail receives only the public Gmail view.
 
-The pairing file pins the Mac certificate fingerprint. The iPhone accepts only HTTPS on a private IPv4 address, validates that certificate for the paired host, requires TLS 1.2 or later, refuses redirects, disables cookies and cellular access, and stores the token and Health receipts in non-synchronizing, unlocked-device-only Keychain storage. App Transport Security has no insecure HTTP exception. Provider credentials and private data files are never returned to the phone.
+The pairing file pins the Mac certificate fingerprint. Each native app accepts only HTTPS on a private IPv4 address, validates that certificate for the paired host, requires TLS 1.2 or later, refuses redirects, disables cookies and cellular access, and stores its token in non-synchronizing, unlocked-device-only Keychain storage. iPhone Health receipts use the same protection. App Transport Security has no insecure HTTP exception. Provider credentials and private data files are never returned to a companion device.
 
 ## Current operating limits
 
@@ -60,6 +60,6 @@ Workspace item saves, completion toggles, and deletes use record-level commands 
 
 Workspace makes one short connection attempt when the app launches. While the Mac is away, automatic retries back off for fifteen minutes and expected reachability failures stay quiet; returning to the app never replaces a usable snapshot with a connection warning. Calendar and Todoist do not start extra refresh attempts while the Mac is already known to be unavailable. **Settings** provides the deliberate sync action.
 
-There is no background Mac service, cloud relay, iCloud transport, remote-network access, or USB data transport. The Mac app must be running and both devices must be on the same private Wi-Fi for network reads and writes. A cable can be part of the daily routine and keep the iPhone powered, but plugging it in alone does not currently transfer Workspace data.
+There is no background Mac service, cloud relay, iCloud transport, remote-network access, or USB data transport. The Mac app must be running and each syncing device must be on the same private Wi-Fi for network reads and writes. A cable can keep a device powered and available for installation, but plugging it in alone does not currently transfer Workspace data.
 
-The app has been signed, installed, and launched on Jordan’s iPhone. Health and Local Network permissions, certificate validation across network changes, and real HealthKit/provider round trips remain dependent on the connected device and services.
+The app has been signed, installed, and launched on Jordan’s iPhone and iPad. Health and Local Network permissions, certificate validation across network changes, and real HealthKit/provider round trips remain dependent on the connected devices and services.

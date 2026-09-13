@@ -469,10 +469,10 @@ export function createIntegrationService(directory:string, remoteFetch:typeof fe
         const input=gmailSendSchema.parse(body);result=await providerState("gmail",async(state,save)=>{await sendGmail(state,input,save);await save();return state.view;});
       }else if(path==="/relations"){
         const input=workspaceRelationRequestSchema.parse(body);result=await atomicUpdate(async state=>{await addWorkspaceRelation(state,input);return state.view;});
-      }else if(path==="/unlink"){
-        const {id}=z.object({id:z.string().uuid()}).strict().parse(body);result=await atomicUpdate(async state=>{const link=state.relations.find(item=>item.id===id);if(!link)throw new PublicError("This connection link is no longer available. Refresh Workspace.",409);state.relations=state.relations.filter(item=>item.id!==id);state.detachedRequests=[...new Set([...state.detachedRequests,link.requestId])].slice(-10000);return state.view;},false);
-      }else if(path==="/mutate"){
-        const input=mutationSchema.parse(body);result=await providerState(input.provider,async(state,save)=>{await mutate(state,input,save);await save();if(input.provider==="todoist")await syncTodoist(state,input.timeZone);else await syncGoogle(state,input.anchorDate||input.date||new Date().toISOString().slice(0,10),input.timeZone);await save();return state.view;});
+      }else if(path==="/unlink"||path==="/unlink/planning"){
+        const {id}=z.object({id:z.string().uuid()}).strict().parse(body);result=await atomicUpdate(async state=>{const link=state.relations.find(item=>item.id===id);if(!link)throw new PublicError("This connection link is no longer available. Refresh Workspace.",409);if(path==="/unlink/planning"&&link.entityKind!=="goal"&&link.entityKind!=="plan")throw new PublicError("This link can be managed only from Mail on the iPad or Mac.",403);state.relations=state.relations.filter(item=>item.id!==id);state.detachedRequests=[...new Set([...state.detachedRequests,link.requestId])].slice(-10000);return state.view;},false);
+      }else if(path==="/mutate"||path==="/mutate/planning"){
+        const input=mutationSchema.parse(body);if(path==="/mutate/planning"&&input.link?.entityKind==="gmail-message")throw new PublicError("Mail follow-ups can be created only from the iPad or Mac.",403);result=await providerState(input.provider,async(state,save)=>{await mutate(state,input,save);await save();if(input.provider==="todoist")await syncTodoist(state,input.timeZone);else await syncGoogle(state,input.anchorDate||input.date||new Date().toISOString().slice(0,10),input.timeZone);await save();return state.view;});
       }else throw new PublicError("Unknown connection action.",404);
       send(200,result);
     }catch(err){send(err instanceof PublicError?err.status:err instanceof StoreBusyError?423:err instanceof z.ZodError?400:500,{error:err instanceof z.ZodError?"Check the connection file, dates, and required fields.":cleanError(err)});}

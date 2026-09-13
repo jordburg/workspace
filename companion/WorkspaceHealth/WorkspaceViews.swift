@@ -110,7 +110,8 @@ struct WorkspaceRootView: View {
         .tint(WorkspaceBrand.signal)
         .task {
             await store.loadInitial()
-            if UserDefaults.standard.bool(forKey: "healthPermissionsRequested") {
+            if store.managesAppleHealth,
+               UserDefaults.standard.bool(forKey: "healthPermissionsRequested") {
                 await store.syncHealth()
             }
         }
@@ -122,7 +123,8 @@ struct WorkspaceRootView: View {
             Task {
                 if store.needsForegroundRefresh {
                     await store.refreshAll()
-                    if UserDefaults.standard.bool(forKey: "healthPermissionsRequested") {
+                    if store.managesAppleHealth,
+                       UserDefaults.standard.bool(forKey: "healthPermissionsRequested") {
                         await store.syncHealth()
                     }
                 } else {
@@ -373,7 +375,8 @@ private struct TabletTodayView: View {
                 TodayView(
                     selectedDay: $selectedDay,
                     openTasks: openTasks,
-                    openSettings: openSettings
+                    openSettings: openSettings,
+                    showsSettingsButton: false
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -660,8 +663,8 @@ private struct WorkspaceStatusBanner: View {
                     Label(store.isPaired ? "Workspace access needed" : "Connect to your Mac", systemImage: "gearshape")
                         .font(.headline)
                     Text(store.isPaired
-                         ? "This iPhone is paired for Apple Health. Pair it again from Settings with a Workspace pairing file to use the companion features."
-                         : "Pair this iPhone from Settings to use the companion features.")
+                         ? "This device is paired for Apple Health. Pair it again from Settings with a Workspace pairing file to use the companion features."
+                         : "Pair this device from Settings to use the companion features.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                     if let openSettings {
@@ -724,7 +727,7 @@ private struct CompanionSyncSummaryRow: View {
         if let last = planningSavedAt {
             return "Updated \(last.formatted(.relative(presentation: .named)))"
         }
-        return "Saved on this iPhone"
+        return "Saved on this device"
     }
 
     private var icon: String {
@@ -795,6 +798,28 @@ private struct EditorErrorSection: View {
                     .font(.subheadline).foregroundStyle(.orange)
                 Button("Dismiss message") { store.clearError(area) }
                     .font(.caption.weight(.semibold))
+            }
+        }
+    }
+}
+
+private struct MacRequiredSection: View {
+    let detail: String
+    var openSettings: (() -> Void)? = nil
+
+    var body: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Connect to your Mac", systemImage: "desktopcomputer")
+                    .font(.headline)
+                Text(detail)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                if let openSettings {
+                    Button("Open Settings", action: openSettings)
+                } else {
+                    NavigationLink("Open Settings", value: MoreRoute.settings)
+                }
             }
         }
     }
@@ -878,11 +903,24 @@ struct TodayView: View {
     @Binding var selectedDay: Date
     let openTasks: () -> Void
     let openSettings: () -> Void
+    let showsSettingsButton: Bool
 
     @State private var itemDraft: WorkspaceItemDraft?
     @State private var taskDraft: RemoteTaskDraft?
     @State private var eventDraft: RemoteEventDraft?
     @State private var taskToComplete: RemoteTask?
+
+    init(
+        selectedDay: Binding<Date>,
+        openTasks: @escaping () -> Void,
+        openSettings: @escaping () -> Void,
+        showsSettingsButton: Bool = true
+    ) {
+        _selectedDay = selectedDay
+        self.openTasks = openTasks
+        self.openSettings = openSettings
+        self.showsSettingsButton = showsSettingsButton
+    }
 
     private var day: String { WorkspaceFormat.dayKey(selectedDay) }
     private var today: String { WorkspaceFormat.dayKey() }
@@ -940,7 +978,11 @@ struct TodayView: View {
     var body: some View {
         List {
             WorkspaceStatusBanner(openSettings: openSettings, errorArea: .workspace)
-            SettingsAttentionSection(area: .health, message: "Apple Health needs attention.", openSettings: openSettings)
+            SettingsAttentionSection(
+                area: .health,
+                message: store.managesAppleHealth ? "Apple Health needs attention." : "Health summary needs attention.",
+                openSettings: openSettings
+            )
             Section {
                 WeekDayPicker(selection: $selectedDay)
             }
@@ -955,7 +997,7 @@ struct TodayView: View {
                             title: store.isLoading(.workspace) || store.isLoading(.integrations) ? "Loading your day" : "First sync needed",
                             detail: store.isLoading(.workspace) || store.isLoading(.integrations)
                                 ? "Workspace is loading the latest planning snapshot."
-                                : "Sync with your Mac once to bring your daily plan to this iPhone."
+                                : "Sync with your Mac once to bring your daily plan to this device."
                         )
                     }
                 }
@@ -1085,10 +1127,12 @@ struct TodayView: View {
                 .disabled(!store.hasWorkspaceAccess)
                 .accessibilityLabel("Add to today")
 
-                Button(action: openSettings) {
-                    Image(systemName: "gearshape")
+                if showsSettingsButton {
+                    Button(action: openSettings) {
+                        Image(systemName: "gearshape")
+                    }
+                    .accessibilityLabel("Settings")
                 }
-                .accessibilityLabel("Settings")
             }
         }
         .task(id: day) {
@@ -1177,7 +1221,7 @@ private struct AgendaRow: View {
             }
             Spacer()
             switch entry.source {
-            case .local: Image(systemName: "iphone").foregroundStyle(.secondary)
+            case .local: Image(systemName: UIDevice.current.userInterfaceIdiom == .pad ? "ipad" : "iphone").foregroundStyle(.secondary)
             case .google: Image(systemName: "calendar").foregroundStyle(.blue)
             }
         }
@@ -1264,11 +1308,39 @@ private struct WeekDayPicker: View {
 // MARK: - Capture and tasks
 
 struct CaptureView: View {
-    @EnvironmentObject private var store: WorkspaceStore
     let openSettings: () -> Void
+
+    var body: some View {
+        List {
+            WorkspaceStatusBanner(openSettings: openSettings, errorArea: .workspace)
+
+            Section {
+                CaptureComposer()
+            }
+            .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+        }
+        .navigationTitle("Capture")
+        .toolbar {
+            CompanionSettingsToolbar(openSettings: openSettings)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .scrollContentBackground(.hidden)
+        .background(WorkspaceBrand.canvas)
+    }
+}
+
+private struct CaptureComposer: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    let compact: Bool
 
     @State private var saveMessage: String?
     @FocusState private var captureFocused: Bool
+
+    init(compact: Bool = false) {
+        self.compact = compact
+    }
 
     private var trimmedCapture: String {
         store.captureDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1278,70 +1350,55 @@ struct CaptureView: View {
     }
 
     var body: some View {
-        List {
-            WorkspaceStatusBanner(openSettings: openSettings, errorArea: .workspace)
-
-            Section {
-                VStack(alignment: .leading, spacing: 14) {
-                    TextField("What’s on your mind?", text: captureBinding, axis: .vertical)
-                        .font(.title3)
-                        .lineLimit(7...12)
-                        .frame(minHeight: 180, alignment: .topLeading)
-                        .focused($captureFocused)
-                        .disabled(!store.hasWorkspaceAccess)
-                        .onChange(of: store.captureDraft) { _, value in
-                            if !value.isEmpty { saveMessage = nil }
-                        }
-
-                    Divider().overlay(WorkspaceBrand.rule)
-
-                    HStack {
-                        if let captureStatus {
-                            Text(captureStatus)
-                                .font(.subheadline)
-                                .foregroundStyle(WorkspaceBrand.signal)
-                        }
-                        Spacer()
-                        Button(action: saveCapture) {
-                            Label(store.isLoading(.workspace) ? "Saving" : "Save", systemImage: "arrow.right")
-                                .font(.body.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 16)
-                                .frame(minHeight: 46)
-                                .background(
-                                    trimmedCapture.isEmpty
-                                        ? Color.secondary.opacity(0.45)
-                                        : WorkspaceBrand.signal,
-                                    in: Rectangle()
-                                )
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(trimmedCapture.isEmpty || !store.hasWorkspaceAccess)
-                        .accessibilityLabel("Save to Workspace Captures")
-                    }
+        VStack(alignment: .leading, spacing: compact ? 10 : 14) {
+            TextField("What’s on your mind?", text: captureBinding, axis: .vertical)
+                .font(compact ? .body : .title3)
+                .lineLimit(compact ? 4...7 : 7...12)
+                .frame(minHeight: compact ? 92 : 180, alignment: .topLeading)
+                .focused($captureFocused)
+                .disabled(!store.hasWorkspaceAccess)
+                .onChange(of: store.captureDraft) { _, value in
+                    if !value.isEmpty { saveMessage = nil }
                 }
-                .padding(18)
-                .background(WorkspaceBrand.surface)
-                .overlay {
-                    Rectangle().stroke(WorkspaceBrand.rule, lineWidth: 1)
+
+            Divider().overlay(WorkspaceBrand.rule)
+
+            HStack {
+                if let captureStatus {
+                    Text(captureStatus)
+                        .font(.caption)
+                        .foregroundStyle(WorkspaceBrand.signal)
+                        .lineLimit(2)
                 }
+                Spacer()
+                Button(action: saveCapture) {
+                    Label(store.isLoading(.workspace) ? "Saving" : "Save", systemImage: "arrow.right")
+                        .font((compact ? Font.caption : Font.body).weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, compact ? 12 : 16)
+                        .frame(minHeight: compact ? 38 : 46)
+                        .background(
+                            trimmedCapture.isEmpty
+                                ? Color.secondary.opacity(0.45)
+                                : WorkspaceBrand.signal,
+                            in: Rectangle()
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(trimmedCapture.isEmpty || !store.hasWorkspaceAccess)
+                .accessibilityLabel("Save to Workspace Captures")
             }
-            .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden)
         }
-        .navigationTitle("Capture")
+        .padding(compact ? 12 : 18)
+        .background(WorkspaceBrand.surface)
+        .overlay(Rectangle().stroke(WorkspaceBrand.rule, lineWidth: 1))
         .toolbar {
-            CompanionSettingsToolbar(openSettings: openSettings)
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("Done") { captureFocused = false }
                     .fontWeight(.semibold)
             }
         }
-        .scrollDismissesKeyboard(.interactively)
-        .scrollContentBackground(.hidden)
-        .background(WorkspaceBrand.canvas)
         .onDisappear { captureFocused = false }
     }
 
@@ -1364,11 +1421,128 @@ struct CaptureView: View {
             case .delivered:
                 saveMessage = "Saved to Workspace Captures"
             case .queued:
-                saveMessage = "Saved on this iPhone"
+                saveMessage = "Saved on this device"
             case nil:
                 break
             }
         }
+    }
+}
+
+private struct TabletCapturesView: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    let openSettings: () -> Void
+
+    @State private var itemDraft: WorkspaceItemDraft?
+
+    private var captures: [WorkspaceItem] {
+        store.workspace.items
+            .filter { $0.kind == .note && $0.triageStatus != .archived }
+            .sorted {
+                ($0.updatedAt ?? $0.createdAt ?? "") > ($1.updatedAt ?? $1.createdAt ?? "")
+            }
+    }
+
+    var body: some View {
+        List {
+            WorkspaceStatusBanner(openSettings: openSettings, errorArea: .workspace)
+            WorkspaceConflictBanner()
+
+            Section("Add a capture") {
+                CaptureComposer(compact: true)
+                    .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 16))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+
+            Section {
+                if captures.isEmpty {
+                    EmptyRow(
+                        icon: "tray",
+                        title: "Your capture inbox is clear",
+                        detail: "Loose thoughts and reminders stay here until you review or archive them."
+                    )
+                } else {
+                    ForEach(captures) { item in
+                        Button { present(item.id) } label: {
+                            HStack(alignment: .top, spacing: 12) {
+                                Image(systemName: item.triageStatus == .new ? "circle.fill" : "circle")
+                                    .font(.caption2)
+                                    .foregroundStyle(item.triageStatus == .new ? WorkspaceBrand.signal : WorkspaceBrand.rule)
+                                    .padding(.top, 6)
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(item.title)
+                                        .foregroundStyle(WorkspaceBrand.ink)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    Text(captureMetadata(item))
+                                        .font(.caption)
+                                        .foregroundStyle(WorkspaceBrand.muted)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button {
+                                archive(item.id)
+                            } label: {
+                                Label("Archive", systemImage: "archivebox")
+                            }
+                            .tint(WorkspaceBrand.signal)
+                        }
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Inbox")
+                    Spacer()
+                    if !captures.isEmpty {
+                        Text(captures.count.formatted())
+                    }
+                }
+            } footer: {
+                Text("Open a capture to edit it. Swipe left to archive it.")
+            }
+        }
+        .navigationTitle("Captures")
+        .scrollDismissesKeyboard(.interactively)
+        .scrollContentBackground(.hidden)
+        .background(WorkspaceBrand.canvas)
+        .task {
+            guard store.hasWorkspaceAccess else { return }
+            await store.load(.workspace)
+        }
+        .refreshable {
+            guard store.hasWorkspaceAccess else { return }
+            await store.load(.workspace, force: true)
+        }
+        .sheet(item: $itemDraft) { WorkspaceItemEditor(draft: $0) }
+    }
+
+    private func present(_ id: String) {
+        let openingState = store.workspace
+        guard let item = openingState.items.first(where: { $0.id == id }) else {
+            store.reportStaleRow("Capture", area: .workspace)
+            return
+        }
+        itemDraft = WorkspaceItemDraft(item: item, openingState: openingState, isNew: false)
+    }
+
+    private func archive(_ id: String) {
+        let openingState = store.workspace
+        guard var item = openingState.items.first(where: { $0.id == id }) else {
+            store.reportStaleRow("Capture", area: .workspace)
+            return
+        }
+        item.triageStatus = .archived
+        Task { await store.upsertWorkspaceItem(item, openingState: openingState) }
+    }
+
+    private func captureMetadata(_ item: WorkspaceItem) -> String {
+        let area = item.area == .personal ? "Personal" : "Independent work"
+        let status = item.triageStatus == .new ? "New" : "Reviewed"
+        let date = (item.updatedAt ?? item.createdAt).map(displayTimestamp)
+        return [area, status, date].compactMap { $0 }.joined(separator: " · ")
     }
 }
 
@@ -1421,7 +1595,7 @@ struct TasksView: View {
                         EmptyRow(
                             icon: "desktopcomputer",
                             title: "First sync needed",
-                            detail: "Sync with your Mac once to bring your Personal Todoist tasks to this iPhone."
+                            detail: "Sync with your Mac once to bring your Personal Todoist tasks to this device."
                         )
                     }
                 } else if store.loadedAreas.contains(.integrations) && !store.integrations.todoist.connected {
@@ -2044,7 +2218,7 @@ struct ClimbingView: View {
                         title: store.isLoading(.climbing) ? "Loading Climbing" : "First sync needed",
                         detail: store.isLoading(.climbing)
                             ? "Workspace is loading the latest climbing snapshot."
-                            : "Sync with your Mac once to bring your climbing log to this iPhone."
+                            : "Sync with your Mac once to bring your climbing log to this device."
                     )
                     if store.isLoading(.climbing) { ProgressView() }
                 }
@@ -3828,60 +4002,81 @@ struct HealthWorkspaceView: View {
             remoteSnapshot: store.healthView?.snapshot
         ).sorted { $0.start < $1.start }
     }
+    private var needsMac: Bool {
+        !store.managesAppleHealth && !store.isOnline && store.healthView == nil
+    }
 
     var body: some View {
         List {
-            WorkspaceStatusBanner(openSettings: openSettings, errorArea: .health, requiresFullWorkspace: false)
-            Section { WeekDayPicker(selection: $selectedDay) }
+            if needsMac {
+                MacRequiredSection(
+                    detail: "Health summaries load from Workspace on your Mac and are not saved for offline use on this iPad.",
+                    openSettings: openSettings
+                )
+            } else {
+                WorkspaceStatusBanner(openSettings: openSettings, errorArea: .health, requiresFullWorkspace: false)
+                Section { WeekDayPicker(selection: $selectedDay) }
 
-            Section("Daily snapshot") {
-                if let healthDay {
-                    HealthMetricRow(icon: "figure.walk", color: .green, title: "Steps", value: healthDay.steps.map { Int($0).formatted() } ?? "—")
-                    HealthMetricRow(icon: "bed.double.fill", color: .indigo, title: "Sleep", value: healthDay.sleepMinutes.map { minutesLabel(Int($0.rounded())) } ?? "—")
-                    HealthMetricRow(icon: "heart.fill", color: .pink, title: "Resting heart rate", value: healthDay.restingHeartRate.map { "\(Int($0.rounded())) bpm" } ?? "—")
-                    HealthMetricRow(icon: "scalemass.fill", color: .blue, title: "Weight", value: healthDay.weightKg.map(weightLabel) ?? "—")
-                } else {
-                    EmptyRow(icon: "heart.text.square", title: "No accessible readings", detail: "Use Settings to update Apple Health, or choose another day.")
-                }
-            }
-
-            Section("Workouts") {
-                if workouts.isEmpty {
-                    Text("No accessible workouts on this day.").foregroundStyle(.secondary)
-                } else {
-                    ForEach(workouts) { workout in
-                        HStack(spacing: 12) {
-                            Image(systemName: workout.activity == "climbing" ? "mountain.2.fill" : "figure.run")
-                                .foregroundStyle(workout.activity == "climbing" ? Color.orange : Color.blue)
-                                .frame(width: 24)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(workout.name).font(.headline)
-                                Text("\(WorkspaceFormat.timeLabel(workout.start, in: workout.timeZone)) · \(minutesLabel(Int(workout.minutes.rounded()))) · \(workout.source)")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !store.commands.isEmpty {
                 Section {
-                    ForEach(store.commands) { command in
-                        Button { weightToReview = command } label: {
-                            HStack {
-                                Label(weightLabel(command.kg), systemImage: "scalemass")
-                                Spacer()
-                                Text(command.measuredAt.formatted(date: .abbreviated, time: .shortened)).foregroundStyle(.secondary)
-                            }
-                        }
+                    if let healthDay {
+                        HealthMetricRow(icon: "figure.walk", color: .green, title: "Steps", value: healthDay.steps.map { Int($0).formatted() } ?? "—")
+                        HealthMetricRow(icon: "bed.double.fill", color: .indigo, title: "Sleep", value: healthDay.sleepMinutes.map { minutesLabel(Int($0.rounded())) } ?? "—")
+                        HealthMetricRow(icon: "heart.fill", color: .pink, title: "Resting heart rate", value: healthDay.restingHeartRate.map { "\(Int($0.rounded())) bpm" } ?? "—")
+                        HealthMetricRow(icon: "scalemass.fill", color: .blue, title: "Weight", value: healthDay.weightKg.map(weightLabel) ?? "—")
+                    } else {
+                        EmptyRow(
+                            icon: "heart.text.square",
+                            title: "No accessible readings",
+                            detail: store.managesAppleHealth
+                                ? "Use Settings to update Apple Health, or choose another day."
+                                : "Sync with your Mac to update the health summary collected by your iPhone."
+                        )
                     }
                 } header: {
-                    Text("Waiting for review")
+                    Text("Daily snapshot")
                 } footer: {
-                    Text("Workspace never writes a measurement to Apple Health without your confirmation on this iPhone.")
+                    if !store.managesAppleHealth {
+                        Text("Read-only on iPad. Apple Health collection and writes stay on your iPhone.")
+                    }
+                }
+
+                Section("Workouts") {
+                    if workouts.isEmpty {
+                        Text("No accessible workouts on this day.").foregroundStyle(.secondary)
+                    } else {
+                        ForEach(workouts) { workout in
+                            HStack(spacing: 12) {
+                                Image(systemName: workout.activity == "climbing" ? "mountain.2.fill" : "figure.run")
+                                    .foregroundStyle(workout.activity == "climbing" ? Color.orange : Color.blue)
+                                    .frame(width: 24)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(workout.name).font(.headline)
+                                    Text("\(WorkspaceFormat.timeLabel(workout.start, in: workout.timeZone)) · \(minutesLabel(Int(workout.minutes.rounded()))) · \(workout.source)")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if store.managesAppleHealth && !store.commands.isEmpty {
+                    Section {
+                        ForEach(store.commands) { command in
+                            Button { weightToReview = command } label: {
+                                HStack {
+                                    Label(weightLabel(command.kg), systemImage: "scalemass")
+                                    Spacer()
+                                    Text(command.measuredAt.formatted(date: .abbreviated, time: .shortened)).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    } header: {
+                        Text("Waiting for review")
+                    } footer: {
+                        Text("Workspace never writes a measurement to Apple Health without your confirmation on this iPhone.")
+                    }
                 }
             }
-
         }
         .navigationTitle("Health")
         .task { await store.load(.health) }
@@ -4011,7 +4206,7 @@ struct MoreView: View {
     }
     private var settingsDetail: String {
         let count = [store.integrations.google.connected, store.integrations.gmail.connected, store.integrations.todoist.connected].filter { $0 }.count
-        let device = store.hasWorkspaceAccess ? "iPhone paired" : "Setup needed"
+        let device = store.hasWorkspaceAccess ? "Device paired" : "Setup needed"
         return "\(count) of 3 services · \(device)"
     }
 }
@@ -4033,6 +4228,143 @@ private struct MoreDestinationRow: View {
 }
 
 // MARK: - Chess
+
+private struct TabletChessWorkspaceView: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    let openSettings: () -> Void
+
+    @State private var reviewCard: ChessReviewCard?
+
+    var body: some View {
+        List {
+            WorkspaceStatusBanner(openSettings: openSettings, errorArea: .chess)
+
+            if store.hasWorkspaceAccess {
+                Section("Study progress") {
+                    LabeledContent("Reviews due", value: store.chess.summary.reviewsDue.formatted())
+                    LabeledContent(
+                        "Steps covered",
+                        value: "\(store.chess.summary.stepsCovered) of \(store.chess.summary.totalSteps)"
+                    )
+                    if let accuracy = store.chess.summary.recentReviewAccuracy {
+                        LabeledContent(
+                            "Recent accuracy",
+                            value: accuracy.formatted(.percent.precision(.fractionLength(0)))
+                        )
+                    }
+                    if let next = store.chess.summary.nextDueAt,
+                       store.chess.summary.reviewsDue == 0 {
+                        LabeledContent("Next review", value: displayTimestamp(next))
+                    }
+                }
+
+                Section {
+                    if let first = store.chess.reviewQueue.first {
+                        Button {
+                            reviewCard = first
+                        } label: {
+                            Label(
+                                store.chess.summary.reviewsDue == 1
+                                    ? "Start 1 review"
+                                    : "Start \(store.chess.summary.reviewsDue) reviews",
+                                systemImage: "play.fill"
+                            )
+                        }
+                        .disabled(!store.chess.capability.canWrite || store.isLoading(.chess))
+                    } else {
+                        EmptyRow(
+                            icon: "checkmark.seal.fill",
+                            title: "Reviews are clear",
+                            detail: store.chess.summary.nextDueAt.map {
+                                "The next card is due \(displayTimestamp($0))."
+                            } ?? "New lesson steps will appear here for review."
+                        )
+                    }
+                } header: {
+                    Text("Review")
+                } footer: {
+                    if !store.chess.reviewQueue.isEmpty {
+                        Text("Choose a move on the board, then explain why it works. Workspace grades and schedules each card on your Mac.")
+                    }
+                }
+
+                Section("Courses") {
+                    if store.chess.catalog.courses.isEmpty {
+                        EmptyRow(
+                            icon: "checkerboard.rectangle",
+                            title: store.isLoading(.chess) ? "Loading the chess catalog" : "No chess catalog loaded",
+                            detail: store.isPaired
+                                ? "Refresh after the paired Mac finishes loading Chess."
+                                : "Pair with your Mac to load Chess."
+                        )
+                    } else {
+                        ForEach(store.chess.catalog.courses) { course in
+                            let progress = courseProgress(course)
+                            NavigationLink {
+                                ChessCourseDetailView(course: course)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack(alignment: .firstTextBaseline) {
+                                        Text(course.title)
+                                            .font(.headline)
+                                            .foregroundStyle(.primary)
+                                        Spacer()
+                                        Text(course.level)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Text(course.description)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                    ProgressView(
+                                        value: progress.total == 0
+                                            ? 0
+                                            : Double(progress.covered) / Double(progress.total)
+                                    )
+                                    .tint(WorkspaceBrand.signal)
+                                    Text("\(progress.covered) of \(progress.total) trainer steps covered")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.vertical, 4)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Chess")
+        .scrollContentBackground(.hidden)
+        .background(WorkspaceBrand.canvas)
+        .task {
+            guard store.hasWorkspaceAccess else { return }
+            await store.load(.chess)
+        }
+        .refreshable {
+            guard store.hasWorkspaceAccess else { return }
+            await store.load(.chess, force: true)
+        }
+        .sheet(item: $reviewCard) { card in
+            ChessReviewSessionView(firstCard: card)
+        }
+    }
+
+    private func courseProgress(_ course: ChessCourse) -> (covered: Int, total: Int) {
+        let lessonIds = Set(course.lessonIds)
+        let totalIds = Set(
+            store.chess.catalog.lessons
+                .filter { $0.courseId == course.id && lessonIds.contains($0.id) }
+                .flatMap { lesson in lesson.segments.flatMap { $0.steps ?? [] } }
+                .map(\.id)
+        )
+        let coveredIds = Set(
+            store.chess.state.progress
+                .filter { $0.courseId == course.id && lessonIds.contains($0.lessonId) }
+                .flatMap(\.completedStepIds)
+        )
+        return (coveredIds.intersection(totalIds).count, totalIds.count)
+    }
+}
 
 private struct CurrentChessLessonRoute: Hashable {
     let courseId: String
@@ -4139,7 +4471,7 @@ struct ChessWorkspaceView: View {
     private var lessonEmptyDetail: String {
         store.loadedAreas.contains(.chess)
             ? "Open a lesson in Workspace on your Mac and it will be ready to continue here."
-            : "Sync with your Mac once to bring the current lesson to this iPhone."
+            : "Sync with your Mac once to bring the current lesson to this device."
     }
 
     private func lessonProgressLabel(_ lesson: ChessLesson) -> String {
@@ -5231,6 +5563,7 @@ private struct ChessBoardView: View {
             }
         }
         .aspectRatio(1, contentMode: .fit)
+        .frame(maxWidth: 560)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.35)))
     }
@@ -5360,12 +5693,17 @@ private struct MailWorkspaceView: View {
                 return left.id > right.id
             }
     }
+    private var needsMac: Bool {
+        !store.managesAppleHealth && !store.isOnline && !store.mailLoadedFromMac
+    }
 
     var body: some View {
         List {
             EditorErrorSection(area: .integrations)
 
-            if !store.integrations.gmail.connected {
+            if needsMac {
+                MacRequiredSection(detail: "Mail loads from Workspace on your Mac and message previews are not saved for offline use on this iPad.")
+            } else if !store.integrations.gmail.connected {
                 Section {
                     Label("Mail is unavailable", systemImage: "envelope.badge")
                         .font(.headline)
@@ -5446,12 +5784,14 @@ private struct MailWorkspaceView: View {
         .searchable(text: $search, prompt: "Search loaded mail")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    composeDraft = MailComposeDraft()
-                } label: {
-                    Label("Compose", systemImage: "square.and.pencil")
+                if !needsMac {
+                    Button {
+                        composeDraft = MailComposeDraft()
+                    } label: {
+                        Label("Compose", systemImage: "square.and.pencil")
+                    }
+                    .disabled(!store.integrations.gmail.connected || store.isLoading(.integrations))
                 }
-                .disabled(!store.integrations.gmail.connected || store.isLoading(.integrations))
             }
         }
         .task { await store.load(.integrations) }
@@ -5839,11 +6179,16 @@ private struct FinanceWorkspaceView: View {
             return $0.name < $1.name
         }
     }
+    private var needsMac: Bool {
+        !store.managesAppleHealth && !store.isOnline && !store.loadedAreas.contains(.finance)
+    }
 
     var body: some View {
         List {
             EditorErrorSection(area: .finance)
-            if store.finance.banks.isEmpty {
+            if needsMac {
+                MacRequiredSection(detail: "Balances and transactions load from Workspace on your Mac and are not saved for offline use on this iPad.")
+            } else if store.finance.banks.isEmpty {
                 ContentUnavailableView {
                     Label("No finance data", systemImage: "building.columns")
                 } description: {
@@ -5960,57 +6305,67 @@ private struct WritingWorkspaceView: View {
     @EnvironmentObject private var store: WorkspaceStore
     @State private var draft: WritingInput?
 
+    private var needsMac: Bool {
+        !store.managesAppleHealth && !store.isOnline && !store.loadedAreas.contains(.writing)
+    }
+
     var body: some View {
         List {
             EditorErrorSection(area: .writing)
-            if !store.writing.available {
-                ContentUnavailableView {
-                    Label("Site entries unavailable", systemImage: "folder.badge.questionmark")
-                } description: {
-                    Text("Review the personal site connection from Settings.")
-                } actions: {
-                    NavigationLink("Open Settings", value: MoreRoute.settings)
+            if needsMac {
+                MacRequiredSection(detail: "Site entries and Workspace drafts load from your Mac and are not saved for offline use on this iPad.")
+            } else {
+                if !store.writing.available {
+                    ContentUnavailableView {
+                        Label("Site entries unavailable", systemImage: "folder.badge.questionmark")
+                    } description: {
+                        Text("Review the personal site connection from Settings.")
+                    } actions: {
+                        NavigationLink("Open Settings", value: MoreRoute.settings)
+                    }
                 }
-            }
-            Section("Drafts") {
-                if store.writing.drafts.isEmpty {
-                    EmptyRow(icon: "square.and.pencil", title: "Something worth writing down", detail: "Start an idea here and continue it from either device.")
-                } else {
-                    ForEach(store.writing.drafts.sorted { $0.updatedAt > $1.updatedAt }) { value in
-                        Button { draft = value.input } label: {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(value.title.nilIfEmpty ?? "Untitled draft").font(.headline).foregroundStyle(.primary)
-                                Text([enumTitle(value.kind.rawValue), enumTitle(value.primaryThread.rawValue), displayTimestamp(value.updatedAt)].joined(separator: " · "))
-                                    .font(.caption).foregroundStyle(.secondary)
+                Section("Drafts") {
+                    if store.writing.drafts.isEmpty {
+                        EmptyRow(icon: "square.and.pencil", title: "Something worth writing down", detail: "Start an idea here and continue it from either device.")
+                    } else {
+                        ForEach(store.writing.drafts.sorted { $0.updatedAt > $1.updatedAt }) { value in
+                            Button { draft = value.input } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(value.title.nilIfEmpty ?? "Untitled draft").font(.headline).foregroundStyle(.primary)
+                                    Text([enumTitle(value.kind.rawValue), enumTitle(value.primaryThread.rawValue), displayTimestamp(value.updatedAt)].joined(separator: " · "))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
+                    Button { draft = .new() } label: { Label("New draft", systemImage: "plus") }
+                        .disabled(!store.writing.available)
                 }
-                Button { draft = .new() } label: { Label("New draft", systemImage: "plus") }
-                    .disabled(!store.writing.available)
-            }
-            if !store.writing.entries.isEmpty {
-                Section {
-                    ForEach(store.writing.entries.sorted { $0.order < $1.order }) { entry in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(entry.title).font(.headline)
-                            Text(entry.summary).font(.subheadline).foregroundStyle(.secondary).lineLimit(3)
-                            Text(entry.draft ? "Site draft" : "Published in repository").font(.caption).foregroundStyle(.secondary)
+                if !store.writing.entries.isEmpty {
+                    Section {
+                        ForEach(store.writing.entries.sorted { $0.order < $1.order }) { entry in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(entry.title).font(.headline)
+                                Text(entry.summary).font(.subheadline).foregroundStyle(.secondary).lineLimit(3)
+                                Text(entry.draft ? "Site draft" : "Published in repository").font(.caption).foregroundStyle(.secondary)
+                            }
                         }
+                    } header: {
+                        Text("On your site")
+                    } footer: {
+                        Text("Publishing and site export stay on the Mac so repository changes remain reviewable there.")
                     }
-                } header: {
-                    Text("On your site")
-                } footer: {
-                    Text("Publishing and site export stay on the Mac so repository changes remain reviewable there.")
                 }
             }
         }
         .navigationTitle("Writing")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button { draft = .new() } label: { Image(systemName: "square.and.pencil") }
-                    .disabled(!store.writing.available)
-                    .accessibilityLabel("New writing draft")
+                if !needsMac {
+                    Button { draft = .new() } label: { Image(systemName: "square.and.pencil") }
+                        .disabled(!store.writing.available)
+                        .accessibilityLabel("New writing draft")
+                }
             }
         }
         .task { await store.load(.writing) }
@@ -6112,7 +6467,7 @@ private struct SettingsWorkspaceView: View {
                 }
                 .disabled(store.busy)
                 if store.isPaired {
-                    Button("Unpair this iPhone", role: .destructive) { confirmUnpair = true }
+                    Button("Unpair this device", role: .destructive) { confirmUnpair = true }
                         .disabled(store.isLoading(.pairing))
                 }
             }
@@ -6122,15 +6477,21 @@ private struct SettingsWorkspaceView: View {
                     Task {
                         syncResult = nil
                         let workspaceSynced = await store.refreshAll()
-                        let healthSynced = await store.syncHealth()
-                        if workspaceSynced && healthSynced {
+                        let synced: Bool
+                        if store.managesAppleHealth {
+                            let healthSynced = await store.syncHealth()
+                            synced = workspaceSynced && healthSynced
+                        } else {
+                            synced = workspaceSynced
+                        }
+                        if synced {
                             syncResult = "Synced with your Mac just now."
                         } else if store.connectionNeedsAttention && !store.isOnline {
                             syncResult = "Sync could not complete. Review the connection message above."
                         } else if store.isOnline {
                             syncResult = "The Mac was reached, but part of the sync needs attention. Review the messages above."
                         } else {
-                            syncResult = "Your Mac was not available. Saved data remains ready on this iPhone."
+                            syncResult = "Your Mac was not available. Saved data remains ready on this device."
                         }
                     }
                 } label: {
@@ -6145,27 +6506,40 @@ private struct SettingsWorkspaceView: View {
             } header: {
                 Text("Sync")
             } footer: {
-                Text("Workspace is designed to stay useful between syncs. Open Workspace on your Mac and keep both devices on the same private Wi-Fi when you want to update this iPhone. The USB cable can keep the devices together, but app data currently travels over the local network.")
+                Text("Workspace is designed to stay useful between syncs. Open Workspace on your Mac and keep both devices on the same private Wi-Fi when you want to update this device. The USB cable can keep the devices together, but app data currently travels over the local network.")
             }
 
-            Section("Apple Health") {
-                Button { Task { await store.authorizeHealth() } } label: {
-                    Label("Review Health permissions", systemImage: "lock.shield")
+            if store.managesAppleHealth {
+                Section("Apple Health") {
+                    Button { Task { await store.authorizeHealth() } } label: {
+                        Label("Review Health permissions", systemImage: "lock.shield")
+                    }
+                    .disabled(store.isLoading(.health))
+                    Button { showingHealthImport = true } label: {
+                        Label("Import older sleep history", systemImage: "clock.arrow.circlepath")
+                    }
+                    .disabled(!store.isPaired || store.isLoading(.health) || store.importingHistory)
+                    LabeledContent("Recent sleep") {
+                        Text(store.sleepStatus).multilineTextAlignment(.trailing).foregroundStyle(.secondary)
+                    }
+                    if let last = store.healthView?.lastSynced {
+                        LabeledContent("Mac snapshot", value: displayTimestamp(last))
+                    }
                 }
-                .disabled(store.isLoading(.health))
-                Button { showingHealthImport = true } label: {
-                    Label("Import older sleep history", systemImage: "clock.arrow.circlepath")
-                }
-                .disabled(!store.isPaired || store.isLoading(.health) || store.importingHistory)
-                LabeledContent("Recent sleep") {
-                    Text(store.sleepStatus).multilineTextAlignment(.trailing).foregroundStyle(.secondary)
-                }
-                if let last = store.healthView?.lastSynced {
-                    LabeledContent("Mac snapshot", value: displayTimestamp(last))
+            } else {
+                Section {
+                    LabeledContent("Apple Health sync", value: "iPhone")
+                    if let last = store.healthView?.lastSynced {
+                        LabeledContent("Mac snapshot", value: displayTimestamp(last))
+                    }
+                } header: {
+                    Text("Health")
+                } footer: {
+                    Text("This iPad reads the health summary saved on your Mac. Apple Health permissions, uploads, history imports, and new entries stay on your iPhone.")
                 }
             }
 
-            if !store.commands.isEmpty {
+            if store.managesAppleHealth && !store.commands.isEmpty {
                 Section {
                     ForEach(store.commands) { command in
                         Button { weightToReview = command } label: {
@@ -6218,7 +6592,7 @@ private struct SettingsWorkspaceView: View {
             }
 
             Section {
-                Text("Provider credentials remain on your Mac. This iPhone uses the private paired bridge and does not store Google or Todoist credentials.")
+                Text("Provider credentials remain on your Mac. This device uses the private paired bridge and does not store Google or Todoist credentials.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -6244,12 +6618,12 @@ private struct SettingsWorkspaceView: View {
             }
             Button("Keep link", role: .cancel) { linkToRemove = nil }
         } message: { Text("The external item remains unchanged.") }
-        .confirmationDialog("Unpair this iPhone?", isPresented: $confirmUnpair, titleVisibility: .visible) {
+        .confirmationDialog("Unpair this device?", isPresented: $confirmUnpair, titleVisibility: .visible) {
             Button("Unpair", role: .destructive) { Task { await store.unpair() } }
                 .disabled(store.isLoading(.pairing))
             Button("Stay paired", role: .cancel) { }
         } message: {
-            Text("This immediately removes the token and cached data from this iPhone, then asks your Mac to revoke the pairing. If the Mac cannot confirm, Workspace tells you how to invalidate the token there.")
+            Text("This immediately removes the token and cached data from this device, then asks your Mac to revoke the pairing. If the Mac cannot confirm, Workspace tells you how to invalidate the token there.")
         }
         .confirmationDialog(
             weightToReview.map { "Save \(weightLabel($0.kg)) to Apple Health?" } ?? "Save this measurement?",

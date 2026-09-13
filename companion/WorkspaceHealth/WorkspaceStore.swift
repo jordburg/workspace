@@ -12,7 +12,7 @@ struct RevisionConflict<Value: Equatable & Sendable>: Identifiable, Equatable, S
 private struct EmptyBridgeBody: Codable, Sendable {}
 private struct SavedBridgeResponse: Decodable, Sendable { let saved: Bool }
 private struct WeightCommandsResponse: Decodable, Sendable { let commands: [WeightCommand] }
-private let capturePersistenceError = "This iPhone could not protect the Capture draft. Keep this screen open and try again."
+private let capturePersistenceError = "This device could not protect the Capture draft. Keep this screen open and try again."
 
 enum CompanionConnectionState: Equatable, Sendable {
     case unpaired
@@ -378,6 +378,7 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var integrations: IntegrationView = .empty
     @Published private(set) var healthView: PhoneHealthView?
     @Published private(set) var healthSnapshot: HealthSnapshot?
+    @Published private(set) var mailLoadedFromMac = false
 
     @Published private(set) var connectionState: CompanionConnectionState = .unpaired
     @Published private(set) var lastSuccessfulContact: Date?
@@ -418,6 +419,7 @@ final class WorkspaceStore: ObservableObject {
     var isPaired: Bool { credentials != nil }
     var isOnline: Bool { connectionState == .online }
     var hasCachedContent: Bool { !loadedAreas.isEmpty }
+    var managesAppleHealth: Bool { health.supportsLocalHealthSync }
     var connectionNeedsAttention: Bool {
         if case .error = connectionState { return true }
         return false
@@ -477,17 +479,13 @@ final class WorkspaceStore: ObservableObject {
         if let suppliedCredentials {
             credentials = suppliedCredentials
             connectionState = loadedAreas.isEmpty ? .connecting : .offlineWithCache
-            status = suppliedCredentials.scope == .workspace
-                ? "Ready to load your workspace from the Mac."
-                : "Ready to sync Health with your Mac."
+            status = pairingReadyStatus(for: suppliedCredentials)
         } else {
             do {
                 credentials = try BridgeKeychain.load()
                 if let credentials {
                     connectionState = loadedAreas.isEmpty ? .connecting : .offlineWithCache
-                    status = credentials.scope == .workspace
-                        ? "Ready to load your workspace from the Mac."
-                        : "Ready to sync Health with your Mac."
+                    status = pairingReadyStatus(for: credentials)
                 }
             } catch {
                 credentials = nil
@@ -549,7 +547,7 @@ final class WorkspaceStore: ObservableObject {
     @discardableResult
     func submitCapture(_ text: String) async -> CaptureDisposition? {
         guard hasWorkspaceAccess else {
-            record(BridgeError.message("Pair this iPhone with Workspace before saving a Capture."), area: .workspace)
+            record(BridgeError.message("Pair this device with Workspace before saving a Capture."), area: .workspace)
             return nil
         }
         prepareCaptureIdentity()
@@ -667,8 +665,12 @@ final class WorkspaceStore: ObservableObject {
                 throw BridgeError.message("Choose the small pairing JSON file from your Mac.")
             }
             let pairing = try bridgeDecoder().decode(PairingFile.self, from: data)
+            guard managesAppleHealth || pairing.scope == .workspace else {
+                throw BridgeError.message("Use a Workspace pairing file on this iPad. Health-only pairing is reserved for the iPhone that reads and writes Apple Health.")
+            }
             let paired = try await BridgeClient.pair(pairing)
             guard expectedEpoch == pairingEpoch else {
+                try? await BridgeClient(paired).revokePairing()
                 BridgeKeychain.remove()
                 return
             }
@@ -737,7 +739,7 @@ final class WorkspaceStore: ObservableObject {
         resetWorkspaceState()
         CompanionPersistence.removeSnapshot()
         connectionState = .unpaired
-        let revokingStatus = "This iPhone is unpaired locally. Asking the Mac to revoke its saved token…"
+        let revokingStatus = "This device is unpaired locally. Asking the Mac to revoke its saved token…"
         postUnpairStatus = revokingStatus
         status = revokingStatus
         defer {
@@ -753,14 +755,14 @@ final class WorkspaceStore: ObservableObject {
         }
         guard let savedClient else {
             if hadCredentials {
-                completionStatus = "This iPhone is unpaired locally. The Mac did not confirm revocation, so disable iPhone sync on the Mac to invalidate its saved token."
+                completionStatus = "This device is unpaired locally. The Mac did not confirm revocation, so disable companion sync on the Mac to invalidate its saved token."
             }
             return
         }
         do {
             try await savedClient.revokePairing()
         } catch {
-            completionStatus = "This iPhone is unpaired locally. The Mac did not confirm revocation, so disable iPhone sync on the Mac to invalidate its saved token."
+            completionStatus = "This device is unpaired locally. The Mac did not confirm revocation, so disable companion sync on the Mac to invalidate its saved token."
         }
     }
 
@@ -808,10 +810,19 @@ final class WorkspaceStore: ObservableObject {
         guard hasWorkspaceAccess else { return false }
         let areasLoaded = await loadWorkspaceAreas(force: true)
         let providersRefreshed = await refreshIntegrationsIfNeeded()
+        var financeRefreshed = true
+        var gmailRefreshed = true
+        if !managesAppleHealth {
+            financeRefreshed = await syncFinance()
+            gmailRefreshed = await refreshGmail()
+        }
         await flushCaptureOutbox(forceAttempt: true)
         return areasLoaded
             && providersRefreshed
+            && financeRefreshed
+            && gmailRefreshed
             && integrationProviderError == nil
+            && (managesAppleHealth || integrations.gmail.error == nil)
             && captureOutbox.isEmpty
     }
 
@@ -843,6 +854,7 @@ final class WorkspaceStore: ObservableObject {
                 writing = try await client.get("v1/writing")
             case .integrations:
                 integrations = try await client.get("v1/integrations")
+                if !managesAppleHealth { mailLoadedFromMac = true }
             case .health:
                 try await requireWorkspace(using: client)
                 let view: PhoneHealthView = try await client.get("v1/health-view")
@@ -870,6 +882,7 @@ final class WorkspaceStore: ObservableObject {
         do {
             let request = IntegrationSyncRequest(date: date)
             integrations = try await client.send("v1/integrations/sync", input: request)
+            if !managesAppleHealth { mailLoadedFromMac = true }
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
             markConnectionSucceeded()
@@ -891,6 +904,27 @@ final class WorkspaceStore: ObservableObject {
         guard connectionState == .online else { return rangeCoversDate }
         guard !rangeCoversDate || !connectedProvidersAreFresh else { return true }
         return await refreshIntegrations(on: date)
+    }
+
+    @discardableResult
+    private func refreshGmail() async -> Bool {
+        guard begin(.integrations) else { return false }
+        defer { finish(.integrations) }
+        guard let client = workspaceClient(area: .integrations) else { return false }
+        do {
+            integrations = try await client.send("v1/integrations/gmail/sync", input: EmptyBridgeBody())
+            mailLoadedFromMac = true
+            loadedAreas.insert(.integrations)
+            clearRecordedError(.integrations)
+            markConnectionSucceeded()
+            cacheCurrent(.integrations)
+            status = integrations.gmail.error == nil ? "Mail refreshed." : "Mail refresh finished with a provider issue."
+            return integrations.gmail.error == nil
+        } catch {
+            recordAutomaticSyncFailure(error, area: .integrations)
+            markConnectionFailureIfNeeded(error)
+            return false
+        }
     }
 
     @discardableResult
@@ -1531,10 +1565,12 @@ final class WorkspaceStore: ObservableObject {
             writing = try await client.send("v1/writing/save", input: input)
             loadedAreas.insert(.writing)
             clearRecordedError(.writing)
+            markConnectionSucceeded()
             status = "Writing draft saved."
             return true
         } catch {
             record(error, area: .writing)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -1553,10 +1589,12 @@ final class WorkspaceStore: ObservableObject {
             finance = try await client.send("v1/finance/sync", input: EmptyBridgeBody())
             loadedAreas.insert(.finance)
             clearRecordedError(.finance)
+            markConnectionSucceeded()
             status = "Finances refreshed."
             return true
         } catch {
             record(error, area: .finance)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -1570,10 +1608,12 @@ final class WorkspaceStore: ObservableObject {
             finance = try await client.send("v1/finance/annotate", input: input)
             loadedAreas.insert(.finance)
             clearRecordedError(.finance)
+            markConnectionSucceeded()
             status = "Transaction notes saved."
             return true
         } catch {
             record(error, area: .finance)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -1594,6 +1634,7 @@ final class WorkspaceStore: ObservableObject {
                 request.encodesNilDate = true
             }
             integrations = try await client.send("v1/integrations/mutate", input: request)
+            if !managesAppleHealth { mailLoadedFromMac = true }
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
             markConnectionSucceeded()
@@ -1614,6 +1655,7 @@ final class WorkspaceStore: ObservableObject {
         guard let client = workspaceClient(area: .integrations) else { return false }
         do {
             integrations = try await client.send("v1/integrations/gmail/mutate", input: mutation)
+            mailLoadedFromMac = true
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
             markConnectionSucceeded()
@@ -1641,6 +1683,7 @@ final class WorkspaceStore: ObservableObject {
         guard let client = workspaceClient(area: .integrations) else { return false }
         do {
             integrations = try await client.send("v1/integrations/gmail/send", input: message)
+            mailLoadedFromMac = true
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
             markConnectionSucceeded()
@@ -1661,6 +1704,7 @@ final class WorkspaceStore: ObservableObject {
         guard let client = workspaceClient(area: .integrations) else { return false }
         do {
             integrations = try await client.send("v1/integrations/unlink", input: IntegrationUnlinkRequest(id: id))
+            if !managesAppleHealth { mailLoadedFromMac = true }
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
             markConnectionSucceeded()
@@ -1675,6 +1719,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func authorizeHealth() async {
+        guard requireAppleHealthOwner() else { return }
         guard begin(.health) else { return }
         defer { finish(.health) }
         do {
@@ -1689,6 +1734,7 @@ final class WorkspaceStore: ObservableObject {
 
     @discardableResult
     func syncHealth() async -> Bool {
+        guard requireAppleHealthOwner() else { return false }
         guard begin(.health) else { return false }
         defer { finish(.health) }
         do {
@@ -1756,6 +1802,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func importHealthHistory(from requested: Date) async {
+        guard requireAppleHealthOwner() else { return }
         guard begin(.health) else { return }
         importingHistory = true
         cancelHistoryRequested = false
@@ -1792,6 +1839,7 @@ final class WorkspaceStore: ObservableObject {
     func cancelHealthHistory() { cancelHistoryRequested = true }
 
     func confirmWeight(_ command: WeightCommand) async {
+        guard requireAppleHealthOwner() else { return }
         guard begin(.health) else { return }
         defer { finish(.health) }
         guard var credentials, let client = makeClient() else { return }
@@ -1826,6 +1874,24 @@ final class WorkspaceStore: ObservableObject {
         busyAreas.insert(area)
         areaErrors.removeValue(forKey: area)
         return true
+    }
+
+    private func requireAppleHealthOwner() -> Bool {
+        guard managesAppleHealth else {
+            commands = []
+            status = HealthStore.unavailableMessage
+            return false
+        }
+        return true
+    }
+
+    private func pairingReadyStatus(for credentials: BridgeCredentials) -> String {
+        if credentials.scope == .workspace {
+            return "Ready to load your workspace from the Mac."
+        }
+        return managesAppleHealth
+            ? "Ready to sync Health with your Mac."
+            : "This iPad needs a Workspace pairing file. Apple Health sync stays on your iPhone."
     }
 
     private func finish(_ area: WorkspaceArea) {
@@ -1949,7 +2015,7 @@ final class WorkspaceStore: ObservableObject {
 
     private func makeClient() -> BridgeClient? {
         guard let credentials else {
-            record(BridgeError.message("Pair this iPhone with your Mac first."), area: .pairing)
+            record(BridgeError.message("Pair this device with your Mac first."), area: .pairing)
             return nil
         }
         do {
@@ -1979,8 +2045,20 @@ final class WorkspaceStore: ObservableObject {
 
     private func negotiateCapabilities(using client: BridgeClient) async throws {
         let value = try await client.negotiateCapabilities()
-        guard value.health else {
-            throw BridgeError.message("This Mac does not support the Health bridge expected by this app.")
+        if managesAppleHealth {
+            guard value.health else {
+                throw BridgeError.message("Pair this iPhone again so it can manage Apple Health sync.")
+            }
+        } else {
+            guard value.workspace else {
+                throw BridgeError.message("Pair this iPad again with a Workspace pairing file.")
+            }
+        }
+        if let deviceClass = value.deviceClass {
+            let expected: BridgeDeviceClass = managesAppleHealth ? .phone : .tablet
+            guard deviceClass == expected else {
+                throw BridgeError.message("Pair this device again so the Mac can grant the correct companion access.")
+            }
         }
         capabilities = value
         if var credentials, credentials.scope != value.scope {
@@ -1995,7 +2073,7 @@ final class WorkspaceStore: ObservableObject {
     private func requireWorkspace(using client: BridgeClient) async throws {
         if capabilities == nil { try await negotiateCapabilities(using: client) }
         guard capabilities?.workspace == true else {
-            throw BridgeError.message("This phone is paired for Health only. Pair again with a Workspace pairing file.")
+            throw BridgeError.message("This device is paired for Health only. Pair again with a Workspace pairing file.")
         }
     }
 
@@ -2048,7 +2126,9 @@ final class WorkspaceStore: ObservableObject {
     @discardableResult
     private func loadWorkspaceAreas(force: Bool = false) async -> Bool {
         var loadedEveryArea = true
-        for area in [WorkspaceArea.workspace, .climbing, .chess, .integrations, .health] {
+        var areas = [WorkspaceArea.workspace, .climbing, .chess, .integrations, .health]
+        if !managesAppleHealth { areas.append(.writing) }
+        for area in areas {
             if !(await load(area, force: force)) {
                 loadedEveryArea = false
             }
@@ -2057,6 +2137,11 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func acceptHealthView(_ view: PhoneHealthView) throws {
+        guard managesAppleHealth else {
+            healthView = view
+            commands = []
+            return
+        }
         var review: [WeightCommand] = []
         for command in view.commands {
             if let receipt = credentials?.receipts[command.id] {
@@ -2082,6 +2167,7 @@ final class WorkspaceStore: ObservableObject {
         integrations = .empty
         healthView = nil
         healthSnapshot = nil
+        mailLoadedFromMac = false
         snapshotCache = CompanionSnapshotCache()
         lastSuccessfulContact = nil
         CompanionPersistence.removeSnapshot()

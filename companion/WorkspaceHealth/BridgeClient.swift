@@ -1,16 +1,23 @@
 import Foundation
 import Security
 import CryptoKit
+import UIKit
 
 enum BridgeScope: String, Codable, Hashable, Sendable {
     case health
     case workspace
 }
 
+enum BridgeDeviceClass: String, Codable, Hashable, Sendable {
+    case phone
+    case tablet
+}
+
 struct PairingFile: Decodable, Sendable {
     let version: Int
     let type: String
     let scope: BridgeScope?
+    let deviceClass: BridgeDeviceClass?
     let url: URL
     let fingerprint: String
     let code: String
@@ -52,6 +59,7 @@ struct BridgeCredentials: Codable, Hashable, Sendable {
 struct BridgeCapabilities: Codable, Hashable, Sendable {
     let version: Int
     let scope: BridgeScope
+    let deviceClass: BridgeDeviceClass?
     let workspace: Bool
     let health: Bool
 }
@@ -138,7 +146,7 @@ enum BridgeKeychain {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess, let data = result as? Data else {
-            throw BridgeError.message("Unlock your iPhone to access its pairing.")
+            throw BridgeError.message("Unlock your device to access its pairing.")
         }
         return try bridgeDecoder().decode(BridgeCredentials.self, from: data)
     }
@@ -389,7 +397,7 @@ final class BridgeClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, 
         guard let byteCount = values.fileSize,
               byteCount > 0,
               byteCount <= Self.maximumMediaBytes else {
-            throw BridgeError.message("This attachment is larger than the 200 MB iPhone limit.")
+            throw BridgeError.message("This attachment is larger than the 200 MB device limit.")
         }
         let filteredExtension = fileExtension?.lowercased().filter {
             $0.isASCII && ($0.isLetter || $0.isNumber)
@@ -454,29 +462,62 @@ final class BridgeClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, 
         }
 
         let requestedScope: BridgeScope = workspace ? .workspace : .health
+        let deviceClass: BridgeDeviceClass = await MainActor.run {
+            UIDevice.current.userInterfaceIdiom == .pad ? .tablet : .phone
+        }
+        if workspace, file.deviceClass != deviceClass {
+            throw BridgeError.message("Download the pairing file made for this device from Workspace on your Mac.")
+        }
+        if legacyHealth, deviceClass != .phone {
+            throw BridgeError.message("Health-only pairing is reserved for the iPhone that reads and writes Apple Health.")
+        }
+        let existing = try BridgeKeychain.load()
+        let replacesToken = existing.flatMap { credentials in
+            credentials.url == file.url && credentials.fingerprint == file.fingerprint
+                ? credentials.token
+                : nil
+        }
         let temporary = BridgeCredentials(
             url: file.url,
             fingerprint: file.fingerprint,
             token: file.code,
             scope: requestedScope
         )
-        struct Response: Decodable { let token: String; let scope: BridgeScope? }
+        struct Request: Encodable {
+            let deviceClass: BridgeDeviceClass
+            let replacesToken: String?
+        }
+        struct Response: Decodable {
+            let token: String
+            let scope: BridgeScope?
+            let deviceClass: BridgeDeviceClass?
+        }
         let response: Response = try await BridgeClient(temporary).call(
             "pair",
             method: .post,
-            body: Data("{}".utf8)
+            body: bridgeEncoder().encode(Request(deviceClass: deviceClass, replacesToken: replacesToken))
         )
         let grantedScope = response.scope ?? requestedScope
-        guard requestedScope != .workspace || grantedScope == .workspace else {
-            throw BridgeError.message("The Mac did not grant Workspace access. Create a new Workspace pairing file and try again.")
-        }
         let credentials = BridgeCredentials(
             url: file.url,
             fingerprint: file.fingerprint,
             token: response.token,
             scope: grantedScope
         )
-        try BridgeKeychain.save(credentials)
+        guard requestedScope != .workspace || grantedScope == .workspace else {
+            try? await BridgeClient(credentials).revokePairing()
+            throw BridgeError.message("The Mac did not grant Workspace access. Create a new Workspace pairing file and try again.")
+        }
+        guard response.deviceClass == nil || response.deviceClass == deviceClass else {
+            try? await BridgeClient(credentials).revokePairing()
+            throw BridgeError.message("The Mac did not grant the expected companion access. Create a new pairing file and try again.")
+        }
+        do {
+            try BridgeKeychain.save(credentials)
+        } catch {
+            try? await BridgeClient(credentials).revokePairing()
+            throw error
+        }
         return credentials
     }
 }

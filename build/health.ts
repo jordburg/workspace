@@ -1,7 +1,7 @@
 import { readFile, mkdir, chmod, rename, stat, unlink } from "node:fs/promises";
 import { homedir, networkInterfaces } from "node:os";
 import { join } from "node:path";
-import { createHash, randomBytes, randomUUID, timingSafeEqual, X509Certificate } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual, X509Certificate } from "node:crypto";
 import { createServer, type Server } from "node:https";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -15,18 +15,48 @@ import { withPrivateLock, writePrivateJson, StoreBusyError } from "./private-sto
 import { buildNights, emptySleep, mergeSleepBatch, sleepBatchSchema, sleepNightDetail, sleepNightQuerySchema, sleepNoteInputSchema, sleepSettingsSchema, sleepSources, sleepSummaryQuerySchema, sleepUserStateSchema, summarizeSleepArchive, type SleepArchive, type SleepNight, type SleepUserState } from "../lib/sleep.ts";
 
 type PhoneScope="health"|"workspace";
-type State={version:1;enabled:boolean;address?:string;tokenHash?:string;tokenScope?:PhoneScope;pairing?:{hash:string;expires:number;scope?:PhoneScope};snapshot:HealthSnapshot|null;lastSynced:string|null;commands:WeightCommand[]};
+type DeviceClass="phone"|"tablet";
+type PhoneToken={hash:string;scope:PhoneScope;deviceClass:DeviceClass};
+type PairingClaim={deviceClass:DeviceClass;replacesHash?:string;tokenHash:string};
+type State={version:1;enabled:boolean;address?:string;tokens:PhoneToken[];tokenHash?:string;tokenScope?:PhoneScope;pairing?:{hash:string;expires:number;scope?:PhoneScope;deviceClass?:DeviceClass;claimed?:PairingClaim};snapshot:HealthSnapshot|null;lastSynced:string|null;commands:WeightCommand[]};
 type WorkspaceResponse={status:number;data:unknown};
 type WorkspaceRequest=(path:string,method:"GET"|"POST"|"PUT",body?:unknown)=>Promise<WorkspaceResponse>;
 type WorkspaceRawRequest=(path:string,method:"GET"|"HEAD"|"POST",headers:Record<string,string>,body?:IncomingMessage)=>Promise<Response>;
 type HealthServiceOptions={addresses?:()=>string[];port?:number;workspaceRequest?:WorkspaceRequest;workspaceRawRequest?:WorkspaceRawRequest;onPhoneWorkspaceMutationAuthorized?:(path:string)=>void};
 export class HealthError extends Error {readonly status:number;constructor(message:string,status=400){super(message);this.status=status;}}
+const MAX_DEVICE_TOKENS=8;
 const hash=(value:string)=>createHash("sha256").update(value).digest("hex");
-const matches=(value:string,expected?:string)=>!!expected&&expected.length===64&&timingSafeEqual(Buffer.from(hash(value),"hex"),Buffer.from(expected,"hex"));
+const matches=(value:string,expected?:string)=>!!expected&&/^[a-f0-9]{64}$/i.test(expected)&&timingSafeEqual(Buffer.from(hash(value),"hex"),Buffer.from(expected,"hex"));
+const tokenFor=(state:State,credential:string)=>state.tokens.find(token=>matches(credential,token.hash));
+function normalizeTokens(state:State):State {
+  if(Object.hasOwn(state,"tokens")&&!Array.isArray(state.tokens))throw new Error("Invalid device tokens");
+  if(!Array.isArray(state.tokens))state.tokens=[];
+  const tokens:PhoneToken[]=[];
+  for(const token of state.tokens){
+    if(!token||typeof token!=="object"||typeof token.hash!=="string"||!/^[a-f0-9]{64}$/i.test(token.hash)||(token.scope!=="health"&&token.scope!=="workspace")||(token.deviceClass!==undefined&&token.deviceClass!=="phone"&&token.deviceClass!=="tablet"))throw new Error("Invalid device token");
+    if(!tokens.some(saved=>saved.hash.toLowerCase()===token.hash.toLowerCase()))tokens.push({hash:token.hash,scope:token.scope,deviceClass:token.deviceClass??"phone"});
+  }
+  if(state.tokenHash){if(!/^[a-f0-9]{64}$/i.test(state.tokenHash)||(state.tokenScope!==undefined&&state.tokenScope!=="health"&&state.tokenScope!=="workspace"))throw new Error("Invalid legacy device token");if(!tokens.some(token=>token.hash.toLowerCase()===state.tokenHash?.toLowerCase()))tokens.push({hash:state.tokenHash,scope:state.tokenScope??"health",deviceClass:"phone"});}
+  if(tokens.length>MAX_DEVICE_TOKENS)throw new Error("Too many device tokens");
+  if(tokens.filter(token=>token.deviceClass==="phone").length>1)throw new Error("Multiple Apple Health owners");
+  state.tokens=tokens;delete state.tokenHash;delete state.tokenScope;return state;
+}
+function normalizePairing(state:State):State {
+  if(!state.pairing)return state;
+  const pairing=state.pairing;
+  if(typeof pairing.hash!=="string"||!/^[a-f0-9]{64}$/i.test(pairing.hash)||!Number.isFinite(pairing.expires)||(pairing.scope!==undefined&&pairing.scope!=="health"&&pairing.scope!=="workspace")||(pairing.deviceClass!==undefined&&pairing.deviceClass!=="phone"&&pairing.deviceClass!=="tablet"))throw new Error("Invalid pairing state");
+  pairing.scope??="health";
+  if(pairing.claimed){
+    const claim=pairing.claimed;
+    if((claim.deviceClass!=="phone"&&claim.deviceClass!=="tablet")||!/^[a-f0-9]{64}$/i.test(claim.tokenHash)||(claim.replacesHash!==undefined&&!/^[a-f0-9]{64}$/i.test(claim.replacesHash)))throw new Error("Invalid pairing claim");
+  }
+  return state;
+}
 const header=(req:IncomingMessage,name:string)=>{const value=req.headers[name];return Array.isArray(value)?value[0]??"":value??"";};
 export const lanAddresses=()=>Object.values(networkInterfaces()).flatMap(entries=>entries||[]).filter(a=>a.family==="IPv4"&&!a.internal&&/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a.address)).map(a=>a.address).filter((a,i,all)=>all.indexOf(a)===i);
 const errorMessage=(e:unknown)=>e instanceof HealthError||e instanceof StoreBusyError?e.message:"Health sync could not finish. The last saved snapshot has been kept.";
-const phoneWorkspaceRoutes:Record<string,{path:string;method:"GET"|"POST"|"PUT";max?:number}>={
+type PhoneWorkspaceRoute={path:string;method:"GET"|"POST"|"PUT";max?:number;tabletOnly?:boolean};
+const phoneWorkspaceRoutes:Record<string,PhoneWorkspaceRoute>={
   "GET /v1/workspace":{path:"/api/workspace",method:"GET"},
   "POST /v1/workspace":{path:"/api/workspace",method:"PUT",max:2_000_000},
   "POST /v1/workspace/command":{path:"/api/workspace",method:"POST",max:128_000},
@@ -38,17 +68,31 @@ const phoneWorkspaceRoutes:Record<string,{path:string;method:"GET"|"POST"|"PUT";
   "GET /v1/chess":{path:"/api/chess",method:"GET"},
   "POST /v1/chess/progress":{path:"/api/chess/progress",method:"POST",max:128_000},
   "POST /v1/chess/session":{path:"/api/chess/session",method:"POST",max:128_000},
+  "POST /v1/chess/review":{path:"/api/chess/review",method:"POST",max:128_000,tabletOnly:true},
+  "GET /v1/finance":{path:"/api/finance",method:"GET",tabletOnly:true},
+  "POST /v1/finance/sync":{path:"/api/finance/sync",method:"POST",max:64_000,tabletOnly:true},
+  "POST /v1/finance/annotate":{path:"/api/finance/annotate",method:"POST",max:64_000,tabletOnly:true},
+  "GET /v1/writing":{path:"/api/writing",method:"GET",tabletOnly:true},
+  "POST /v1/writing/save":{path:"/api/writing/save",method:"POST",max:500_000,tabletOnly:true},
   "GET /v1/integrations":{path:"/api/integrations",method:"GET"},
   "POST /v1/integrations/sync":{path:"/api/integrations/sync",method:"POST",max:64_000},
   "POST /v1/integrations/mutate":{path:"/api/integrations/mutate",method:"POST",max:64_000},
   "POST /v1/integrations/unlink":{path:"/api/integrations/unlink",method:"POST",max:64_000},
+  "POST /v1/integrations/gmail/sync":{path:"/api/integrations/gmail/sync",method:"POST",max:64_000,tabletOnly:true},
+  "POST /v1/integrations/gmail/mutate":{path:"/api/integrations/gmail/mutate",method:"POST",max:64_000,tabletOnly:true},
+  "POST /v1/integrations/gmail/send":{path:"/api/integrations/gmail/send",method:"POST",max:256_000,tabletOnly:true},
   "GET /v1/health-view":{path:"/api/health",method:"GET"},
 };
 
-function sanitizePhoneIntegrationResponse(value:unknown):unknown {
+function sanitizePhoneIntegrationResponse(value:unknown,deviceClass:DeviceClass):unknown {
   if(!value||typeof value!=="object"||Array.isArray(value))return value;
-  const source=value as Record<string,unknown>,allowed=["todoist","google","tasks","events","links","range","error","code"];
+  const source=value as Record<string,unknown>,allowed=["todoist","google","tasks","events","links","range","error","code",...(deviceClass==="tablet"?["gmail","messages"]:[])];
   return Object.fromEntries(allowed.flatMap(key=>Object.hasOwn(source,key)?[[key,source[key]]]:[]));
+}
+
+function sanitizeWritingResponse(value:unknown):unknown {
+  if(!value||typeof value!=="object"||Array.isArray(value)||!Object.hasOwn(value,"repository"))return value;
+  return {...value as Record<string,unknown>,repository:""};
 }
 
 export function createHealthService(directory:string,options:HealthServiceOptions={}){
@@ -59,8 +103,9 @@ export function createHealthService(directory:string,options:HealthServiceOption
   let sleepNightsCache:{revision:string;values:Map<string,SleepNight[]>}|undefined;
   const addresses=options.addresses||lanAddresses;
   const exclusive=<T>(fn:()=>Promise<T>)=>{const next=queue.catch(()=>{}).then(()=>withPrivateLock(file,fn));queue=next;return next;};
-  async function read():Promise<State>{try{const state=JSON.parse(await readFile(file,"utf8"));if(state.version!==1||!Array.isArray(state.commands)||typeof state.enabled!=="boolean")throw new Error();if(state.tokenHash&&!state.tokenScope)state.tokenScope="health";if(state.pairing&&!state.pairing.scope)state.pairing.scope="health";return state;}catch(e){if((e as NodeJS.ErrnoException).code==="ENOENT")return {version:1,enabled:false,snapshot:null,lastSynced:null,commands:[]};throw new HealthError("Saved health data could not be read. It has been left untouched.",500);}}
+  async function read():Promise<State>{try{const state=JSON.parse(await readFile(file,"utf8")) as State;if(state.version!==1||!Array.isArray(state.commands)||typeof state.enabled!=="boolean")throw new Error();return normalizePairing(normalizeTokens(state));}catch(e){if((e as NodeJS.ErrnoException).code==="ENOENT")return {version:1,enabled:false,tokens:[],snapshot:null,lastSynced:null,commands:[]};throw new HealthError("Saved health data could not be read. It has been left untouched.",500);}}
   const write=(s:State)=>writePrivateJson(file,s);
+  const issuedPairToken=async(credential:string,scope:PhoneScope,deviceClass:DeviceClass,replacesHash?:string)=>createHmac("sha256",await readFile(privateKey)).update(JSON.stringify({version:1,credential,scope,deviceClass,replacesHash:replacesHash??null})).digest("base64url");
   const sleepUserState=(archive:SleepArchive):SleepUserState=>({version:1,settings:archive.settings,settingsRevision:archive.settingsRevision,notes:archive.notes});
   const invalidateSleep=()=>{sleepCache=undefined;sleepNightsCache=undefined;};
   async function fileStamp(path:string){try{const value=await stat(path,{bigint:true});return `${value.ino}:${value.size}:${value.mtimeNs}`;}catch(e){if((e as NodeJS.ErrnoException).code==="ENOENT")return "missing";throw e;}}
@@ -78,7 +123,7 @@ export function createHealthService(directory:string,options:HealthServiceOption
   async function readSleep(){return (await readSleepRecord()).archive;}
   async function writeSleepUser(user:SleepUserState){await writePrivateJson(sleepUserFile,user);invalidateSleep();}
   function nightsFor(record:{archive:SleepArchive;revision:string},sourceId:string){if(sleepNightsCache?.revision!==record.revision)sleepNightsCache={revision:record.revision,values:new Map()};let nights=sleepNightsCache.values.get(sourceId);if(!nights){nights=buildNights(record.archive.samples,sourceId,record.archive.timeZone,record.archive.ranges);sleepNightsCache.values.set(sourceId,nights);}return nights;}
-  function view(s:State):HealthView{return {enabled:s.enabled,online:!!server?.listening,paired:!!s.tokenHash,phoneScope:s.tokenHash?s.tokenScope??"health":null,endpoint,addresses:addresses(),error:runtimeError,lastSynced:s.lastSynced,snapshot:s.snapshot,commands:s.commands};}
+  function view(s:State):HealthView{const phones=s.tokens.filter(token=>token.deviceClass==="phone"),phoneScope=phones.some(token=>token.scope==="workspace")?"workspace":phones.length?"health":null;return {enabled:s.enabled,online:!!server?.listening,paired:s.tokens.length>0,pairedDeviceCount:s.tokens.length,healthOwnerPaired:phones.length>0,phoneScope,endpoint,addresses:addresses(),error:runtimeError,lastSynced:s.lastSynced,snapshot:s.snapshot,commands:s.commands};}
   async function generateCertificate(address:string){
     await mkdir(directory,{recursive:true,mode:0o700});const suffix=randomUUID();const key=`${privateKey}.${suffix}.tmp`;const cert=`${certificate}.${suffix}.tmp`;
     try{await promisify(execFile)("openssl",["req","-x509","-newkey","rsa:2048","-sha256","-nodes","-keyout",key,"-out",cert,"-days","365","-subj","/CN=Personal Workspace Health","-addext",`subjectAltName=IP:${address}`,"-addext","extendedKeyUsage=serverAuth","-addext","keyUsage=critical,digitalSignature,keyEncipherment"],{timeout:20000});await chmod(key,0o600);await chmod(cert,0o600);await rename(key,privateKey);await rename(cert,certificate);}catch{throw new HealthError("The private health certificate could not be created. OpenSSL is required on this Mac.",500);}finally{await unlink(key).catch(()=>{});await unlink(cert).catch(()=>{});}
@@ -90,23 +135,45 @@ export function createHealthService(directory:string,options:HealthServiceOption
   async function phone(req:IncomingMessage,res:ServerResponse){
     try{
       const path=req.url?.split("?")[0];if(req.headers.origin)throw new HealthError("Only the paired companion app can use this endpoint.",403);
-      const credential=req.headers.authorization?.replace(/^Bearer /,"")||"";if(credential.length>200)throw new HealthError("Pair this iPhone again.",401);
-      const initial=await read();if(!initial.enabled)throw new HealthError("iPhone sync is disabled.",403);
+      const credential=req.headers.authorization?.replace(/^Bearer /,"")||"";if(credential.length>200)throw new HealthError("Pair this companion device again.",401);
+      const initial=await read();if(!initial.enabled)throw new HealthError("Companion sync is disabled.",403);
       if(path==="/pair"&&req.method==="POST"){
-        const result=await exclusive(async()=>{const s=await read();if(!s.enabled||!s.pairing||s.pairing.expires<Date.now()||!matches(credential,s.pairing.hash))throw new HealthError("This pairing code expired or was already used. Create a new pairing file on your Mac.",401);const token=randomBytes(32).toString("base64url");s.tokenHash=hash(token);s.tokenScope=s.pairing.scope??"health";delete s.pairing;await write(s);return {token,scope:s.tokenScope};});send(res,200,result);return;
+        const pairRequest=z.object({deviceClass:z.enum(["phone","tablet"]).default("phone"),replacesToken:z.string().min(1).max(200).optional()}).strict().parse(await body(req,1_000));
+        const result=await exclusive(async()=>{
+          const s=await read();
+          if(!s.enabled||!s.pairing||s.pairing.expires<Date.now()||!matches(credential,s.pairing.hash))throw new HealthError("This pairing code expired or was already used. Create a new pairing file on your Mac.",401);
+          const scope=s.pairing.scope??"health";
+          const pairedDeviceClass=s.pairing.deviceClass??(scope==="health"?"phone":undefined);
+          if(!pairedDeviceClass)throw new HealthError("This older Workspace pairing file is not bound to a device. Create a new pairing file on your Mac.",409);
+          if(pairRequest.deviceClass!==pairedDeviceClass)throw new HealthError(`This pairing file is for a${pairedDeviceClass==="tablet"?"n iPad":"n iPhone"}. Create the matching pairing file on your Mac.`,403);
+          const replacesHash=pairRequest.replacesToken?hash(pairRequest.replacesToken):undefined;
+          const token=await issuedPairToken(credential,scope,pairedDeviceClass,replacesHash);
+          if(s.pairing.claimed){
+            const claim=s.pairing.claimed;
+            if(claim.deviceClass!==pairRequest.deviceClass||claim.replacesHash!==replacesHash||!matches(token,claim.tokenHash)||!s.tokens.some(saved=>matches(token,saved.hash)))throw new HealthError("This pairing file was already used by another companion request. Create a new pairing file on your Mac.",409);
+            return {token,scope,deviceClass:pairedDeviceClass};
+          }
+          const replacedIndex=pairRequest.replacesToken?s.tokens.findIndex(saved=>matches(pairRequest.replacesToken!,saved.hash)):-1;
+          if(replacedIndex>=0&&s.tokens[replacedIndex].deviceClass!==pairedDeviceClass)throw new HealthError("A companion credential can be rotated only by the same device class.",409);
+          if(pairedDeviceClass==="phone"&&s.tokens.some((saved,index)=>index!==replacedIndex&&saved.deviceClass==="phone"))throw new HealthError("Apple Health is already assigned to another paired iPhone. Re-pair that iPhone to rotate its credential, or disable companion sync before changing the Health owner.",409);
+          if(s.tokens.length-(replacedIndex>=0?1:0)>=MAX_DEVICE_TOKENS)throw new HealthError(`Workspace already has the maximum of ${MAX_DEVICE_TOKENS} paired devices. Unpair a device or disable companion sync before adding another.`,409);
+          if(replacedIndex>=0)s.tokens.splice(replacedIndex,1);
+          const tokenHash=hash(token);s.tokens.push({hash:tokenHash,scope,deviceClass:pairedDeviceClass});s.pairing.claimed={deviceClass:pairedDeviceClass,replacesHash,tokenHash};s.pairing.expires=Math.min(s.pairing.expires,Date.now()+120_000);await write(s);
+          return {token,scope,deviceClass:pairedDeviceClass};
+        });send(res,200,result);return;
       }
-      if(!matches(credential,initial.tokenHash))throw new HealthError("Pair this iPhone again.",401);
-      if(path==="/capabilities"&&req.method==="GET"){send(res,200,{version:2,scope:initial.tokenScope??"health",workspace:(initial.tokenScope??"health")==="workspace",health:true});return;}
-      if(path==="/commands"&&req.method==="GET"){send(res,200,{commands:initial.commands.filter(c=>c.status==="pending")});return;}
+      const authorizedToken=tokenFor(initial,credential);if(!authorizedToken)throw new HealthError("Pair this companion device again.",401);
+      if(path==="/capabilities"&&req.method==="GET"){send(res,200,{version:2,scope:authorizedToken.scope,deviceClass:authorizedToken.deviceClass,workspace:authorizedToken.scope==="workspace",health:authorizedToken.deviceClass==="phone"});return;}
+      if(path==="/commands"&&req.method==="GET"){if(authorizedToken.deviceClass!=="phone")throw new HealthError("Apple Health sync is assigned to a paired iPhone.",403);send(res,200,{commands:initial.commands.filter(c=>c.status==="pending")});return;}
       if(path==="/unpair"&&req.method==="POST"){
         z.object({}).strict().parse(await body(req,1_000));
-        const result=await exclusive(async()=>{const s=await read();if(!s.enabled||!matches(credential,s.tokenHash))throw new HealthError("Pair this iPhone again.",401);delete s.tokenHash;delete s.tokenScope;delete s.pairing;await write(s);return {revoked:true};});
+        const result=await exclusive(async()=>{const s=await read(),index=s.tokens.findIndex(token=>matches(credential,token.hash));if(!s.enabled||index<0)throw new HealthError("Pair this companion device again.",401);const removed=s.tokens[index];s.tokens.splice(index,1);if(s.pairing?.claimed?.tokenHash.toLowerCase()===removed.hash.toLowerCase())delete s.pairing;await write(s);return {revoked:true};});
         send(res,200,result);return;
       }
       const mediaRead=/^\/v1\/climbing\/media\/([0-9a-f-]+)$/i.exec(path??"");
       const mediaUpload=path==="/v1/climbing/media/upload"&&req.method==="POST";
       if(mediaUpload||(mediaRead&&(req.method==="GET"||req.method==="HEAD"))){
-        if((initial.tokenScope??"health")!=="workspace")throw new HealthError("This phone is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
+        if(authorizedToken.scope!=="workspace")throw new HealthError("This device is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
         if(!options.workspaceRawRequest)throw new HealthError("Workspace media is unavailable. Keep the desktop Workspace open and try again.",503);
         const forwardedHeaders:Record<string,string>={};
         if(mediaUpload){
@@ -120,9 +187,9 @@ export function createHealthService(directory:string,options:HealthServiceOption
           for(const name of ["content-type","content-length","x-workspace-request-id","x-workspace-reference-id","x-workspace-goal-id","x-workspace-file-name","x-workspace-label"]){
             const value=header(req,name);if(value)forwardedHeaders[name]=value;
           }
-          const current=await read();
-          if(!current.enabled||!matches(credential,current.tokenHash))throw new HealthError("Pair this iPhone again.",401);
-          if((current.tokenScope??"health")!=="workspace")throw new HealthError("This phone is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
+          const current=await read(),currentToken=tokenFor(current,credential);
+          if(!current.enabled||!currentToken)throw new HealthError("Pair this companion device again.",401);
+          if(currentToken.scope!=="workspace")throw new HealthError("This device is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
         }else{
           const range=header(req,"range");if(range)forwardedHeaders.range=range;
         }
@@ -145,30 +212,34 @@ export function createHealthService(directory:string,options:HealthServiceOption
       }
       const workspaceRoute=phoneWorkspaceRoutes[`${req.method} ${path}`];
       if(workspaceRoute){
-        if((initial.tokenScope??"health")!=="workspace")throw new HealthError("This phone is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
+        if(authorizedToken.scope!=="workspace")throw new HealthError("This device is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
+        if(workspaceRoute.tabletOnly&&authorizedToken.deviceClass!=="tablet")throw new HealthError("This feature is available to a paired iPad.",403);
         if(!options.workspaceRequest)throw new HealthError("Workspace data is unavailable. Keep the desktop Workspace open and try again.",503);
-        let input:unknown;
+        let input:unknown,targetPath=workspaceRoute.path;
         if(req.method==="POST"){
           options.onPhoneWorkspaceMutationAuthorized?.(path??"");
           input=await body(req,workspaceRoute.max??2_000_000);
-          const current=await read();
-          if(!current.enabled||!matches(credential,current.tokenHash))throw new HealthError("Pair this iPhone again.",401);
-          if((current.tokenScope??"health")!=="workspace")throw new HealthError("This phone is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
+          const current=await read(),currentToken=tokenFor(current,credential);
+          if(!current.enabled||!currentToken)throw new HealthError("Pair this companion device again.",401);
+          if(currentToken.scope!=="workspace")throw new HealthError("This device is paired for Health only. Download a new Workspace pairing file on your Mac and pair again.",403);
+          if(workspaceRoute.tabletOnly&&currentToken.deviceClass!=="tablet")throw new HealthError("This feature is available to a paired iPad.",403);
+          if(currentToken.deviceClass==="phone"&&path==="/v1/integrations/mutate")targetPath="/api/integrations/mutate/planning";
+          if(currentToken.deviceClass==="phone"&&path==="/v1/integrations/unlink")targetPath="/api/integrations/unlink/planning";
         }
-        let result:WorkspaceResponse;try{result=await options.workspaceRequest(workspaceRoute.path,workspaceRoute.method,input);}catch(e){if(e instanceof HealthError)throw e;throw new HealthError("The desktop Workspace could not complete this request. Its saved data has been kept.",503);}
-        const responseData=path?.startsWith("/v1/integrations")?sanitizePhoneIntegrationResponse(result.data):result.data;
+        let result:WorkspaceResponse;try{result=await options.workspaceRequest(targetPath,workspaceRoute.method,input);}catch(e){if(e instanceof HealthError)throw e;throw new HealthError("The desktop Workspace could not complete this request. Its saved data has been kept.",503);}
+        const responseData=path?.startsWith("/v1/integrations")?sanitizePhoneIntegrationResponse(result.data,authorizedToken.deviceClass):path?.startsWith("/v1/writing")?sanitizeWritingResponse(result.data):path==="/v1/health-view"&&authorizedToken.deviceClass==="tablet"&&result.data&&typeof result.data==="object"&&!Array.isArray(result.data)?{...result.data as Record<string,unknown>,commands:[]}:result.data;
         send(res,result.status,responseData);return;
       }
       if(req.method!=="POST")throw new HealthError("Unknown health endpoint.",404);
       const input=await body(req,path==="/sleep-batch"?20_000_000:2_000_000);
-      const result=await exclusive(async()=>{const s=await read();if(!s.enabled||!matches(credential,s.tokenHash))throw new HealthError("Pair this iPhone again.",401);
+      const result=await exclusive(async()=>{const s=await read(),currentToken=tokenFor(s,credential);if(!s.enabled||!currentToken)throw new HealthError("Pair this companion device again.",401);if(currentToken.deviceClass!=="phone")throw new HealthError("Apple Health sync is assigned to a paired iPhone.",403);
         if(path==="/snapshot"){
-          const snapshot=healthSnapshotSchema.parse(input);if(Date.parse(snapshot.generatedAt)>Date.now()+300000)throw new HealthError("Check the iPhone’s clock before syncing.");if(s.snapshot&&Date.parse(snapshot.generatedAt)<Date.parse(s.snapshot.generatedAt))throw new HealthError("A newer health snapshot is already saved.",409);
+          const snapshot=healthSnapshotSchema.parse(input);if(Date.parse(snapshot.generatedAt)>Date.now()+300000)throw new HealthError("Check this device’s clock before syncing.");if(s.snapshot&&Date.parse(snapshot.generatedAt)<Date.parse(s.snapshot.generatedAt))throw new HealthError("A newer health snapshot is already saved.",409);
           s.snapshot=snapshot;s.lastSynced=new Date().toISOString();await write(s);return {saved:true};
         }
         if(path==="/sleep-batch"){
           const batch=sleepBatchSchema.parse(input);
-          if(Date.parse(batch.generatedAt)>Date.now()+300000||Date.parse(batch.to)>Date.now()+86400000)throw new HealthError("Check the iPhone’s clock before syncing.");
+          if(Date.parse(batch.generatedAt)>Date.now()+300000||Date.parse(batch.to)>Date.now()+86400000)throw new HealthError("Check this device’s clock before syncing.");
           const record=await readSleepRecord();let merged:SleepArchive;
           try{merged=mergeSleepBatch(record.archive,batch);}catch(e){throw new HealthError((e as Error).message,409);}
           const userChanged=JSON.stringify(sleepUserState(record.archive))!==JSON.stringify(sleepUserState(merged));
@@ -187,7 +258,7 @@ export function createHealthService(directory:string,options:HealthServiceOption
     if(!addresses().includes(s.address))throw new HealthError("The Mac’s network address changed. Disable sync, then enable and pair again.");
     const cert=await readFile(certificate);const x509=new X509Certificate(cert);if(!x509.checkIP(s.address)||Date.parse(x509.validTo)<Date.now())throw new HealthError("The health certificate needs renewal. Disable sync, then enable and pair again.");
     const candidate=createServer({key:await readFile(privateKey),cert,minVersion:"TLSv1.2"},phone);candidate.requestTimeout=300000;candidate.headersTimeout=15000;candidate.maxRequestsPerSocket=50;
-    try{await new Promise<void>((resolve,reject)=>{candidate.once("error",reject);candidate.listen(options.port??5174,s.address,()=>{candidate.removeListener("error",reject);resolve();});});candidate.on("error",()=>{runtimeError="The iPhone connection stopped. Disable and enable sync to retry.";});server=candidate;const address=candidate.address();endpoint=`https://${s.address}:${typeof address==="object"&&address?address.port:5174}`;runtimeError=null;}catch{candidate.close();throw new HealthError("The health connection could not listen on this address. Check the Wi-Fi connection and whether port 5174 is already in use.",503);}
+    try{await new Promise<void>((resolve,reject)=>{candidate.once("error",reject);candidate.listen(options.port??5174,s.address,()=>{candidate.removeListener("error",reject);resolve();});});candidate.on("error",()=>{runtimeError="The companion connection stopped. Disable and enable sync to retry.";});server=candidate;const address=candidate.address();endpoint=`https://${s.address}:${typeof address==="object"&&address?address.port:5174}`;runtimeError=null;}catch{candidate.close();throw new HealthError("The health connection could not listen on this address. Check the Wi-Fi connection and whether port 5174 is already in use.",503);}
   }
   async function resume(){try{await exclusive(async()=>start(await read()));}catch(e){runtimeError=errorMessage(e);}}
   async function handle(req:IncomingMessage,res:ServerResponse,next?:()=>void){
@@ -222,15 +293,15 @@ export function createHealthService(directory:string,options:HealthServiceOption
         if(path==="/open-companion"){await promisify(execFile)("/usr/bin/open",[join(process.cwd(),"companion/WorkspaceHealth.xcodeproj")]);return {opened:true};}
         if(path==="/retry"){await start(s);return view(s);}
         if(path==="/enable"){
-          const {address}=z.object({address:z.string()}).strict().parse(input);if(!addresses().includes(address))throw new HealthError("Choose this Mac’s current Wi-Fi address.");if(s.enabled)throw new HealthError("Disable the existing iPhone connection before setting it up again.",409);
-          await generateCertificate(address);s.address=address;s.enabled=true;delete s.tokenHash;delete s.tokenScope;delete s.pairing;await start(s);await write(s);return view(s);
+          const {address}=z.object({address:z.string()}).strict().parse(input);if(!addresses().includes(address))throw new HealthError("Choose this Mac’s current Wi-Fi address.");if(s.enabled)throw new HealthError("Disable the existing companion connection before setting it up again.",409);
+          await generateCertificate(address);s.address=address;s.enabled=true;s.tokens=[];delete s.tokenHash;delete s.tokenScope;delete s.pairing;await start(s);await write(s);return view(s);
         }
-        if(path==="/disable"){s.enabled=false;delete s.tokenHash;delete s.tokenScope;delete s.pairing;await write(s);await stop();runtimeError=null;return view(s);}
+        if(path==="/disable"){s.enabled=false;s.tokens=[];delete s.tokenHash;delete s.tokenScope;delete s.pairing;await write(s);await stop();runtimeError=null;return view(s);}
         if(path==="/pairing"){
-          if(!s.enabled||!server?.listening||!endpoint)throw new HealthError("Enable the iPhone connection first.");const code=randomBytes(32).toString("base64url");s.pairing={hash:hash(code),expires:Date.now()+600000,scope:"workspace"};await write(s);const cert=new X509Certificate(await readFile(certificate));return {version:2,type:"personal-workspace-pairing",scope:"workspace",url:endpoint,fingerprint:hashBuffer(cert.raw),code,expiresAt:new Date(s.pairing.expires).toISOString()};
+          if(!s.enabled||!server?.listening||!endpoint)throw new HealthError("Enable the companion connection first.");const {deviceClass}=z.object({deviceClass:z.enum(["phone","tablet"])}).strict().parse(input);const code=randomBytes(32).toString("base64url");s.pairing={hash:hash(code),expires:Date.now()+600000,scope:"workspace",deviceClass};await write(s);const cert=new X509Certificate(await readFile(certificate));return {version:2,type:"personal-workspace-pairing",scope:"workspace",deviceClass,url:endpoint,fingerprint:hashBuffer(cert.raw),code,expiresAt:new Date(s.pairing.expires).toISOString()};
         }
         if(path==="/weight"){
-          const value=weightInputSchema.parse(input);if(!s.tokenHash)throw new HealthError("Pair your iPhone before sending a health entry.");if(Date.parse(value.measuredAt)>Date.now()+300000)throw new HealthError("A measurement cannot be in the future.");const payloadHash=hash(JSON.stringify({id:value.id,kg:value.kg,measuredAt:value.measuredAt}));const old=s.commands.find(c=>c.id===value.id);if(old){if(old.payloadHash!==payloadHash)throw new HealthError("This request ID already belongs to another health entry.",409);return view(s);}if(s.commands.filter(c=>c.status==="pending").length>=100)throw new HealthError("Review the pending entries on your iPhone first.");s.commands.push({...value,kind:"weight",payloadHash,status:"pending",createdAt:new Date().toISOString(),appliedAt:null});await write(s);return view(s);
+          const value=weightInputSchema.parse(input);if(!s.tokens.some(token=>token.deviceClass==="phone"))throw new HealthError("Pair an iPhone before sending a health entry.");if(Date.parse(value.measuredAt)>Date.now()+300000)throw new HealthError("A measurement cannot be in the future.");const payloadHash=hash(JSON.stringify({id:value.id,kg:value.kg,measuredAt:value.measuredAt}));const old=s.commands.find(c=>c.id===value.id);if(old){if(old.payloadHash!==payloadHash)throw new HealthError("This request ID already belongs to another health entry.",409);return view(s);}if(s.commands.filter(c=>c.status==="pending").length>=100)throw new HealthError("Review the pending entries on your iPhone first.");s.commands.push({...value,kind:"weight",payloadHash,status:"pending",createdAt:new Date().toISOString(),appliedAt:null});await write(s);return view(s);
         }
         throw new HealthError("Unknown health action.",404);
       });send(res,200,result);
@@ -242,11 +313,11 @@ const hashBuffer=(value:Buffer)=>createHash("sha256").update(value).digest("hex"
 const MAX_PHONE_WORKSPACE_RESPONSE_BYTES=10_000_000;
 async function cappedResponseText(response:Response,max=MAX_PHONE_WORKSPACE_RESPONSE_BYTES){
   const declared=Number(response.headers.get("content-length"));
-  if(Number.isFinite(declared)&&declared>max){await response.body?.cancel().catch(()=>{});throw new HealthError("This Workspace response is too large for the phone. Narrow the requested history on the Mac.",413);}
+  if(Number.isFinite(declared)&&declared>max){await response.body?.cancel().catch(()=>{});throw new HealthError("This Workspace response is too large for the companion device. Narrow the requested history on the Mac.",413);}
   if(!response.body)return "";
   const reader=response.body.getReader();const chunks:Buffer[]=[];let size=0;
   try{
-    while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>max){await reader.cancel().catch(()=>{});throw new HealthError("This Workspace response is too large for the phone. Narrow the requested history on the Mac.",413);}chunks.push(Buffer.from(value));}
+    while(true){const {done,value}=await reader.read();if(done)break;size+=value.byteLength;if(size>max){await reader.cancel().catch(()=>{});throw new HealthError("This Workspace response is too large for the companion device. Narrow the requested history on the Mac.",413);}chunks.push(Buffer.from(value));}
   }finally{reader.releaseLock();}
   return Buffer.concat(chunks,size).toString("utf8");
 }
