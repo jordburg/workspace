@@ -174,6 +174,8 @@ enum BridgeKeychain {
 }
 
 final class BridgeClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, @unchecked Sendable {
+    static let maximumMediaBytes = 200_000_000
+
     let credentials: BridgeCredentials
 
     init(_ credentials: BridgeCredentials) throws {
@@ -245,11 +247,7 @@ final class BridgeClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, 
         completionHandler(nil)
     }
 
-    func call<T: Decodable>(
-        _ path: String,
-        method: BridgeHTTPMethod? = nil,
-        body: Data? = nil
-    ) async throws -> T {
+    private func normalizedPath(_ path: String) throws -> String {
         let normalized = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !normalized.isEmpty,
               !normalized.contains(".."),
@@ -257,39 +255,75 @@ final class BridgeClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, 
               !normalized.contains("#") else {
             throw BridgeError.message("The app tried to use an invalid Workspace route.")
         }
+        return normalized
+    }
 
+    private func makeSession(resourceTimeout: TimeInterval = 12) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.waitsForConnectivity = true
+        configuration.waitsForConnectivity = false
         configuration.allowsCellularAccess = false
-        configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 45
+        configuration.timeoutIntervalForRequest = 8
+        configuration.timeoutIntervalForResource = resourceTimeout
         configuration.tlsMinimumSupportedProtocolVersion = .TLSv12
         configuration.httpCookieAcceptPolicy = .never
         configuration.urlCache = nil
-        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+    }
 
+    private func makeRequest(
+        path: String,
+        method: BridgeHTTPMethod,
+        contentType: String? = nil,
+        accept: String = "application/json"
+    ) throws -> URLRequest {
+        let normalized = try normalizedPath(path)
         var request = URLRequest(url: credentials.url.appendingPathComponent(normalized))
-        request.httpMethod = (method ?? (body == nil ? .get : .post)).rawValue
-        request.httpBody = body
+        request.httpMethod = method.rawValue
         request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
+        request.setValue(accept, forHTTPHeaderField: "Accept")
+        if let contentType { request.setValue(contentType, forHTTPHeaderField: "Content-Type") }
+        return request
+    }
 
-        let (data, response) = try await session.data(for: request)
+    private func checkedResponse(_ response: URLResponse, errorData: Data) throws -> HTTPURLResponse {
         guard let response = response as? HTTPURLResponse else {
             throw BridgeError.message("The Mac returned an unreadable response.")
         }
         guard (200..<300).contains(response.statusCode) else {
-            let details = try? bridgeDecoder().decode(BridgeErrorResponse.self, from: data)
+            let details = try? bridgeDecoder().decode(BridgeErrorResponse.self, from: errorData)
             let message = details?.error ?? "The Mac did not accept this request. Check its Workspace connection."
             throw BridgeError.response(status: response.statusCode, code: details?.code, message: message)
         }
+        return response
+    }
+
+    private func decoded<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do {
-            return try bridgeDecoder().decode(T.self, from: data)
+            return try bridgeDecoder().decode(type, from: data)
         } catch {
             throw BridgeError.message("The Mac returned Workspace data this app could not read. Your saved data has been kept.")
         }
+    }
+
+    func call<T: Decodable>(
+        _ path: String,
+        method: BridgeHTTPMethod? = nil,
+        body: Data? = nil
+    ) async throws -> T {
+        let session = makeSession()
+        defer { session.finishTasksAndInvalidate() }
+
+        let requestMethod = method ?? (body == nil ? .get : .post)
+        var request = try makeRequest(
+            path: path,
+            method: requestMethod,
+            contentType: body == nil ? nil : "application/json"
+        )
+        request.httpBody = body
+
+        let (data, response) = try await session.data(for: request)
+        _ = try checkedResponse(response, errorData: data)
+        return try decoded(T.self, from: data)
     }
 
     func get<T: Decodable>(_ path: String) async throws -> T {
@@ -302,6 +336,95 @@ final class BridgeClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, 
         input: Input
     ) async throws -> Output {
         try await call(path, method: method, body: bridgeEncoder().encode(input))
+    }
+
+    func upload<Output: Decodable>(
+        _ path: String,
+        file: URL,
+        contentType: String,
+        headers: [String: String]
+    ) async throws -> Output {
+        let values = try file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true, let byteCount = values.fileSize else {
+            throw BridgeError.message("The selected photo or video is no longer available.")
+        }
+        guard byteCount > 0, byteCount <= Self.maximumMediaBytes else {
+            throw BridgeError.message("Choose a photo or video smaller than 200 MB.")
+        }
+        guard !contentType.isEmpty, !contentType.contains("\r"), !contentType.contains("\n") else {
+            throw BridgeError.message("The selected photo or video has an invalid file type.")
+        }
+
+        var request = try makeRequest(path: path, method: .post, contentType: contentType)
+        for (name, value) in headers {
+            guard !name.isEmpty,
+                  name.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }),
+                  value.utf8.count <= 2_048,
+                  !value.contains("\r"),
+                  !value.contains("\n") else {
+                throw BridgeError.message("The selected photo or video has invalid metadata.")
+            }
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+
+        let session = makeSession(resourceTimeout: 5 * 60)
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.upload(for: request, fromFile: file)
+        _ = try checkedResponse(response, errorData: data)
+        return try decoded(Output.self, from: data)
+    }
+
+    func download(_ path: String, fileExtension: String?) async throws -> URL {
+        let request = try makeRequest(path: path, method: .get, accept: "image/*, video/*")
+        let session = makeSession(resourceTimeout: 5 * 60)
+        defer { session.finishTasksAndInvalidate() }
+        let (temporary, response) = try await session.download(for: request)
+        let errorData = ((response as? HTTPURLResponse)?.statusCode ?? 500) >= 400
+            ? ((try? Data(contentsOf: temporary, options: .mappedIfSafe)) ?? Data())
+            : Data()
+        _ = try checkedResponse(response, errorData: errorData)
+        try Task.checkCancellation()
+
+        let values = try temporary.resourceValues(forKeys: [.fileSizeKey])
+        guard let byteCount = values.fileSize,
+              byteCount > 0,
+              byteCount <= Self.maximumMediaBytes else {
+            throw BridgeError.message("This attachment is larger than the 200 MB iPhone limit.")
+        }
+        let filteredExtension = fileExtension?.lowercased().filter {
+            $0.isASCII && ($0.isLetter || $0.isNumber)
+        }
+        let safeExtension = filteredExtension.flatMap { $0.isEmpty ? nil : String($0.prefix(12)) }
+        let suffix = safeExtension.map { ".\($0)" } ?? ""
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("WorkspaceGoalMedia", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.protectionKey: FileProtectionType.complete]
+        )
+        let destination = directory.appendingPathComponent(UUID().uuidString.lowercased() + suffix)
+        do {
+            try FileManager.default.moveItem(at: temporary, to: destination)
+        } catch {
+            // A URLSession temporary file can live on a different volume. Copy only
+            // when an atomic move is unavailable; URLSession removes its original.
+            do {
+                try FileManager.default.copyItem(at: temporary, to: destination)
+            } catch {
+                try? FileManager.default.removeItem(at: destination)
+                throw error
+            }
+        }
+        do {
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.complete],
+                ofItemAtPath: destination.path
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+        return destination
     }
 
     func negotiateCapabilities() async throws -> BridgeCapabilities {

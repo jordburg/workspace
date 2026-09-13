@@ -16,4 +16,11 @@
 <key>NSLocalNetworkUsageDescription</key><string>Connect securely to your personal Workspace on your Mac and sync selected health and workspace data over your private Wi-Fi.</string>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
+<key>UISupportedInterfaceOrientations~ipad</key>
+<array>
+	<string>UIInterfaceOrientationPortrait</string>
+	<string>UIInterfaceOrientationPortraitUpsideDown</string>
+	<string>UIInterfaceOrientationLandscapeLeft</string>
+	<string>UIInterfaceOrientationLandscapeRight</string>
+</array>
 </dict></plist>

@@ -184,6 +184,13 @@ enum WorkspaceItemKind: String, Codable, CaseIterable, Hashable, Sendable {
     case note
 }
 
+enum WorkspaceTriageStatus: String, Codable, CaseIterable, Hashable, Sendable {
+    case new
+    case reviewed
+    case linked
+    case archived
+}
+
 struct WorkspaceItem: Codable, Identifiable, Hashable, Sendable {
     var id: String
     var kind: WorkspaceItemKind
@@ -193,6 +200,10 @@ struct WorkspaceItem: Codable, Identifiable, Hashable, Sendable {
     var time: String?
     var endTime: String?
     var done: Bool
+    var revision: Int?
+    var createdAt: String?
+    var updatedAt: String?
+    var triageStatus: WorkspaceTriageStatus?
 
     static func new(
         kind: WorkspaceItemKind,
@@ -207,11 +218,18 @@ struct WorkspaceItem: Codable, Identifiable, Hashable, Sendable {
             date: kind == .note ? nil : (date ?? WorkspaceFormat.dayKey()),
             time: nil,
             endTime: nil,
-            done: false
+            done: false,
+            revision: nil,
+            createdAt: nil,
+            updatedAt: nil,
+            triageStatus: kind == .note ? .new : nil
         )
     }
 
-    enum CodingKeys: String, CodingKey { case id, kind, title, area, date, time, endTime, done }
+    enum CodingKeys: String, CodingKey {
+        case id, kind, title, area, date, time, endTime, done
+        case revision, createdAt, updatedAt, triageStatus
+    }
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(id, forKey: .id)
@@ -222,15 +240,26 @@ struct WorkspaceItem: Codable, Identifiable, Hashable, Sendable {
         try values.encodeNullable(time, forKey: .time)
         try values.encodeNullable(endTime, forKey: .endTime)
         try values.encode(done, forKey: .done)
+        try values.encodeIfPresent(revision, forKey: .revision)
+        try values.encodeIfPresent(createdAt, forKey: .createdAt)
+        try values.encodeIfPresent(updatedAt, forKey: .updatedAt)
+        try values.encodeIfPresent(triageStatus, forKey: .triageStatus)
     }
+}
+
+struct WorkspaceTombstone: Codable, Equatable, Sendable {
+    var id: String
+    var revision: Int
+    var deletedAt: String
 }
 
 struct WorkspaceState: Codable, Equatable, Sendable {
     var version: Int
     var revision: Int
     var items: [WorkspaceItem]
+    var tombstones: [WorkspaceTombstone]?
 
-    static let empty = WorkspaceState(version: 1, revision: 0, items: [])
+    static let empty = WorkspaceState(version: 2, revision: 0, items: [], tombstones: [])
 }
 
 // MARK: - Climbing
@@ -550,8 +579,12 @@ struct ClimbingGoal: Codable, Identifiable, Hashable, Sendable {
     var targetDate: String?
     var sessionTarget: Int?
     var venue: String?
+    var environment: ClimbingEnvironment?
+    var discipline: ClimbDiscipline?
+    var ropeStyle: RopeStyle?
     var gradeSystem: GradeSystem?
     var grade: String?
+    var attempts: Int?
     var routineId: String?
     var updatedAt: String
 
@@ -559,11 +592,12 @@ struct ClimbingGoal: Codable, Identifiable, Hashable, Sendable {
         ClimbingGoal(
             id: UUID().uuidString.lowercased(), title: "", kind: .custom, description: "", status: .active,
             archivedAt: nil, progress: 0, nextStep: "", startDate: nil, targetDate: nil, sessionTarget: nil,
-            venue: nil, gradeSystem: nil, grade: nil, routineId: nil, updatedAt: WorkspaceFormat.timestamp()
+            venue: nil, environment: nil, discipline: nil, ropeStyle: nil, gradeSystem: nil, grade: nil,
+            attempts: nil, routineId: nil, updatedAt: WorkspaceFormat.timestamp()
         )
     }
 
-    enum CodingKeys: String, CodingKey { case id, title, kind, description, status, archivedAt, progress, nextStep, startDate, targetDate, sessionTarget, venue, gradeSystem, grade, routineId, updatedAt }
+    enum CodingKeys: String, CodingKey { case id, title, kind, description, status, archivedAt, progress, nextStep, startDate, targetDate, sessionTarget, venue, environment, discipline, ropeStyle, gradeSystem, grade, attempts, routineId, updatedAt }
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(id, forKey: .id)
@@ -578,10 +612,49 @@ struct ClimbingGoal: Codable, Identifiable, Hashable, Sendable {
         try values.encodeNullable(targetDate, forKey: .targetDate)
         try values.encodeNullable(sessionTarget, forKey: .sessionTarget)
         try values.encodeNullable(venue, forKey: .venue)
+        try values.encodeNullable(environment, forKey: .environment)
+        try values.encodeNullable(discipline, forKey: .discipline)
+        try values.encodeNullable(ropeStyle, forKey: .ropeStyle)
         try values.encodeNullable(gradeSystem, forKey: .gradeSystem)
         try values.encodeNullable(grade, forKey: .grade)
+        try values.encodeNullable(attempts, forKey: .attempts)
         try values.encodeNullable(routineId, forKey: .routineId)
         try values.encode(updatedAt, forKey: .updatedAt)
+    }
+}
+
+enum ClimbingGoalReferenceKind: String, Codable, Hashable, Sendable {
+    case link
+    case image
+    case video
+}
+
+struct ClimbingGoalReference: Codable, Identifiable, Hashable, Sendable {
+    var id: String
+    var goalId: String
+    var kind: ClimbingGoalReferenceKind
+    var label: String
+    var url: String?
+    var fileName: String?
+    var mimeType: String?
+    var byteSize: Int?
+    var createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, goalId, kind, label, url, fileName, mimeType, byteSize, createdAt
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(goalId, forKey: .goalId)
+        try values.encode(kind, forKey: .kind)
+        try values.encode(label, forKey: .label)
+        try values.encodeNullable(url, forKey: .url)
+        try values.encodeNullable(fileName, forKey: .fileName)
+        try values.encodeNullable(mimeType, forKey: .mimeType)
+        try values.encodeNullable(byteSize, forKey: .byteSize)
+        try values.encode(createdAt, forKey: .createdAt)
     }
 }
 
@@ -639,17 +712,27 @@ struct ClimbingState: Codable, Equatable, Sendable {
     var goals: [ClimbingGoal]
     var routines: [ClimbingRoutine]
     var plans: [ClimbingPlan]
+    var goalReferences: [ClimbingGoalReference]
 
-    static let empty = ClimbingState(version: 1, revision: 0, sessions: [], goals: [], routines: [], plans: [])
+    static let empty = ClimbingState(version: 1, revision: 0, sessions: [], goals: [], routines: [], plans: [], goalReferences: [])
 
-    enum CodingKeys: String, CodingKey { case version, revision, sessions, goals, routines, plans }
-    init(version: Int, revision: Int, sessions: [ClimbingSession], goals: [ClimbingGoal], routines: [ClimbingRoutine], plans: [ClimbingPlan]) {
+    enum CodingKeys: String, CodingKey { case version, revision, sessions, goals, routines, plans, goalReferences }
+    init(
+        version: Int,
+        revision: Int,
+        sessions: [ClimbingSession],
+        goals: [ClimbingGoal],
+        routines: [ClimbingRoutine],
+        plans: [ClimbingPlan],
+        goalReferences: [ClimbingGoalReference] = []
+    ) {
         self.version = version
         self.revision = revision
         self.sessions = sessions
         self.goals = goals
         self.routines = routines
         self.plans = plans
+        self.goalReferences = goalReferences
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -659,6 +742,7 @@ struct ClimbingState: Codable, Equatable, Sendable {
         goals = try values.decode([ClimbingGoal].self, forKey: .goals)
         routines = try values.decode([ClimbingRoutine].self, forKey: .routines)
         plans = try values.decodeIfPresent([ClimbingPlan].self, forKey: .plans) ?? []
+        goalReferences = try values.decodeIfPresent([ClimbingGoalReference].self, forKey: .goalReferences) ?? []
     }
 }
 

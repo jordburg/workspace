@@ -208,6 +208,22 @@ export function validateChessCatalog() {
       for (const step of segment.steps) {
         if (!isFenShape(step.fen) || !step.acceptedMoves.length || step.acceptedMoves.some((move) => !isUciMove(move)) || step.opponentReplies?.some((move) => !isUciMove(move))) throw new Error(`Invalid chess trainer step ${step.id}.`);
         if (step.review.choices.filter((choice) => choice.isCorrect).length !== 1 || !unique(step.review.choices.map((choice) => choice.id))) throw new Error(`Invalid review prompt for ${step.id}.`);
+        for (const move of step.acceptedMoves) {
+          try {
+            const result = attemptTrainerMove(
+              step,
+              move.slice(0, 2),
+              move.slice(2, 4),
+              move.slice(4),
+            );
+            if (result.status !== "correct") {
+              throw new Error("Authored move is not legal in this position.");
+            }
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : "Invalid move sequence.";
+            throw new Error(`Invalid authored line for ${step.id}: ${detail}`);
+          }
+        }
       }
     }
   }

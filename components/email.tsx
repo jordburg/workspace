@@ -17,10 +17,8 @@ type MailDraft = {
 };
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : "Gmail could not apply this change.";
-const timeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
 const recipients = (value: string) => value.split(",").map(item => item.trim()).filter(Boolean);
 const replySubject = (subject: string) => /^re:/i.test(subject.trim()) ? subject : `Re: ${subject || "(no subject)"}`;
-const syncRequest = (date: string) => ({ date: date || dateKey(new Date()), timeZone: timeZone() });
 const messageTime = (value: string) => {
   const received = new Date(value);
   if (!Number.isFinite(received.getTime())) return "";
@@ -30,23 +28,22 @@ const messageTime = (value: string) => {
     : received.toLocaleDateString("en-US", { month: "short", day: "numeric", ...(received.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }) });
 };
 export function TodayMailCard({ openMail }: { openMail: () => void }) {
-  const { view, busy, openSettings } = useIntegrations();
+  const { view, providerBusy } = useIntegrations();const busy=providerBusy.gmail;
   const messages = view.messages.filter(message => message.unread).slice().sort((a, b) => b.receivedAt.localeCompare(a.receivedAt)).slice(0, 3);
+  if (!view.gmail.connected || !messages.length) return null;
 
   return <section className="today-mail-card" aria-labelledby="today-mail-heading">
     <div className="section-heading">
-      <div><h2 id="today-mail-heading">Mail</h2><p>{view.gmail.connected ? `${view.gmail.unreadCount} unread in the recent personal inbox` : "Personal Gmail"}</p></div>
+      <div><h2 id="today-mail-heading">Mail</h2><p>{view.gmail.unreadCount} unread</p></div>
       <span className="mail-card-icon"><Mail size={18}/></span>
     </div>
-    {!view.gmail.connected ? <div className="today-mail-empty"><p>Bring the messages that need a decision into your daily view.</p><button className="text-button" onClick={openSettings}>Connect Gmail</button></div>
-      : messages.length ? <div className="today-mail-list">{messages.map(message => <a href={message.url} target="_blank" rel="noreferrer" key={message.id}><span className="unread-dot"/><span><strong>{message.subject || "(no subject)"}</strong><small>{message.from} · {messageTime(message.receivedAt)}</small></span><ExternalLink size={13}/></a>)}</div>
-      : <div className="today-mail-empty"><MailOpen size={20}/><p>No unread mail needs your attention.</p></div>}
-    {view.gmail.connected && <button className="text-button today-mail-open" disabled={busy} onClick={openMail}>Open mail</button>}
+    <div className="today-mail-list">{messages.map(message => <a href={message.url} target="_blank" rel="noreferrer" key={message.id}><span className="unread-dot"/><span><strong>{message.subject || "(no subject)"}</strong><small>{message.from} · {messageTime(message.receivedAt)}</small></span><ExternalLink size={13}/></a>)}</div>
+    <button className="text-button today-mail-open" disabled={busy} onClick={openMail}>Open mail</button>
   </section>;
 }
 
 export function MailPanel() {
-  const { view, busy, error, date, perform, openSettings } = useIntegrations();
+  const { view, providerBusy, providerErrors, perform, refreshProvider, openSettings } = useIntegrations();const busy=providerBusy.gmail;const error=providerErrors.gmail||view.gmail.error;
   const [filter, setFilter] = useState<"unread" | "all">("unread");
   const [composer, setComposer] = useState<{ key: string; reply?: RemoteMail } | null>(null);
   const opener = useRef<HTMLElement | null>(null);
@@ -67,32 +64,34 @@ export function MailPanel() {
     mutationRequests.current.delete(key);
   }
 
-  if (!view.gmail.connected) return <section className="mail-connect-panel"><span><Mail size={28}/></span><p className="eyebrow">PERSONAL GMAIL</p><h2>Bring your inbox into the same calm space.</h2><p>See what needs attention, reply or compose when you choose, and clear messages by archiving or moving them to Gmail Trash.</p><Button onClick={openSettings}>Set up Gmail</Button></section>;
+  if (!view.gmail.connected) return <section className="mail-connect-panel"><span><Mail size={28}/></span><p className="eyebrow">PERSONAL GMAIL</p><h2>Mail is not available yet.</h2><p>Finish its setup from the Workspace Settings page.</p><Button onClick={openSettings}>Open Settings</Button></section>;
 
   return <section className="mail-panel" aria-labelledby="mail-panel-heading">
     <div className="mail-toolbar">
-      <div><h2 id="mail-panel-heading">Personal inbox</h2><p>{view.gmail.account || "Personal Gmail"}{view.gmail.lastSynced ? ` · Updated ${new Date(view.gmail.lastSynced).toLocaleString()}` : " · Ready to sync"}</p></div>
-      <div className="mail-toolbar-actions"><button className="mail-quiet-button" disabled={busy} onClick={() => void perform("/gmail/sync", syncRequest(date)).catch(() => {})}><RefreshCw className={busy ? "spin" : ""} size={15}/> Refresh</button><Button disabled={busy} onClick={() => openComposer()}><PenLine size={16}/> Compose</Button></div>
+      <div><h2 id="mail-panel-heading">Personal inbox</h2><p>Recent messages that may need your attention.</p></div>
+      <div className="mail-toolbar-actions"><button className="mail-quiet-button" disabled={busy} onClick={() => void refreshProvider("gmail").catch(() => {})}><RefreshCw className={busy ? "spin" : ""} size={15}/> Refresh</button><Button disabled={busy} onClick={() => openComposer()}><PenLine size={16}/> Compose</Button></div>
     </div>
     <div className="mail-filter-row">
       <div className="mail-filters" aria-label="Filter mail"><button aria-pressed={filter === "unread"} onClick={() => setFilter("unread")}>Unread <span>{view.gmail.unreadCount}</span></button><button aria-pressed={filter === "all"} onClick={() => setFilter("all")}>All <span>{view.messages.length}</span></button></div>
       <p>Messages stay in Gmail. Workspace keeps only the recent view it needs.</p>
     </div>
-    {(error || view.gmail.error) && <div className="mail-error" role="alert">{error || view.gmail.error}</div>}
+    {error&&<div className="settings-link-notice"><p>{error}</p><Button variant="outline" onClick={openSettings}>Open Settings</Button></div>}
     {messages.length ? <div className="mail-list">{messages.map(message => <MailRow key={message.id} message={message} busy={busy} mutate={mutate} reply={() => openComposer(message)}/>)}</div>
-      : <div className="mail-empty"><span><Inbox size={26}/></span><h3>{filter === "unread" ? "You’re caught up." : "No recent messages to show."}</h3><p>{filter === "unread" ? "There’s no unread mail in this recent view." : "Refresh Gmail to check for recent messages."}</p></div>}
+      : <div className="mail-empty"><span><Inbox size={26}/></span><h3>{filter === "unread" ? "You’re caught up." : "No recent messages to show."}</h3><p>{filter === "unread" ? "There’s no unread mail in this recent view." : "New messages will appear as Workspace updates your inbox."}</p></div>}
     <Dialog open={!!composer} onOpenChange={open => { if (!open && !busy) setComposer(null); }}><DialogContent className="editor-dialog mail-compose-dialog" onInteractOutside={event => event.preventDefault()} onCloseAutoFocus={event => { event.preventDefault(); if (opener.current?.isConnected) opener.current.focus(); }}>{composer && <MailComposer key={composer.key} reply={composer.reply} onClose={() => setComposer(null)}/>}</DialogContent></Dialog>
   </section>;
 }
 
 function MailRow({ message, busy, mutate, reply }: { message: RemoteMail; busy: boolean; mutate: (message: RemoteMail, action: "read" | "unread" | "star" | "unstar" | "archive" | "trash") => Promise<void>; reply: () => void }) {
   const { view, date, openEditor } = useIntegrations();
+  const taskRelation=view.gmail.relations.find(relation=>relation.entityId===message.id&&relation.role==="follow-up-task");
+  const calendarRelation=view.gmail.relations.find(relation=>relation.entityId===message.id&&relation.role==="time-block");
   const [confirmTrash, setConfirmTrash] = useState(false);
   const [rowError, setRowError] = useState("");
   const act = async (action: "read" | "unread" | "star" | "unstar" | "archive" | "trash") => { setRowError(""); try { await mutate(message, action); } catch (error) { setRowError(errorMessage(error)); } };
   return <article className={`mail-row ${message.unread ? "is-unread" : ""}`}>
     <div className="mail-row-status"><button className={`mail-star ${message.starred ? "is-starred" : ""}`} disabled={busy} aria-label={`${message.starred ? "Remove star from" : "Star"} ${message.subject || "message"}`} aria-pressed={message.starred} onClick={() => void act(message.starred ? "unstar" : "star")}><Star size={17} fill={message.starred ? "currentColor" : "none"}/></button>{message.unread && <span className="unread-dot" aria-label="Unread"/>}</div>
-    <div className="mail-copy"><div className="mail-sender-line"><strong>{message.from}</strong><time dateTime={message.receivedAt}>{messageTime(message.receivedAt)}</time></div><a href={message.url} target="_blank" rel="noreferrer" className="mail-subject">{message.subject || "(no subject)"} <ExternalLink size={12}/></a>{message.snippet && <p>{message.snippet}</p>}<div className="mail-row-actions"><button disabled={busy || !message.replyTo} title={message.replyTo ? undefined : "Open this message in Gmail to reply"} onClick={reply}><Reply size={14}/> Reply</button><button disabled={busy} onClick={() => void act(message.unread ? "read" : "unread")}>{message.unread ? <MailOpen size={14}/> : <Mail size={14}/>} Mark {message.unread ? "read" : "unread"}</button><button disabled={busy} onClick={() => void act("archive")}><Archive size={14}/> Archive</button>{view.todoist.connected && <button disabled={busy} onClick={() => openEditor({ provider: "todoist", day: date || dateKey(new Date()), preset: { title: `Follow up: ${message.subject || "email"}` }, description: "Review this Todoist task, choose its date and Personal project, then save it." })}><ListTodo size={14}/> Add task</button>}{view.google.connected && <button disabled={busy} onClick={() => openEditor({ provider: "google", day: date || dateKey(new Date()), preset: { title: `Email: ${message.subject || "follow-up"}` }, description: "Review the time block below, then save it to your personal Google Calendar." })}><CalendarPlus size={14}/> Block time</button>}<button className="mail-trash-button" disabled={busy} onClick={() => setConfirmTrash(true)}><Trash2 size={14}/> Trash</button></div>{message.important && <span className="mail-important">Important</span>}
+    <div className="mail-copy"><div className="mail-sender-line"><strong>{message.from}</strong><time dateTime={message.receivedAt}>{messageTime(message.receivedAt)}</time></div><a href={message.url} target="_blank" rel="noreferrer" className="mail-subject">{message.subject || "(no subject)"} <ExternalLink size={12}/></a>{message.snippet && <p>{message.snippet}</p>}<div className="mail-row-actions"><button disabled={busy || !message.replyTo} title={message.replyTo ? undefined : "Open this message in Gmail to reply"} onClick={reply}><Reply size={14}/> Reply</button><button disabled={busy} onClick={() => void act(message.unread ? "read" : "unread")}>{message.unread ? <MailOpen size={14}/> : <Mail size={14}/>} Mark {message.unread ? "read" : "unread"}</button><button disabled={busy} onClick={() => void act("archive")}><Archive size={14}/> Archive</button>{view.todoist.connected && <button disabled={busy||!!taskRelation} title={taskRelation?"This message already has a linked Todoist follow-up.":undefined} onClick={() => openEditor({ provider: "todoist", day: date || dateKey(new Date()), preset: { title: `Follow up: ${message.subject || "email"}` }, link:{entityKind:"gmail-message",entityId:message.id,role:"follow-up-task"}, description: "Review this Todoist task, choose its date and Personal project, then save it." })}><ListTodo size={14}/> {taskRelation?"Task added":"Add task"}</button>}{view.google.connected && <button disabled={busy||!!calendarRelation} title={calendarRelation?"This message already has a linked Calendar time block.":undefined} onClick={() => openEditor({ provider: "google", day: date || dateKey(new Date()), preset: { title: `Email: ${message.subject || "follow-up"}` }, link:{entityKind:"gmail-message",entityId:message.id,role:"time-block"}, description: "Review the time block below, then save it to your personal Google Calendar." })}><CalendarPlus size={14}/> {calendarRelation?"Time blocked":"Block time"}</button>}<button className="mail-trash-button" disabled={busy} onClick={() => setConfirmTrash(true)}><Trash2 size={14}/> Trash</button></div>{message.important && <span className="mail-important">Important</span>}
       {confirmTrash && <div className="mail-trash-confirm" role="alert"><p>Move this message to Gmail Trash? You can recover it from Gmail.</p><div><button disabled={busy} onClick={() => setConfirmTrash(false)}>Cancel</button><Button variant="destructive" size="sm" disabled={busy} onClick={() => void act("trash")}>Move to Trash</Button></div></div>}
       {rowError && <p className="mail-row-error" role="alert">{rowError}</p>}
     </div>
@@ -100,7 +99,7 @@ function MailRow({ message, busy, mutate, reply }: { message: RemoteMail; busy: 
 }
 
 function MailComposer({ reply, onClose }: { reply?: RemoteMail; onClose: () => void }) {
-  const { busy, perform } = useIntegrations();
+  const { providerBusy, perform } = useIntegrations();const busy=providerBusy.gmail;
   const [draft, setDraft] = useState<MailDraft>({ to: reply?.replyTo || reply?.from || "", cc: "", bcc: "", subject: reply ? replySubject(reply.subject) : "", body: "" });
   const [localError, setLocalError] = useState("");
   const request = useRef({ id: crypto.randomUUID(), payload: "" });

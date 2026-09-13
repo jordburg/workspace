@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UniformTypeIdentifiers
 
 struct RevisionConflict<Value: Equatable & Sendable>: Identifiable, Equatable, Sendable {
     let id = UUID()
@@ -11,15 +12,68 @@ struct RevisionConflict<Value: Equatable & Sendable>: Identifiable, Equatable, S
 private struct EmptyBridgeBody: Codable, Sendable {}
 private struct SavedBridgeResponse: Decodable, Sendable { let saved: Bool }
 private struct WeightCommandsResponse: Decodable, Sendable { let commands: [WeightCommand] }
+private let capturePersistenceError = "This iPhone could not protect the Capture draft. Keep this screen open and try again."
 
-private enum WorkspaceItemChange: Sendable {
+enum CompanionConnectionState: Equatable, Sendable {
+    case unpaired
+    case connecting
+    case online
+    case offlineWithCache
+    case error(String)
+}
+
+enum CaptureDisposition: Equatable, Sendable {
+    case delivered
+    case queued
+}
+
+private struct CompanionSnapshotCache: Codable, Sendable {
+    static let currentVersion = 1
+
+    var version = currentVersion
+    var savedAt = Date()
+    var lastSuccessfulContact: Date?
+    var areaSavedAt: [String: Date] = [:]
+    var workspace: WorkspaceState?
+    var climbing: ClimbingState?
+    var chess: ChessView?
+    var integrations: IntegrationView?
+}
+
+private struct CaptureOutboxEntry: Codable, Identifiable, Equatable, Sendable {
+    let requestId: String
+    let item: WorkspaceItem
+    let createdAt: Date
+    var id: String { requestId }
+}
+
+private enum WorkspaceItemChange: Equatable, Sendable {
     case upsert(WorkspaceItem)
+    case restore(item: WorkspaceItem, expectedTombstoneRevision: Int)
     case remove(String)
+    case toggle(id: String, done: Bool)
+
+    var itemId: String {
+        switch self {
+        case .upsert(let item): item.id
+        case .restore(let item, _): item.id
+        case .remove(let id), .toggle(let id, _): id
+        }
+    }
+
+    var attemptKey: String {
+        switch self {
+        case .upsert: "upsert:\(itemId)"
+        case .restore: "restore:\(itemId)"
+        case .remove: "delete:\(itemId)"
+        case .toggle: "toggle:\(itemId)"
+        }
+    }
 
     func applying(to state: WorkspaceState) -> WorkspaceState {
         var result = state
         switch self {
-        case .upsert(let item):
+        case .upsert(let item), .restore(let item, _):
             if let index = result.items.firstIndex(where: { $0.id == item.id }) {
                 result.items[index] = item
             } else {
@@ -27,8 +81,287 @@ private enum WorkspaceItemChange: Sendable {
             }
         case .remove(let id):
             result.items.removeAll { $0.id == id }
+        case .toggle(let id, let done):
+            if let index = result.items.firstIndex(where: { $0.id == id }) {
+                result.items[index].done = done
+            }
+        }
+        if case .restore(let item, _) = self {
+            result.tombstones?.removeAll { $0.id == item.id }
         }
         return result
+    }
+
+    func isSatisfied(by state: WorkspaceState) -> Bool {
+        switch self {
+        case .upsert(let item), .restore(let item, _):
+            guard let saved = state.items.first(where: { $0.id == item.id }) else { return false }
+            return saved.kind == item.kind
+                && saved.title == item.title
+                && saved.area == item.area
+                && saved.date == item.date
+                && saved.time == item.time
+                && saved.endTime == item.endTime
+                && saved.done == item.done
+        case .remove(let id):
+            return !state.items.contains { $0.id == id }
+        case .toggle(let id, let done):
+            return state.items.first(where: { $0.id == id })?.done == done
+        }
+    }
+}
+
+private struct WorkspaceRecordCommand: Encodable, Equatable, Sendable {
+    let requestId: String
+    let expectedItemRevision: Int?
+    let change: WorkspaceItemChange
+
+    private enum CodingKeys: String, CodingKey {
+        case action, requestId, expectedItemRevision, expectedTombstoneRevision, item, id, done
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(requestId, forKey: .requestId)
+        switch change {
+        case .upsert(let item):
+            try values.encode("upsert", forKey: .action)
+            if let expectedItemRevision {
+                try values.encode(expectedItemRevision, forKey: .expectedItemRevision)
+            } else {
+                try values.encodeNil(forKey: .expectedItemRevision)
+            }
+            try values.encode(item, forKey: .item)
+        case .restore(let item, let expectedTombstoneRevision):
+            try values.encode("restore", forKey: .action)
+            try values.encode(expectedTombstoneRevision, forKey: .expectedTombstoneRevision)
+            try values.encode(item, forKey: .item)
+        case .remove(let id):
+            try values.encode("delete", forKey: .action)
+            try values.encode(expectedItemRevision, forKey: .expectedItemRevision)
+            try values.encode(id, forKey: .id)
+        case .toggle(let id, let done):
+            try values.encode("toggle", forKey: .action)
+            try values.encode(expectedItemRevision, forKey: .expectedItemRevision)
+            try values.encode(id, forKey: .id)
+            try values.encode(done, forKey: .done)
+        }
+    }
+}
+
+private enum ClimbingRecordChange: Encodable, Equatable, Sendable {
+    case session(expectedUpdatedAt: String?, value: ClimbingSession)
+    case goal(expectedUpdatedAt: String?, value: ClimbingGoal)
+    case routine(expectedUpdatedAt: String?, value: ClimbingRoutine)
+    case plan(expectedUpdatedAt: String?, value: ClimbingPlan)
+
+    var recordKey: String {
+        switch self {
+        case .session(_, let value): "session:\(value.id)"
+        case .goal(_, let value): "goal:\(value.id)"
+        case .routine(_, let value): "routine:\(value.id)"
+        case .plan(_, let value): "plan:\(value.id)"
+        }
+    }
+
+    func applying(to state: ClimbingState) -> ClimbingState {
+        var result = state
+        switch self {
+        case .session(_, let value):
+            if let index = result.sessions.firstIndex(where: { $0.id == value.id }) { result.sessions[index] = value }
+            else { result.sessions.append(value) }
+        case .goal(_, let value):
+            if let index = result.goals.firstIndex(where: { $0.id == value.id }) { result.goals[index] = value }
+            else { result.goals.append(value) }
+        case .routine(_, let value):
+            if let index = result.routines.firstIndex(where: { $0.id == value.id }) { result.routines[index] = value }
+            else { result.routines.append(value) }
+        case .plan(_, let value):
+            if let index = result.plans.firstIndex(where: { $0.id == value.id }) { result.plans[index] = value }
+            else { result.plans.append(value) }
+        }
+        return result
+    }
+
+    func isSatisfied(by state: ClimbingState) -> Bool {
+        switch self {
+        case .session(_, let value): state.sessions.first(where: { $0.id == value.id }) == value
+        case .goal(_, let value): state.goals.first(where: { $0.id == value.id }) == value
+        case .routine(_, let value): state.routines.first(where: { $0.id == value.id }) == value
+        case .plan(_, let value): state.plans.first(where: { $0.id == value.id }) == value
+        }
+    }
+
+    func isRetryEquivalent(to other: ClimbingRecordChange) -> Bool {
+        switch (self, other) {
+        case let (.session(leftExpected, leftValue), .session(rightExpected, rightValue)):
+            var left = leftValue
+            var right = rightValue
+            left.updatedAt = ""
+            right.updatedAt = ""
+            if left.deletedAt != nil, right.deletedAt != nil {
+                left.deletedAt = ""
+                right.deletedAt = ""
+            }
+            return leftExpected == rightExpected && left == right
+        case let (.goal(leftExpected, leftValue), .goal(rightExpected, rightValue)):
+            var left = leftValue
+            var right = rightValue
+            left.updatedAt = ""
+            right.updatedAt = ""
+            if left.archivedAt != nil, right.archivedAt != nil {
+                left.archivedAt = ""
+                right.archivedAt = ""
+            }
+            return leftExpected == rightExpected && left == right
+        case let (.routine(leftExpected, leftValue), .routine(rightExpected, rightValue)):
+            var left = leftValue
+            var right = rightValue
+            left.updatedAt = ""
+            right.updatedAt = ""
+            return leftExpected == rightExpected && left == right
+        case let (.plan(leftExpected, leftValue), .plan(rightExpected, rightValue)):
+            var left = leftValue
+            var right = rightValue
+            left.updatedAt = ""
+            right.updatedAt = ""
+            return leftExpected == rightExpected && left == right
+        default:
+            return false
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey { case kind, expectedUpdatedAt, value }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        let expected: String?
+        switch self {
+        case .session(let expectedUpdatedAt, let value):
+            expected = expectedUpdatedAt
+            try values.encode("session", forKey: .kind)
+            try values.encode(value, forKey: .value)
+        case .goal(let expectedUpdatedAt, let value):
+            expected = expectedUpdatedAt
+            try values.encode("goal", forKey: .kind)
+            try values.encode(value, forKey: .value)
+        case .routine(let expectedUpdatedAt, let value):
+            expected = expectedUpdatedAt
+            try values.encode("routine", forKey: .kind)
+            try values.encode(value, forKey: .value)
+        case .plan(let expectedUpdatedAt, let value):
+            expected = expectedUpdatedAt
+            try values.encode("plan", forKey: .kind)
+            try values.encode(value, forKey: .value)
+        }
+        if let expected { try values.encode(expected, forKey: .expectedUpdatedAt) }
+        else { try values.encodeNil(forKey: .expectedUpdatedAt) }
+    }
+}
+
+private struct ClimbingRecordCommand: Encodable, Equatable, Sendable {
+    let requestId: String
+    let changes: [ClimbingRecordChange]
+}
+
+private struct ClimbingMediaLinkCommand: Encodable, Sendable {
+    let requestId: String
+    let reference: ClimbingGoalReference
+}
+
+private struct ClimbingMediaDeleteCommand: Encodable, Sendable {
+    let requestId: String
+    let goalId: String
+    let referenceId: String
+}
+
+private struct CompanionLocalState: Codable, Sendable {
+    static let currentVersion = 1
+
+    var version = currentVersion
+    var pairingIdentity: String?
+    var captureDraft = ""
+    var captureOutbox: [CaptureOutboxEntry] = []
+}
+
+private func companionPlanningSnapshot(_ value: IntegrationView) -> IntegrationView {
+    IntegrationView(
+        todoist: value.todoist,
+        google: value.google,
+        gmail: .empty,
+        tasks: value.tasks,
+        events: value.events,
+        messages: [],
+        links: value.links,
+        range: value.range
+    )
+}
+
+private enum CompanionPersistence {
+    private static let directoryName = "Companion"
+    private static let snapshotName = "snapshot-v1.json"
+    private static let localStateName = "local-state-v1.json"
+
+    static func loadSnapshot() -> CompanionSnapshotCache? {
+        load(CompanionSnapshotCache.self, name: snapshotName).flatMap {
+            $0.version == CompanionSnapshotCache.currentVersion ? $0 : nil
+        }
+    }
+
+    static func loadLocalState() -> CompanionLocalState? {
+        load(CompanionLocalState.self, name: localStateName).flatMap {
+            $0.version == CompanionLocalState.currentVersion ? $0 : nil
+        }
+    }
+
+    static func saveSnapshot(_ value: CompanionSnapshotCache) throws {
+        try save(value, name: snapshotName)
+    }
+
+    static func saveLocalState(_ value: CompanionLocalState) throws {
+        try save(value, name: localStateName)
+    }
+
+    static func removeSnapshot() {
+        guard let directory = try? directoryURL(create: false) else { return }
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(snapshotName))
+    }
+
+    static func removeLocalState() {
+        guard let directory = try? directoryURL(create: false) else { return }
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(localStateName))
+    }
+
+    private static func load<Value: Decodable>(_ type: Value.Type, name: String) -> Value? {
+        guard let directory = try? directoryURL(create: false),
+              let data = try? Data(contentsOf: directory.appendingPathComponent(name)) else { return nil }
+        return try? bridgeDecoder().decode(type, from: data)
+    }
+
+    private static func save<Value: Encodable>(_ value: Value, name: String) throws {
+        let directory = try directoryURL(create: true)
+        let url = directory.appendingPathComponent(name)
+        let data = try bridgeEncoder().encode(value)
+        try data.write(to: url, options: [.atomic, .completeFileProtection])
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
+    }
+
+    private static func directoryURL(create: Bool) throws -> URL {
+        let base = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: create
+        )
+        let directory = base.appendingPathComponent(directoryName, isDirectory: true)
+        if create {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.protectionKey: FileProtectionType.complete]
+            )
+        }
+        return directory
     }
 }
 
@@ -45,6 +378,11 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var integrations: IntegrationView = .empty
     @Published private(set) var healthView: PhoneHealthView?
     @Published private(set) var healthSnapshot: HealthSnapshot?
+
+    @Published private(set) var connectionState: CompanionConnectionState = .unpaired
+    @Published private(set) var lastSuccessfulContact: Date?
+    @Published private(set) var captureDraft = ""
+    @Published private(set) var pendingCaptureCount = 0
 
     @Published private(set) var workspaceConflict: RevisionConflict<WorkspaceState>?
     @Published private(set) var climbingConflict: RevisionConflict<ClimbingState>?
@@ -68,11 +406,48 @@ final class WorkspaceStore: ObservableObject {
     private var pairingEpoch = 0
     private var unpairing = false
     private var postUnpairStatus: String?
+    private var lastConnectionAttempt: Date?
     private var workspaceConflictChange: WorkspaceItemChange?
+    private var snapshotCache = CompanionSnapshotCache()
+    private var captureOutbox: [CaptureOutboxEntry] = []
+    private var capturePairingIdentity: String?
+    private var localStateSaveTask: Task<Void, Never>?
+    private var workspaceRecordAttempts: [String: WorkspaceRecordCommand] = [:]
+    private var climbingRecordAttempts: [String: ClimbingRecordCommand] = [:]
 
     var isPaired: Bool { credentials != nil }
+    var isOnline: Bool { connectionState == .online }
+    var hasCachedContent: Bool { !loadedAreas.isEmpty }
+    var connectionNeedsAttention: Bool {
+        if case .error = connectionState { return true }
+        return false
+    }
+    var needsForegroundRefresh: Bool {
+        guard isPaired else { return false }
+        let now = Date()
+        if connectionState == .online, let lastSuccessfulContact {
+            return now.timeIntervalSince(lastSuccessfulContact) >= 5 * 60
+        }
+        if let lastConnectionAttempt {
+            return now.timeIntervalSince(lastConnectionAttempt) >= 15 * 60
+        }
+        return true
+    }
     var hasWorkspaceAccess: Bool {
         capabilities?.workspace ?? (credentials?.scope == .workspace)
+    }
+    var integrationProviderError: String? {
+        [integrations.todoist.error, integrations.google.error]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+    }
+    private var connectedProvidersAreFresh: Bool {
+        let providers = [integrations.todoist, integrations.google].filter { $0.connected }
+        guard !providers.isEmpty else { return true }
+        return providers.allSatisfy { provider in
+            guard let value = provider.lastSynced, let date = timestampDate(value) else { return false }
+            return Date().timeIntervalSince(date) < 5 * 60
+        }
     }
     var busy: Bool { !busyAreas.isEmpty }
     var error: String? {
@@ -82,8 +457,26 @@ final class WorkspaceStore: ObservableObject {
 
     init(credentials suppliedCredentials: BridgeCredentials? = nil, health: HealthStore = HealthStore()) {
         self.health = health
+        let restoredLocalState = CompanionPersistence.loadLocalState()
+        if let cached = CompanionPersistence.loadSnapshot() {
+            snapshotCache = cached
+            workspace = cached.workspace ?? .empty
+            climbing = cached.climbing ?? .empty
+            chess = cached.chess ?? .empty
+            integrations = cached.integrations.map(companionPlanningSnapshot) ?? .empty
+            snapshotCache.integrations = cached.integrations.map(companionPlanningSnapshot)
+            lastSuccessfulContact = cached.lastSuccessfulContact
+            if cached.workspace != nil { loadedAreas.insert(.workspace) }
+            if cached.climbing != nil { loadedAreas.insert(.climbing) }
+            if cached.chess != nil { loadedAreas.insert(.chess) }
+            if cached.integrations != nil { loadedAreas.insert(.integrations) }
+            if cached.integrations != snapshotCache.integrations {
+                try? CompanionPersistence.saveSnapshot(snapshotCache)
+            }
+        }
         if let suppliedCredentials {
             credentials = suppliedCredentials
+            connectionState = loadedAreas.isEmpty ? .connecting : .offlineWithCache
             status = suppliedCredentials.scope == .workspace
                 ? "Ready to load your workspace from the Mac."
                 : "Ready to sync Health with your Mac."
@@ -91,13 +484,26 @@ final class WorkspaceStore: ObservableObject {
             do {
                 credentials = try BridgeKeychain.load()
                 if let credentials {
+                    connectionState = loadedAreas.isEmpty ? .connecting : .offlineWithCache
                     status = credentials.scope == .workspace
                         ? "Ready to load your workspace from the Mac."
                         : "Ready to sync Health with your Mac."
                 }
             } catch {
                 credentials = nil
+                connectionState = .error(error.localizedDescription)
                 areaErrors[.pairing] = error.localizedDescription
+            }
+        }
+        if let local = restoredLocalState {
+            let currentIdentity = credentials?.fingerprint
+            if local.pairingIdentity == currentIdentity {
+                capturePairingIdentity = local.pairingIdentity
+                captureDraft = local.captureDraft
+                captureOutbox = local.captureOutbox
+                pendingCaptureCount = local.captureOutbox.count
+            } else {
+                CompanionPersistence.removeLocalState()
             }
         }
     }
@@ -113,6 +519,136 @@ final class WorkspaceStore: ObservableObject {
         record(cause, area: area)
     }
 
+    func cachedAt(_ area: WorkspaceArea) -> Date? {
+        snapshotCache.areaSavedAt[area.rawValue]
+    }
+
+    func updateCaptureDraft(_ value: String) {
+        guard hasWorkspaceAccess else { return }
+        prepareCaptureIdentity()
+        captureDraft = value
+        localStateSaveTask?.cancel()
+        localStateSaveTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(300))
+            } catch {
+                return
+            }
+            guard let self else { return }
+            self.localStateSaveTask = nil
+            _ = self.persistLocalState()
+        }
+    }
+
+    func persistCaptureState() {
+        localStateSaveTask?.cancel()
+        localStateSaveTask = nil
+        _ = persistLocalState()
+    }
+
+    @discardableResult
+    func submitCapture(_ text: String) async -> CaptureDisposition? {
+        guard hasWorkspaceAccess else {
+            record(BridgeError.message("Pair this iPhone with Workspace before saving a Capture."), area: .workspace)
+            return nil
+        }
+        prepareCaptureIdentity()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed.count <= 2_000 else {
+            record(
+                BridgeError.message("Keep a Capture under 2,000 characters so it can be saved to Workspace Captures."),
+                area: .workspace
+            )
+            return nil
+        }
+
+        var item = WorkspaceItem.new(kind: .note)
+        item.title = trimmed
+        let entry = CaptureOutboxEntry(requestId: item.id, item: item, createdAt: Date())
+        if !captureOutbox.contains(where: { $0.requestId == entry.requestId }) {
+            captureOutbox.append(entry)
+        }
+        localStateSaveTask?.cancel()
+        localStateSaveTask = nil
+        let retainedDraft = captureDraft
+        captureDraft = ""
+        pendingCaptureCount = captureOutbox.count
+        guard persistLocalState() else {
+            captureOutbox.removeAll { $0.requestId == entry.requestId }
+            captureDraft = retainedDraft
+            pendingCaptureCount = captureOutbox.count
+            return nil
+        }
+
+        await flushCaptureOutbox()
+        return captureOutbox.contains(where: { $0.requestId == entry.requestId }) ? .queued : .delivered
+    }
+
+    func flushCaptureOutbox(forceAttempt: Bool = false) async {
+        guard hasWorkspaceAccess,
+              capturePairingIdentity == credentials?.fingerprint,
+              (forceAttempt || connectionState == .online),
+              !captureOutbox.isEmpty else { return }
+        if !loadedAreas.contains(.workspace) {
+            await load(.workspace, force: true)
+        }
+        guard loadedAreas.contains(.workspace), !busyAreas.contains(.workspace) else { return }
+
+        for entry in Array(captureOutbox) {
+            if workspace.items.contains(where: { $0.id == entry.item.id }) {
+                removeCaptureOutboxEntry(entry.requestId)
+                continue
+            }
+
+            if await deliverCapture(entry) {
+                removeCaptureOutboxEntry(entry.requestId)
+                continue
+            }
+            break
+        }
+    }
+
+    private func deliverCapture(_ entry: CaptureOutboxEntry) async -> Bool {
+        guard begin(.workspace) else { return false }
+        defer { finish(.workspace) }
+        guard let client = workspaceClient(area: .workspace) else { return false }
+
+        do {
+            let command = WorkspaceRecordCommand(
+                requestId: entry.requestId,
+                expectedItemRevision: nil,
+                change: .upsert(entry.item)
+            )
+            workspace = try await client.send("v1/workspace/command", input: command)
+            workspaceConflict = nil
+            workspaceConflictChange = nil
+            loadedAreas.insert(.workspace)
+            clearRecordedError(.workspace)
+            markConnectionSucceeded()
+            cacheCurrent(.workspace)
+            status = "Saved to Workspace Captures."
+            return true
+        } catch let bridge as BridgeError where bridge.statusCode == 409 {
+            if let latest: WorkspaceState = try? await client.get("v1/workspace") {
+                workspace = latest
+                loadedAreas.insert(.workspace)
+                cacheCurrent(.workspace)
+                if latest.items.contains(where: { $0.id == entry.item.id }) {
+                    clearRecordedError(.workspace)
+                    markConnectionSucceeded()
+                    return true
+                }
+            }
+            record(bridge, area: .workspace)
+            return false
+        } catch {
+            recordAutomaticSyncFailure(error, area: .workspace)
+            markConnectionFailureIfNeeded(error)
+            return false
+        }
+    }
+
     func pair(_ url: URL) async {
         guard !unpairing, busyAreas.isEmpty else {
             record(BridgeError.message("Wait for the current sync or save to finish before changing the Mac pairing."), area: .pairing)
@@ -120,6 +656,7 @@ final class WorkspaceStore: ObservableObject {
         }
         guard begin(.pairing) else { return }
         defer { finish(.pairing) }
+        connectionState = .connecting
         postUnpairStatus = nil
         let expectedEpoch = pairingEpoch
         let scoped = url.startAccessingSecurityScopedResource()
@@ -135,21 +672,39 @@ final class WorkspaceStore: ObservableObject {
                 BridgeKeychain.remove()
                 return
             }
+            let hasPendingCapture = !captureDraft.isEmpty || !captureOutbox.isEmpty
+            let canAdoptUnboundCapture = credentials == nil && capturePairingIdentity == nil
+            let canCarrySameMacPairing = credentials?.fingerprint == paired.fingerprint
+                && capturePairingIdentity == paired.fingerprint
+            let retainedCapture: (draft: String, outbox: [CaptureOutboxEntry])? =
+                hasPendingCapture && (canAdoptUnboundCapture || canCarrySameMacPairing)
+                    ? (captureDraft, captureOutbox)
+                    : nil
             resetWorkspaceState()
             credentials = paired
+            if let retainedCapture {
+                capturePairingIdentity = paired.fingerprint
+                captureDraft = retainedCapture.draft
+                captureOutbox = retainedCapture.outbox
+                pendingCaptureCount = retainedCapture.outbox.count
+                _ = persistLocalState()
+            }
             status = paired.scope == .workspace
                 ? "Paired. Your Workspace is available while this Mac is awake on the same Wi-Fi."
                 : "Paired for Health. Keep both devices on the same Wi-Fi."
             do {
                 try await negotiateCapabilities(using: BridgeClient(paired))
                 if hasWorkspaceAccess {
-                    await loadWorkspaceAreas()
+                    await loadWorkspaceAreas(force: true)
+                    await flushCaptureOutbox(forceAttempt: true)
                 }
             } catch {
                 record(error, area: .pairing)
+                markConnectionFailure(error)
             }
         } catch {
             record(error, area: .pairing)
+            markConnectionFailure(error)
         }
     }
 
@@ -158,6 +713,7 @@ final class WorkspaceStore: ObservableObject {
         pairingEpoch += 1
         resetWorkspaceState()
         credentials = newCredentials
+        connectionState = newCredentials == nil ? .unpaired : .connecting
         status = newCredentials == nil ? "Pair with your Mac to begin." : "Ready to connect to your Mac."
     }
 
@@ -179,6 +735,8 @@ final class WorkspaceStore: ObservableObject {
         BridgeKeychain.remove()
         credentials = nil
         resetWorkspaceState()
+        CompanionPersistence.removeSnapshot()
+        connectionState = .unpaired
         let revokingStatus = "This iPhone is unpaired locally. Asking the Mac to revoke its saved token…"
         postUnpairStatus = revokingStatus
         status = revokingStatus
@@ -186,6 +744,8 @@ final class WorkspaceStore: ObservableObject {
             BridgeKeychain.remove()
             credentials = nil
             resetWorkspaceState()
+            CompanionPersistence.removeSnapshot()
+            connectionState = .unpaired
             postUnpairStatus = completionStatus
             status = completionStatus
             unpairing = false
@@ -205,42 +765,67 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func loadInitial() async {
+        guard credentials != nil else {
+            connectionState = .unpaired
+            return
+        }
         guard begin(.pairing) else { return }
         defer { finish(.pairing) }
+        lastConnectionAttempt = Date()
+        if !hasCachedContent { connectionState = .connecting }
         guard let client = makeClient() else { return }
         do {
             try await negotiateCapabilities(using: client)
         } catch {
-            record(error, area: .pairing)
+            recordAutomaticSyncFailure(error, area: .pairing)
+            markConnectionFailure(error)
             return
         }
         guard hasWorkspaceAccess else { return }
-        await loadWorkspaceAreas()
+        await loadWorkspaceAreas(force: true)
+        await refreshIntegrationsIfNeeded()
+        await flushCaptureOutbox(forceAttempt: true)
     }
 
-    func refreshAll() async {
-        guard begin(.pairing) else { return }
+    @discardableResult
+    func refreshAll() async -> Bool {
+        guard credentials != nil else {
+            connectionState = .unpaired
+            return false
+        }
+        guard begin(.pairing) else { return false }
         defer { finish(.pairing) }
-        guard let client = makeClient() else { return }
+        lastConnectionAttempt = Date()
+        if !hasCachedContent { connectionState = .connecting }
+        guard let client = makeClient() else { return false }
         do {
             try await negotiateCapabilities(using: client)
         } catch {
-            record(error, area: .pairing)
-            return
+            recordAutomaticSyncFailure(error, area: .pairing)
+            markConnectionFailure(error)
+            return false
         }
-        guard hasWorkspaceAccess else {
-            record(BridgeError.message("Pair again with a Workspace pairing file to load these areas."), area: .pairing)
-            return
-        }
-        await loadWorkspaceAreas(force: true)
+        guard hasWorkspaceAccess else { return false }
+        let areasLoaded = await loadWorkspaceAreas(force: true)
+        let providersRefreshed = await refreshIntegrationsIfNeeded()
+        await flushCaptureOutbox(forceAttempt: true)
+        return areasLoaded
+            && providersRefreshed
+            && integrationProviderError == nil
+            && captureOutbox.isEmpty
     }
 
-    func load(_ area: WorkspaceArea, force: Bool = false) async {
-        guard area != .pairing else { return }
-        if !force, loadedAreas.contains(area) { return }
-        guard begin(area) else { return }
+    @discardableResult
+    func load(_ area: WorkspaceArea, force: Bool = false) async -> Bool {
+        guard area != .pairing else { return true }
+        // Health-only pairings use the dedicated Health sync endpoints. The
+        // companion-area routes below require a full Workspace token, so
+        // treating their absence as one error per tab only adds noise.
+        guard hasWorkspaceAccess else { return false }
+        if !force, loadedAreas.contains(area) { return true }
+        guard begin(area) else { return false }
         defer { finish(area) }
-        guard let client = makeClient() else { return }
+        guard let client = makeClient() else { return false }
         do {
             if area != .health || credentials?.scope == .workspace {
                 try await requireWorkspace(using: client)
@@ -263,12 +848,17 @@ final class WorkspaceStore: ObservableObject {
                 let view: PhoneHealthView = try await client.get("v1/health-view")
                 try acceptHealthView(view)
             case .pairing:
-                return
+                return true
             }
             loadedAreas.insert(area)
             clearRecordedError(area)
+            markConnectionSucceeded()
+            cacheCurrent(area)
+            return true
         } catch {
-            record(error, area: area)
+            recordAutomaticSyncFailure(error, area: area)
+            markConnectionFailureIfNeeded(error)
+            return false
         }
     }
 
@@ -282,66 +872,124 @@ final class WorkspaceStore: ObservableObject {
             integrations = try await client.send("v1/integrations/sync", input: request)
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
-            status = "Connected services refreshed."
+            markConnectionSucceeded()
+            cacheCurrent(.integrations)
+            status = integrationProviderError == nil
+                ? "Calendar and Todoist refreshed."
+                : "Refresh finished with a provider issue."
             return true
         } catch {
-            record(error, area: .integrations)
+            recordAutomaticSyncFailure(error, area: .integrations)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
 
     @discardableResult
-    func saveWorkspace(_ draft: WorkspaceState) async -> Bool {
-        guard allowWorkspaceMutation() else { return false }
-        return await persistWorkspace(draft)
+    func refreshIntegrationsIfNeeded(on date: String = WorkspaceFormat.dayKey()) async -> Bool {
+        let rangeCoversDate = integrations.range.map { $0.from <= date && date <= $0.to } == true
+        guard connectionState == .online else { return rangeCoversDate }
+        guard !rangeCoversDate || !connectedProvidersAreFresh else { return true }
+        return await refreshIntegrations(on: date)
     }
 
     @discardableResult
-    private func persistWorkspace(
-        _ draft: WorkspaceState,
-        change: WorkspaceItemChange? = nil
+    private func persistWorkspaceChange(
+        _ change: WorkspaceItemChange,
+        openingState: WorkspaceState
     ) async -> Bool {
+        let existing = openingState.items.first(where: { $0.id == change.itemId })
+        let expectedItemRevision: Int?
+        let commandChange: WorkspaceItemChange
+        switch change {
+        case .upsert(let item):
+            if existing != nil, existing?.revision == nil {
+                reportStaleRow("Workspace item", area: .workspace)
+                return false
+            }
+            expectedItemRevision = existing?.revision
+            if existing == nil,
+               item.revision != nil,
+               let tombstone = openingState.tombstones?.first(where: { $0.id == item.id }) {
+                commandChange = .restore(item: item, expectedTombstoneRevision: tombstone.revision)
+            } else {
+                commandChange = change
+            }
+        case .restore:
+            expectedItemRevision = nil
+            commandChange = change
+        case .remove, .toggle:
+            guard let revision = existing?.revision else {
+                reportStaleRow("Workspace item", area: .workspace)
+                return false
+            }
+            expectedItemRevision = revision
+            commandChange = change
+        }
+
         guard begin(.workspace) else { return false }
         defer { finish(.workspace) }
         guard let client = workspaceClient(area: .workspace) else { return false }
+
+        let attemptKey = commandChange.attemptKey
+        let command: WorkspaceRecordCommand
+        if let pending = workspaceRecordAttempts[attemptKey],
+           pending.expectedItemRevision == expectedItemRevision,
+           pending.change == commandChange {
+            command = pending
+        } else {
+            command = WorkspaceRecordCommand(
+                requestId: UUID().uuidString.lowercased(),
+                expectedItemRevision: expectedItemRevision,
+                change: commandChange
+            )
+            workspaceRecordAttempts[attemptKey] = command
+        }
+
         do {
-            workspace = try await client.send("v1/workspace", input: draft)
+            workspace = try await client.send("v1/workspace/command", input: command)
+            workspaceRecordAttempts.removeValue(forKey: attemptKey)
             workspaceConflict = nil
             workspaceConflictChange = nil
             loadedAreas.insert(.workspace)
             clearRecordedError(.workspace)
+            markConnectionSucceeded()
+            cacheCurrent(.workspace)
             status = "Workspace saved."
             return true
         } catch let bridge as BridgeError where bridge.statusCode == 409 {
-            let latest = try? await client.get("v1/workspace") as WorkspaceState
-            let revisionChanged = latest.map { $0.revision != draft.revision } ?? false
-            let isRevisionConflict: Bool
-            switch bridge.responseCode {
-            case "store_busy":
-                isRevisionConflict = false
-            case "revision_conflict":
-                isRevisionConflict = true
-            default:
-                // Older bridge builds did not always identify their 409s. Only
-                // those missing or unknown codes need revision-based inference.
-                isRevisionConflict = revisionChanged
+            let latest: WorkspaceState? = try? await client.get("v1/workspace")
+            if let latest {
+                workspace = latest
+                loadedAreas.insert(.workspace)
+                cacheCurrent(.workspace)
+                markConnectionSucceeded()
             }
+
+            if let latest, change.isSatisfied(by: latest) {
+                workspaceRecordAttempts.removeValue(forKey: attemptKey)
+                workspaceConflict = nil
+                workspaceConflictChange = nil
+                clearRecordedError(.workspace)
+                status = "Workspace saved."
+                return true
+            }
+
+            let isRevisionConflict = bridge.responseCode != "store_busy"
             if isRevisionConflict {
                 let savedLatest = latest ?? workspace
-                var retainedDraft = latest.flatMap { change?.applying(to: $0) } ?? draft
-                retainedDraft.revision = savedLatest.revision
+                let retainedDraft = change.applying(to: savedLatest)
                 workspace = savedLatest
+                cacheCurrent(.workspace)
                 workspaceConflict = RevisionConflict(draft: retainedDraft, latest: savedLatest, message: bridge.localizedDescription)
                 workspaceConflictChange = change
-            } else {
-                // The loopback store also uses 409 while its short write lock is held.
-                // Keep any earlier actionable conflict, but do not invent a new one.
-                if workspaceConflict == nil, let latest { workspace = latest }
+                workspaceRecordAttempts.removeValue(forKey: attemptKey)
             }
             record(bridge, area: .workspace)
             return false
         } catch {
             record(error, area: .workspace)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -353,8 +1001,7 @@ final class WorkspaceStore: ObservableObject {
         guard loadedAreas.contains(.workspace) else { return false }
         let change = WorkspaceItemChange.upsert(item)
         let base = openingState ?? workspace
-        let draft = change.applying(to: base)
-        return await persistWorkspace(draft, change: change)
+        return await persistWorkspaceChange(change, openingState: base)
     }
 
     @discardableResult
@@ -364,8 +1011,7 @@ final class WorkspaceStore: ObservableObject {
         guard loadedAreas.contains(.workspace) else { return false }
         let change = WorkspaceItemChange.remove(id)
         let base = openingState ?? workspace
-        let draft = change.applying(to: base)
-        return await persistWorkspace(draft, change: change)
+        return await persistWorkspaceChange(change, openingState: base)
     }
 
     @discardableResult
@@ -373,68 +1019,97 @@ final class WorkspaceStore: ObservableObject {
         guard allowWorkspaceMutation() else { return false }
         if !loadedAreas.contains(.workspace) { await load(.workspace) }
         guard loadedAreas.contains(.workspace),
-              let index = workspace.items.firstIndex(where: { $0.id == id }) else { return false }
+              let item = workspace.items.first(where: { $0.id == id }) else { return false }
         let base = workspace
-        let changed = base.items[index]
-        var toggled = changed
-        toggled.done.toggle()
-        return await upsertWorkspaceItem(toggled, openingState: base)
+        let change = WorkspaceItemChange.toggle(id: id, done: !item.done)
+        return await persistWorkspaceChange(change, openingState: base)
     }
 
     @discardableResult
     func retryWorkspaceConflict() async -> Bool {
-        guard let conflict = workspaceConflict else { return false }
-        var draft = workspaceConflictChange?.applying(to: conflict.latest) ?? conflict.draft
-        draft.revision = conflict.latest.revision
-        return await persistWorkspace(draft, change: workspaceConflictChange)
+        guard let conflict = workspaceConflict,
+              let change = workspaceConflictChange else { return false }
+        return await persistWorkspaceChange(change, openingState: conflict.latest)
     }
 
     func discardWorkspaceConflict() {
+        if let change = workspaceConflictChange {
+            workspaceRecordAttempts = workspaceRecordAttempts.filter { _, command in
+                command.change.itemId != change.itemId
+            }
+        }
         workspaceConflict = nil
         workspaceConflictChange = nil
     }
 
     @discardableResult
-    func saveClimbing(_ draft: ClimbingState) async -> Bool {
-        await persistClimbing(draft)
-    }
-
-    @discardableResult
-    private func persistClimbing(_ draft: ClimbingState) async -> Bool {
+    private func persistClimbingChanges(
+        _ changes: [ClimbingRecordChange]
+    ) async -> Bool {
+        guard !changes.isEmpty else { return true }
         guard begin(.climbing) else { return false }
         defer { finish(.climbing) }
         guard let client = workspaceClient(area: .climbing) else { return false }
+
+        let attemptKey = changes.map(\.recordKey).sorted().joined(separator: "|")
+        let command: ClimbingRecordCommand
+        if let pending = climbingRecordAttempts[attemptKey],
+           pending.changes.count == changes.count,
+           zip(pending.changes, changes).allSatisfy({ pair in
+               pair.0.isRetryEquivalent(to: pair.1)
+           }) {
+            command = pending
+        } else {
+            command = ClimbingRecordCommand(
+                requestId: UUID().uuidString.lowercased(),
+                changes: changes
+            )
+            climbingRecordAttempts[attemptKey] = command
+        }
+
         do {
-            climbing = try await client.send("v1/climbing", input: draft)
+            climbing = try await client.send("v1/climbing/command", input: command)
+            climbingRecordAttempts.removeValue(forKey: attemptKey)
             climbingConflict = nil
             loadedAreas.insert(.climbing)
             clearRecordedError(.climbing)
+            markConnectionSucceeded()
+            cacheCurrent(.climbing)
             status = "Climbing saved."
             return true
         } catch let bridge as BridgeError where bridge.statusCode == 409 {
-            let latest = try? await client.get("v1/climbing") as ClimbingState
-            let revisionChanged = latest.map { $0.revision != draft.revision } ?? false
-            let isRevisionConflict: Bool
-            switch bridge.responseCode {
-            case "store_busy":
-                isRevisionConflict = false
-            case "revision_conflict":
-                isRevisionConflict = true
-            default:
-                isRevisionConflict = revisionChanged
+            let latest: ClimbingState? = try? await client.get("v1/climbing")
+            if let latest {
+                climbing = latest
+                loadedAreas.insert(.climbing)
+                cacheCurrent(.climbing)
+                markConnectionSucceeded()
             }
+
+            if let latest, command.changes.allSatisfy({ $0.isSatisfied(by: latest) }) {
+                climbingRecordAttempts.removeValue(forKey: attemptKey)
+                climbingConflict = nil
+                clearRecordedError(.climbing)
+                status = "Climbing saved."
+                return true
+            }
+
+            let isRevisionConflict = bridge.responseCode != "store_busy"
             if isRevisionConflict {
                 let savedLatest = latest ?? climbing
+                let retainedDraft = command.changes.reduce(savedLatest) { result, change in
+                    change.applying(to: result)
+                }
                 climbing = savedLatest
-                climbingConflict = RevisionConflict(draft: draft, latest: savedLatest, message: bridge.localizedDescription)
-            } else if let latest {
-                // A transient 409 must not be presented as a revision conflict.
-                climbing = latest
+                cacheCurrent(.climbing)
+                climbingConflict = RevisionConflict(draft: retainedDraft, latest: savedLatest, message: bridge.localizedDescription)
+                climbingRecordAttempts.removeValue(forKey: attemptKey)
             }
             record(bridge, area: .climbing)
             return false
         } catch {
             record(error, area: .climbing)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -445,56 +1120,266 @@ final class WorkspaceStore: ObservableObject {
         openingState: ClimbingState,
         markLinkedPlanLogged: Bool
     ) async -> Bool {
-        var draft = openingState
-        if let index = draft.sessions.firstIndex(where: { $0.id == session.id }) {
-            draft.sessions[index] = session
-        } else {
-            draft.sessions.append(session)
-        }
+        let expectedSessionUpdate = openingState.sessions.first(where: { $0.id == session.id })?.updatedAt
+        var changes: [ClimbingRecordChange] = [
+            .session(expectedUpdatedAt: expectedSessionUpdate, value: session)
+        ]
         if markLinkedPlanLogged,
            let planId = session.planId,
-           let index = draft.plans.firstIndex(where: { $0.id == planId }) {
-            draft.plans[index].status = .logged
-            draft.plans[index].sessionId = session.id
-            draft.plans[index].updatedAt = session.updatedAt
+           var linkedPlan = openingState.plans.first(where: { $0.id == planId }) {
+            let expectedPlanUpdate = linkedPlan.updatedAt
+            linkedPlan.status = .logged
+            linkedPlan.sessionId = session.id
+            linkedPlan.updatedAt = session.updatedAt
+            changes.append(.plan(expectedUpdatedAt: expectedPlanUpdate, value: linkedPlan))
         }
-        return await persistClimbing(draft)
+        return await persistClimbingChanges(changes)
     }
 
     @discardableResult
     func upsertClimbingPlan(_ plan: ClimbingPlan, openingState: ClimbingState) async -> Bool {
-        var draft = openingState
-        if let index = draft.plans.firstIndex(where: { $0.id == plan.id }) {
-            draft.plans[index] = plan
-        } else {
-            draft.plans.append(plan)
-        }
-        return await persistClimbing(draft)
+        let expectedUpdate = openingState.plans.first(where: { $0.id == plan.id })?.updatedAt
+        return await persistClimbingChanges([.plan(expectedUpdatedAt: expectedUpdate, value: plan)])
     }
 
     @discardableResult
     func upsertClimbingGoal(_ goal: ClimbingGoal, openingState: ClimbingState) async -> Bool {
-        var draft = openingState
-        if let index = draft.goals.firstIndex(where: { $0.id == goal.id }) {
-            draft.goals[index] = goal
-        } else {
-            draft.goals.append(goal)
+        let expectedUpdate = openingState.goals.first(where: { $0.id == goal.id })?.updatedAt
+        return await persistClimbingChanges([.goal(expectedUpdatedAt: expectedUpdate, value: goal)])
+    }
+
+    @discardableResult
+    func addClimbingGoalLink(_ reference: ClimbingGoalReference) async -> Bool {
+        guard reference.kind == .link,
+              validMediaIdentifier(reference.id),
+              validMediaIdentifier(reference.goalId),
+              validMediaText(reference.label, maxUTF16Units: 160),
+              validMediaText(reference.url, maxUTF16Units: 2_048) else {
+            record(BridgeError.message("Enter a valid goal reference."), area: .climbing)
+            return false
         }
-        return await persistClimbing(draft)
+        guard climbing.goalReferences.filter({ $0.goalId == reference.goalId }).count < 12 else {
+            record(BridgeError.message("This goal already has 12 references. Remove one before adding another."), area: .climbing)
+            return false
+        }
+        guard climbingConflict == nil else {
+            record(BridgeError.message("Resolve the saved Climbing conflict before adding a reference."), area: .climbing)
+            return false
+        }
+        guard begin(.climbing) else { return false }
+        defer { finish(.climbing) }
+        guard let client = workspaceClient(area: .climbing) else { return false }
+
+        let command = ClimbingMediaLinkCommand(
+            requestId: UUID().uuidString.lowercased(),
+            reference: reference
+        )
+        do {
+            let latest: ClimbingState = try await client.send("v1/climbing/media/link", input: command)
+            applyClimbingMediaResult(latest, status: "Reference added.")
+            return true
+        } catch {
+            if await reconcileClimbingMedia(using: client, referenceId: reference.id, shouldExist: true) {
+                status = "Reference added."
+                return true
+            }
+            record(error, area: .climbing)
+            markConnectionFailureIfNeeded(error)
+            return false
+        }
+    }
+
+    @discardableResult
+    func uploadClimbingGoalMedia(
+        goalId: String,
+        referenceId: String,
+        requestId: String,
+        label: String,
+        fileName: String,
+        contentType: String,
+        file: URL
+    ) async -> Bool {
+        guard validMediaIdentifier(goalId),
+              validMediaIdentifier(referenceId),
+              validMediaIdentifier(requestId),
+              validMediaText(label, maxUTF16Units: 160),
+              validMediaText(fileName, maxUTF16Units: 240),
+              contentType == "application/octet-stream"
+                || contentType.hasPrefix("image/")
+                || contentType.hasPrefix("video/") else {
+            record(BridgeError.message("The selected goal attachment is invalid."), area: .climbing)
+            return false
+        }
+        guard climbing.goalReferences.filter({ $0.goalId == goalId }).count < 12 else {
+            record(BridgeError.message("This goal already has 12 references. Remove one before adding another."), area: .climbing)
+            return false
+        }
+        guard climbingConflict == nil else {
+            record(BridgeError.message("Resolve the saved Climbing conflict before adding an attachment."), area: .climbing)
+            return false
+        }
+        do {
+            let values = try file.resourceValues(forKeys: [.fileSizeKey])
+            guard let byteCount = values.fileSize,
+                  byteCount > 0,
+                  byteCount <= BridgeClient.maximumMediaBytes else {
+                throw BridgeError.message("Choose a photo or video smaller than 200 MB.")
+            }
+        } catch {
+            record(error, area: .climbing)
+            return false
+        }
+        guard begin(.climbing) else { return false }
+        defer { finish(.climbing) }
+        guard let client = workspaceClient(area: .climbing) else { return false }
+
+        let headers = [
+            "X-Workspace-Request-Id": requestId,
+            "X-Workspace-Reference-Id": referenceId,
+            "X-Workspace-Goal-Id": goalId,
+            "X-Workspace-File-Name": encodeURIComponent(fileName),
+            "X-Workspace-Label": encodeURIComponent(label),
+        ]
+        do {
+            let latest: ClimbingState = try await client.upload(
+                "v1/climbing/media/upload",
+                file: file,
+                contentType: contentType,
+                headers: headers
+            )
+            applyClimbingMediaResult(latest, status: "Attachment added.")
+            return true
+        } catch {
+            if Task.isCancelled || bridgeOperationWasCancelled(error) { return false }
+            if await reconcileClimbingMedia(using: client, referenceId: referenceId, shouldExist: true) {
+                status = "Attachment added."
+                return true
+            }
+            record(error, area: .climbing)
+            markConnectionFailureIfNeeded(error)
+            return false
+        }
+    }
+
+    @discardableResult
+    func deleteClimbingGoalReference(_ reference: ClimbingGoalReference) async -> Bool {
+        guard validMediaIdentifier(reference.id), validMediaIdentifier(reference.goalId) else {
+            record(BridgeError.message("This goal reference is invalid."), area: .climbing)
+            return false
+        }
+        guard climbingConflict == nil else {
+            record(BridgeError.message("Resolve the saved Climbing conflict before removing a reference."), area: .climbing)
+            return false
+        }
+        guard begin(.climbing) else { return false }
+        defer { finish(.climbing) }
+        guard let client = workspaceClient(area: .climbing) else { return false }
+
+        let command = ClimbingMediaDeleteCommand(
+            requestId: UUID().uuidString.lowercased(),
+            goalId: reference.goalId,
+            referenceId: reference.id
+        )
+        do {
+            let latest: ClimbingState = try await client.send("v1/climbing/media/delete", input: command)
+            applyClimbingMediaResult(latest, status: "Reference removed.")
+            return true
+        } catch {
+            if await reconcileClimbingMedia(using: client, referenceId: reference.id, shouldExist: false) {
+                status = "Reference removed."
+                return true
+            }
+            record(error, area: .climbing)
+            markConnectionFailureIfNeeded(error)
+            return false
+        }
+    }
+
+    func downloadClimbingGoalReference(_ reference: ClimbingGoalReference) async -> URL? {
+        guard reference.kind != .link,
+              validMediaIdentifier(reference.id),
+              validMediaIdentifier(reference.goalId) else {
+            record(BridgeError.message("This goal attachment is invalid."), area: .climbing)
+            return nil
+        }
+        guard !unpairing else { return nil }
+        let expectedEpoch = pairingEpoch
+        guard let client = workspaceClient(area: .climbing) else { return nil }
+
+        let displayFileExtension = reference.fileName.flatMap { name in
+            let value = URL(fileURLWithPath: name).pathExtension
+            return validMediaText(value) ? value : nil
+        }
+        let fileExtension = reference.mimeType.flatMap { UTType(mimeType: $0)?.preferredFilenameExtension }
+            ?? displayFileExtension
+        do {
+            let file = try await client.download(
+                "v1/climbing/media/\(reference.id)",
+                fileExtension: fileExtension
+            )
+            guard expectedEpoch == pairingEpoch, credentials != nil, !Task.isCancelled else {
+                try? FileManager.default.removeItem(at: file)
+                return nil
+            }
+            clearRecordedError(.climbing)
+            markConnectionSucceeded()
+            return file
+        } catch {
+            if Task.isCancelled || bridgeOperationWasCancelled(error) { return nil }
+            record(error, area: .climbing)
+            markConnectionFailureIfNeeded(error)
+            return nil
+        }
     }
 
     @discardableResult
     func upsertClimbingRoutine(_ routine: ClimbingRoutine, openingState: ClimbingState) async -> Bool {
-        var draft = openingState
-        if let index = draft.routines.firstIndex(where: { $0.id == routine.id }) {
-            draft.routines[index] = routine
-        } else {
-            draft.routines.append(routine)
-        }
-        return await persistClimbing(draft)
+        let expectedUpdate = openingState.routines.first(where: { $0.id == routine.id })?.updatedAt
+        return await persistClimbingChanges([.routine(expectedUpdatedAt: expectedUpdate, value: routine)])
     }
 
     func discardClimbingConflict() { climbingConflict = nil }
+
+    private func validMediaIdentifier(_ value: String) -> Bool {
+        UUID(uuidString: value) != nil
+    }
+
+    private func validMediaText(_ value: String?, maxUTF16Units: Int? = nil) -> Bool {
+        guard let value,
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return maxUTF16Units.map { value.utf16.count <= $0 } ?? true
+    }
+
+    private func bridgeOperationWasCancelled(_ error: Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
+    }
+
+    private func encodeURIComponent(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-_.!~*'()")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+    }
+
+    private func applyClimbingMediaResult(_ latest: ClimbingState, status message: String) {
+        climbing = latest
+        loadedAreas.insert(.climbing)
+        clearRecordedError(.climbing)
+        markConnectionSucceeded()
+        cacheCurrent(.climbing)
+        status = message
+    }
+
+    private func reconcileClimbingMedia(
+        using client: BridgeClient,
+        referenceId: String,
+        shouldExist: Bool
+    ) async -> Bool {
+        guard let latest: ClimbingState = try? await client.get("v1/climbing") else { return false }
+        let exists = latest.goalReferences.contains { $0.id == referenceId }
+        guard exists == shouldExist else { return false }
+        applyClimbingMediaResult(latest, status: shouldExist ? "Reference added." : "Reference removed.")
+        return true
+    }
 
     @discardableResult
     func saveChessProgress(_ request: ChessProgressRequest) async -> Bool {
@@ -507,6 +1392,8 @@ final class WorkspaceStore: ObservableObject {
             chess = response.view
             loadedAreas.insert(.chess)
             clearRecordedError(.chess)
+            markConnectionSucceeded()
+            cacheCurrent(.chess)
             status = "Chess progress saved."
             return true
         } catch let bridge as BridgeError {
@@ -515,12 +1402,15 @@ final class WorkspaceStore: ObservableObject {
                let latest = try? await client.get("v1/chess") as ChessView {
                 chess = latest
                 loadedAreas.insert(.chess)
+                cacheCurrent(.chess)
                 chessProgressNeedsRebase = true
             }
             record(bridge, area: .chess)
+            markConnectionFailureIfNeeded(bridge)
             return false
         } catch {
             record(error, area: .chess)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -536,6 +1426,8 @@ final class WorkspaceStore: ObservableObject {
             chess = response.view
             loadedAreas.insert(.chess)
             clearRecordedError(.chess)
+            markConnectionSucceeded()
+            cacheCurrent(.chess)
             status = response.result.grade == .good ? "Chess review complete." : "Chess review saved for another look."
             return response.result
         } catch let bridge as BridgeError {
@@ -543,6 +1435,7 @@ final class WorkspaceStore: ObservableObject {
                 if let latest = try? await client.get("v1/chess") as ChessView {
                     chess = latest
                     loadedAreas.insert(.chess)
+                    cacheCurrent(.chess)
                 }
                 chessReviewNoLongerDue = true
             } else if let status = bridge.statusCode,
@@ -555,12 +1448,15 @@ final class WorkspaceStore: ObservableObject {
                    let latest = try? await client.get("v1/chess") as ChessView {
                     chess = latest
                     loadedAreas.insert(.chess)
+                    cacheCurrent(.chess)
                 }
             }
             record(bridge, area: .chess)
+            markConnectionFailureIfNeeded(bridge)
             return nil
         } catch {
             record(error, area: .chess)
+            markConnectionFailureIfNeeded(error)
             return nil
         }
     }
@@ -575,6 +1471,8 @@ final class WorkspaceStore: ObservableObject {
             chess = response.view
             loadedAreas.insert(.chess)
             clearRecordedError(.chess)
+            markConnectionSucceeded()
+            cacheCurrent(.chess)
             status = "Chess study session saved."
             return response.session
         } catch let bridge as BridgeError {
@@ -583,12 +1481,15 @@ final class WorkspaceStore: ObservableObject {
                let latest = try? await client.get("v1/chess") as ChessView {
                 chess = latest
                 loadedAreas.insert(.chess)
+                cacheCurrent(.chess)
                 chessSessionNeedsRebase = true
             }
             record(bridge, area: .chess)
+            markConnectionFailureIfNeeded(bridge)
             return nil
         } catch {
             record(error, area: .chess)
+            markConnectionFailureIfNeeded(error)
             return nil
         }
     }
@@ -616,7 +1517,7 @@ final class WorkspaceStore: ObservableObject {
 
     func reportStaleRow(_ noun: String, area: WorkspaceArea) {
         record(
-            BridgeError.message("This \(noun) changed or was removed on your Mac. Refresh and try again."),
+            BridgeError.message("This \(noun) changed or was removed on your Mac. Refresh from Settings, then try again."),
             area: area
         )
     }
@@ -695,10 +1596,13 @@ final class WorkspaceStore: ObservableObject {
             integrations = try await client.send("v1/integrations/mutate", input: request)
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
+            markConnectionSucceeded()
+            cacheCurrent(.integrations)
             status = mutation.provider == .google ? "Calendar updated." : "Todoist updated."
             return true
         } catch {
             record(error, area: .integrations)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -712,6 +1616,8 @@ final class WorkspaceStore: ObservableObject {
             integrations = try await client.send("v1/integrations/gmail/mutate", input: mutation)
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
+            markConnectionSucceeded()
+            cacheCurrent(.integrations)
             switch mutation.action {
             case .read: status = "Message marked read."
             case .unread: status = "Message marked unread."
@@ -723,6 +1629,7 @@ final class WorkspaceStore: ObservableObject {
             return true
         } catch {
             record(error, area: .integrations)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -736,10 +1643,13 @@ final class WorkspaceStore: ObservableObject {
             integrations = try await client.send("v1/integrations/gmail/send", input: message)
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
+            markConnectionSucceeded()
+            cacheCurrent(.integrations)
             status = message.replyToId == nil ? "Email sent." : "Reply sent."
             return true
         } catch {
             record(error, area: .integrations)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -753,10 +1663,13 @@ final class WorkspaceStore: ObservableObject {
             integrations = try await client.send("v1/integrations/unlink", input: IntegrationUnlinkRequest(id: id))
             loadedAreas.insert(.integrations)
             clearRecordedError(.integrations)
+            markConnectionSucceeded()
+            cacheCurrent(.integrations)
             status = "The local connection link was forgotten."
             return true
         } catch {
             record(error, area: .integrations)
+            markConnectionFailureIfNeeded(error)
             return false
         }
     }
@@ -774,47 +1687,71 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func syncHealth() async {
-        guard begin(.health) else { return }
+    @discardableResult
+    func syncHealth() async -> Bool {
+        guard begin(.health) else { return false }
         defer { finish(.health) }
-        guard let credentials, let client = makeClient() else { return }
         do {
             health.refreshCalendar()
             let snapshot = try await health.snapshot()
-            let _: SavedBridgeResponse = try await client.call("snapshot", body: bridgeEncoder().encode(snapshot))
             healthSnapshot = snapshot
-
-            let calendar = health.calendar
-            let today = calendar.startOfDay(for: Date())
-            let from = calendar.date(byAdding: .day, value: -29, to: today)!
-            let to = calendar.date(byAdding: .day, value: 1, to: today)!
-            let batch = try await health.sleepBatch(from: from, to: to)
-            let _: SavedBridgeResponse = try await client.call("sleep-batch", body: bridgeEncoder().encode(batch))
-            sleepStatus = "Recent sleep stages and daily context synced."
-
-            let pending: WeightCommandsResponse = try await client.get("commands")
-            var review: [WeightCommand] = []
-            for command in pending.commands {
-                if let receipt = credentials.receipts[command.id] {
-                    guard receipt == command.payloadHash else {
-                        throw BridgeError.message("A health request changed after it was saved. Check the Mac’s health queue.")
-                    }
-                    let body = try JSONSerialization.data(withJSONObject: ["id": command.id, "payloadHash": receipt])
-                    let _: SavedBridgeResponse = try await client.call("receipt", body: body)
-                } else {
-                    review.append(command)
-                }
-            }
-            commands = review
             dayCount = snapshot.days.count
-            if hasWorkspaceAccess, let view: PhoneHealthView = try? await client.get("v1/health-view") {
-                try acceptHealthView(view)
-                loadedAreas.insert(.health)
+            status = "Health summary updated on this iPhone."
+
+            guard let credentials else {
+                clearRecordedError(.health)
+                status = "Health summary updated on this iPhone. Pair with your Mac to sync it."
+                return true
             }
-            clearRecordedError(.health)
-            status = "Synced at \(Date().formatted(date: .omitted, time: .shortened))."
+            guard connectionState == .online else {
+                clearRecordedError(.health)
+                status = "Health summary updated on this iPhone. It will sync when your Mac is available."
+                return false
+            }
+            guard let client = makeClient() else { return false }
+
+            do {
+                let _: SavedBridgeResponse = try await client.call("snapshot", body: bridgeEncoder().encode(snapshot))
+
+                let calendar = health.calendar
+                let today = calendar.startOfDay(for: Date())
+                let from = calendar.date(byAdding: .day, value: -29, to: today)!
+                let to = calendar.date(byAdding: .day, value: 1, to: today)!
+                let batch = try await health.sleepBatch(from: from, to: to)
+                let _: SavedBridgeResponse = try await client.call("sleep-batch", body: bridgeEncoder().encode(batch))
+                sleepStatus = "Recent sleep stages and daily context synced."
+
+                let pending: WeightCommandsResponse = try await client.get("commands")
+                var review: [WeightCommand] = []
+                for command in pending.commands {
+                    if let receipt = credentials.receipts[command.id] {
+                        guard receipt == command.payloadHash else {
+                            throw BridgeError.message("A health request changed after it was saved. Check the Mac’s health queue.")
+                        }
+                        let body = try JSONSerialization.data(withJSONObject: ["id": command.id, "payloadHash": receipt])
+                        let _: SavedBridgeResponse = try await client.call("receipt", body: body)
+                    } else {
+                        review.append(command)
+                    }
+                }
+                commands = review
+                if hasWorkspaceAccess, let view: PhoneHealthView = try? await client.get("v1/health-view") {
+                    try acceptHealthView(view)
+                    loadedAreas.insert(.health)
+                }
+                clearRecordedError(.health)
+                markConnectionSucceeded()
+                status = "Synced at \(Date().formatted(date: .omitted, time: .shortened))."
+                return true
+            } catch {
+                recordAutomaticSyncFailure(error, area: .health)
+                markConnectionFailureIfNeeded(error)
+                status = "Health summary updated on this iPhone. Mac sync will retry when reachable."
+                return false
+            }
         } catch {
             record(error, area: .health)
+            return false
         }
     }
 
@@ -880,7 +1817,7 @@ final class WorkspaceStore: ObservableObject {
 
     // Compatibility with the original Health-only view while the native shell is adopted.
     func authorize() async { await authorizeHealth() }
-    func sync() async { await syncHealth() }
+    func sync() async { _ = await syncHealth() }
     func importHistory(from date: Date) async { await importHealthHistory(from: date) }
     func save(_ command: WeightCommand) async { await confirmWeight(command) }
 
@@ -904,6 +1841,112 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    private func removeCaptureOutboxEntry(_ requestId: String) {
+        captureOutbox.removeAll { $0.requestId == requestId }
+        pendingCaptureCount = captureOutbox.count
+        _ = persistLocalState()
+    }
+
+    private func prepareCaptureIdentity() {
+        let currentIdentity = credentials?.fingerprint
+        guard capturePairingIdentity != currentIdentity else { return }
+        clearCaptureState()
+        capturePairingIdentity = currentIdentity
+    }
+
+    private func clearCaptureState() {
+        localStateSaveTask?.cancel()
+        localStateSaveTask = nil
+        capturePairingIdentity = nil
+        captureDraft = ""
+        captureOutbox = []
+        pendingCaptureCount = 0
+        CompanionPersistence.removeLocalState()
+    }
+
+    @discardableResult
+    private func persistLocalState() -> Bool {
+        prepareCaptureIdentity()
+        let value = CompanionLocalState(
+            pairingIdentity: capturePairingIdentity,
+            captureDraft: captureDraft,
+            captureOutbox: captureOutbox
+        )
+        do {
+            try CompanionPersistence.saveLocalState(value)
+            if areaErrors[.workspace] == capturePersistenceError {
+                areaErrors.removeValue(forKey: .workspace)
+            }
+            return true
+        } catch {
+            record(
+                BridgeError.message(capturePersistenceError),
+                area: .workspace
+            )
+            return false
+        }
+    }
+
+    private func cacheCurrent(_ area: WorkspaceArea) {
+        switch area {
+        case .workspace:
+            snapshotCache.workspace = workspace
+        case .climbing:
+            snapshotCache.climbing = climbing
+        case .chess:
+            snapshotCache.chess = chess
+        case .integrations:
+            snapshotCache.integrations = companionPlanningSnapshot(integrations)
+        case .health, .finance, .writing, .pairing:
+            return
+        }
+        let now = Date()
+        snapshotCache.savedAt = now
+        snapshotCache.areaSavedAt[area.rawValue] = now
+        try? CompanionPersistence.saveSnapshot(snapshotCache)
+    }
+
+    private func markConnectionSucceeded() {
+        let now = Date()
+        connectionState = .online
+        lastSuccessfulContact = now
+        snapshotCache.lastSuccessfulContact = now
+        snapshotCache.savedAt = now
+        try? CompanionPersistence.saveSnapshot(snapshotCache)
+    }
+
+    private func markConnectionFailure(_ cause: Error) {
+        if let bridge = cause as? BridgeError,
+           let status = bridge.statusCode,
+           status == 401 || status == 403 {
+            connectionState = .error(cause.localizedDescription)
+        } else if isExpectedMacAbsence(cause), hasCachedContent || healthSnapshot != nil {
+            connectionState = .offlineWithCache
+        } else {
+            connectionState = .error(cause.localizedDescription)
+        }
+    }
+
+    private func markConnectionFailureIfNeeded(_ cause: Error) {
+        if cause is URLError {
+            markConnectionFailure(cause)
+            return
+        }
+        if let bridge = cause as? BridgeError,
+           let status = bridge.statusCode,
+           status == 401 || status == 403 || status >= 500 {
+            markConnectionFailure(cause)
+        }
+    }
+
+    private func timestampDate(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
+
     private func makeClient() -> BridgeClient? {
         guard let credentials else {
             record(BridgeError.message("Pair this iPhone with your Mac first."), area: .pairing)
@@ -913,6 +1956,7 @@ final class WorkspaceStore: ObservableObject {
             return try BridgeClient(credentials)
         } catch {
             record(error, area: .pairing)
+            connectionState = .error(error.localizedDescription)
             return nil
         }
     }
@@ -921,6 +1965,13 @@ final class WorkspaceStore: ObservableObject {
         guard let client = makeClient() else { return nil }
         guard hasWorkspaceAccess else {
             record(BridgeError.message("Pair again with a Workspace pairing file to use this area."), area: area)
+            return nil
+        }
+        guard connectionState == .online else {
+            record(
+                BridgeError.message("Sync with your Mac from Settings before making this change."),
+                area: area
+            )
             return nil
         }
         return client
@@ -938,6 +1989,7 @@ final class WorkspaceStore: ObservableObject {
             self.credentials = credentials
         }
         clearRecordedError(.pairing)
+        markConnectionSucceeded()
     }
 
     private func requireWorkspace(using client: BridgeClient) async throws {
@@ -967,10 +2019,41 @@ final class WorkspaceStore: ObservableObject {
         areaErrors[area] = message
     }
 
-    private func loadWorkspaceAreas(force: Bool = false) async {
-        for area in [WorkspaceArea.workspace, .climbing, .chess, .finance, .writing, .integrations, .health] {
-            await load(area, force: force)
+    private func recordAutomaticSyncFailure(_ cause: Error, area: WorkspaceArea) {
+        guard !isExpectedMacAbsence(cause) || (!hasCachedContent && healthSnapshot == nil) else {
+            return
         }
+        record(cause, area: area)
+    }
+
+    private func isExpectedMacAbsence(_ cause: Error) -> Bool {
+        let error = cause as NSError
+        guard error.domain == NSURLErrorDomain else { return false }
+        switch URLError.Code(rawValue: error.code) {
+        case .timedOut,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .networkConnectionLost,
+             .dnsLookupFailed,
+             .notConnectedToInternet,
+             .internationalRoamingOff,
+             .callIsActive,
+             .dataNotAllowed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    @discardableResult
+    private func loadWorkspaceAreas(force: Bool = false) async -> Bool {
+        var loadedEveryArea = true
+        for area in [WorkspaceArea.workspace, .climbing, .chess, .integrations, .health] {
+            if !(await load(area, force: force)) {
+                loadedEveryArea = false
+            }
+        }
+        return loadedEveryArea
     }
 
     private func acceptHealthView(_ view: PhoneHealthView) throws {
@@ -989,6 +2072,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func resetWorkspaceState() {
+        clearCaptureState()
         capabilities = nil
         workspace = .empty
         climbing = .empty
@@ -998,6 +2082,9 @@ final class WorkspaceStore: ObservableObject {
         integrations = .empty
         healthView = nil
         healthSnapshot = nil
+        snapshotCache = CompanionSnapshotCache()
+        lastSuccessfulContact = nil
+        CompanionPersistence.removeSnapshot()
         commands = []
         dayCount = 0
         sleepStatus = "Sleep history has not been imported in this session."
@@ -1005,6 +2092,8 @@ final class WorkspaceStore: ObservableObject {
         workspaceConflict = nil
         workspaceConflictChange = nil
         climbingConflict = nil
+        workspaceRecordAttempts = [:]
+        climbingRecordAttempts = [:]
         chessProgressNeedsRebase = false
         chessReviewCanChangeAnswer = false
         chessReviewNoLongerDue = false

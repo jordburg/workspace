@@ -2,22 +2,51 @@ import { z } from "zod";
 import { daySchema } from "../workspace.ts";
 
 export type Provider = "todoist" | "google";
+export type SyncProvider = Provider | "gmail";
 export type LifeArea = "personal" | "independent";
 export type Source = { id: string; name: string; area: LifeArea; blocked: boolean; parentId?: string };
 export type RemoteTask = { id: string; sourceId: string; sourceName: string; title: string; area: LifeArea; dueDate: string | null; dueTime: string | null; deadline: string | null; recurring: boolean; priority: number; version: string; parentId: string | null; url: string };
+export type TodoistTaskGroup = "overdue" | "today" | "deadlines" | "upcoming" | "no-date";
+export function todoistAttentionDate(task:Pick<RemoteTask,"dueDate"|"deadline">):string|null {
+  return [task.dueDate,task.deadline].filter((value):value is string=>!!value).sort()[0]??null;
+}
+export function todoistTaskGroup(task:RemoteTask,today:string):TodoistTaskGroup {
+  const attentionDate=todoistAttentionDate(task);
+  if(attentionDate&&attentionDate<today)return "overdue";
+  if(attentionDate===today)return "today";
+  if(task.deadline&&(!task.dueDate||task.deadline<task.dueDate))return "deadlines";
+  if(task.dueDate)return "upcoming";
+  return "no-date";
+}
 export type RemoteEvent = { id: string; sourceId: string; sourceName: string; title: string; area: LifeArea; startDate: string; endDate: string; startTime: string | null; endTime: string | null; allDay: boolean; version: string; editable: boolean; recurring: boolean; url: string; location: string };
 export type RemoteMail = { id: string; threadId: string; from: string; replyTo: string; subject: string; snippet: string; receivedAt: string; unread: boolean; starred: boolean; important: boolean; version: string; url: string };
 export type Selection = { id: string; area: LifeArea };
 export type ProviderState = { connected: boolean; configured: boolean; sources: Source[]; selected: Selection[]; lastSynced: string | null; error: string | null };
-export type GmailState = ProviderState & { account: string | null; unreadCount: number };
-export const integrationLinkSchema = z.object({
-  id: z.string().uuid(), entityKind: z.enum(["goal", "plan"]), entityId: z.string().uuid(), role: z.enum(["goal-next-step", "scheduled-session"]),
-  provider: z.enum(["todoist", "google"]), remoteId: z.string().min(1).max(500), requestId: z.string().uuid(), createdAt: z.string().datetime({ offset: true }),
-}).strict().superRefine((link, ctx) => {
-  const goalTask = link.entityKind === "goal" && link.role === "goal-next-step" && link.provider === "todoist";
-  const scheduledSession = link.entityKind === "plan" && link.role === "scheduled-session" && link.provider === "google";
-  if (!goalTask && !scheduledSession) ctx.addIssue({ code: "custom", message: "Choose the provider and role that match this linked Workspace item." });
-});
+const relationFields = {
+  id: z.string().uuid(),
+  remoteId: z.string().min(1).max(500),
+  requestId: z.string().uuid(),
+  createdAt: z.string().datetime({ offset: true }),
+};
+export const integrationRelationTargetSchema = z.discriminatedUnion("entityKind", [
+  z.object({ entityKind: z.literal("goal"), entityId: z.string().uuid(), role: z.literal("goal-next-step") }).strict(),
+  z.object({ entityKind: z.literal("plan"), entityId: z.string().uuid(), role: z.literal("scheduled-session") }).strict(),
+  z.object({ entityKind: z.literal("gmail-message"), entityId: z.string().min(1).max(500), role: z.enum(["follow-up-task", "time-block"]) }).strict(),
+]);
+export const integrationLinkSchema = z.discriminatedUnion("entityKind", [
+  z.object({ ...relationFields, entityKind: z.literal("goal"), entityId: z.string().uuid(), role: z.literal("goal-next-step"), provider: z.literal("todoist") }).strict(),
+  z.object({ ...relationFields, entityKind: z.literal("plan"), entityId: z.string().uuid(), role: z.literal("scheduled-session"), provider: z.literal("google") }).strict(),
+]);
+export const gmailRelationSchema = z.discriminatedUnion("role", [
+  z.object({ ...relationFields, entityKind: z.literal("gmail-message"), entityId: z.string().min(1).max(500), role: z.literal("follow-up-task"), provider: z.literal("todoist") }).strict(),
+  z.object({ ...relationFields, entityKind: z.literal("gmail-message"), entityId: z.string().min(1).max(500), role: z.literal("time-block"), provider: z.literal("google") }).strict(),
+]);
+export const workspaceRelationRequestSchema = z.object({
+  entityKind: z.literal("capture"), entityId: z.string().uuid(), role: z.literal("capture-derived-priority"),
+  targetKind: z.literal("priority"), targetId: z.string().uuid(), requestId: z.string().uuid(),
+}).strict();
+export const workspaceRelationSchema = workspaceRelationRequestSchema.extend({id:z.string().uuid(),createdAt:z.string().datetime({offset:true})}).strict();
+export const integrationRelationSchema = z.union([integrationLinkSchema, gmailRelationSchema, workspaceRelationSchema]);
 export const integrationLinksSchema = z.array(integrationLinkSchema).max(10000).superRefine((links, ctx) => {
   if (new Set(links.map(link => link.id)).size !== links.length) ctx.addIssue({ code: "custom", message: "Integration link IDs must be unique." });
   if (new Set(links.map(link => link.requestId)).size !== links.length) ctx.addIssue({ code: "custom", message: "Each integration request can create only one link." });
@@ -27,13 +56,26 @@ export const integrationLinksSchema = z.array(integrationLinkSchema).max(10000).
   if (new Set(scheduledPlans).size !== scheduledPlans.length) ctx.addIssue({ code: "custom", message: "A climbing plan can link to only one Calendar event." });
 });
 export type IntegrationLink = z.infer<typeof integrationLinkSchema>;
-export type SyncView = { todoist: ProviderState; google: ProviderState; gmail: GmailState; tasks: RemoteTask[]; events: RemoteEvent[]; messages: RemoteMail[]; links: IntegrationLink[]; range: { from: string; to: string; timeZone: string } | null };
+export type GmailRelation = z.infer<typeof gmailRelationSchema>;
+export type WorkspaceRelation = z.infer<typeof workspaceRelationSchema>;
+export type IntegrationRelation = z.infer<typeof integrationRelationSchema>;
+export const integrationRelationsSchema = z.array(integrationRelationSchema).max(10000).superRefine((relations, ctx) => {
+  if (new Set(relations.map(relation => relation.id)).size !== relations.length) ctx.addIssue({ code: "custom", message: "Integration relation IDs must be unique." });
+  if (new Set(relations.map(relation => relation.requestId)).size !== relations.length) ctx.addIssue({ code: "custom", message: "Each integration request can create only one relation." });
+  const identities = relations.map(relation => `${relation.entityKind}\u0000${relation.entityId}\u0000${relation.role}`);
+  if (new Set(identities).size !== identities.length) ctx.addIssue({ code: "custom", message: "A Workspace item can have only one current relation for each integration role." });
+  const derivedPriorities = relations.filter(relation => relation.entityKind === "capture").map(relation => relation.targetId);
+  if (new Set(derivedPriorities).size !== derivedPriorities.length) ctx.addIssue({ code: "custom", message: "A priority can be derived from only one capture." });
+});
+export const gmailRelationsSchema = z.array(gmailRelationSchema).max(10000);
+export type GmailState = ProviderState & { account: string | null; unreadCount: number; relations: GmailRelation[] };
+export type SyncView = { todoist: ProviderState; google: ProviderState; gmail: GmailState; tasks: RemoteTask[]; events: RemoteEvent[]; messages: RemoteMail[]; links: IntegrationLink[]; workspaceRelations: WorkspaceRelation[]; range: { from: string; to: string; timeZone: string } | null };
 export const selectionSchema = z.array(z.object({ id: z.string().min(1).max(500), area: z.enum(["personal", "independent"]) }).strict()).max(100).refine(items => new Set(items.map(i => i.id)).size === items.length, "Choose each source only once");
 export const syncRequestSchema = z.object({ date: daySchema, timeZone: z.string().min(1).max(100).refine(zone => { try { new Intl.DateTimeFormat("en", {timeZone: zone}); return true; } catch { return false; } }, "Invalid time zone") }).strict();
 export const isArtek = (name: string) => /artek/i.test(name);
 export const emptyProvider = (): ProviderState => ({connected:false,configured:false,sources:[],selected:[],lastSynced:null,error:null});
-export const emptyGmail = (): GmailState => ({...emptyProvider(),account:null,unreadCount:0});
-export const emptySync = (): SyncView => ({todoist:emptyProvider(),google:emptyProvider(),gmail:emptyGmail(),tasks:[],events:[],messages:[],links:[],range:null});
+export const emptyGmail = (): GmailState => ({...emptyProvider(),account:null,unreadCount:0,relations:[]});
+export const emptySync = (): SyncView => ({todoist:emptyProvider(),google:emptyProvider(),gmail:emptyGmail(),tasks:[],events:[],messages:[],links:[],workspaceRelations:[],range:null});
 
 const projectSchema = z.object({id:z.string(),name:z.string(),parent_id:z.string().nullable().optional()});
 export function todoistSources(raw: unknown[]): Source[] {

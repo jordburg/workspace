@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { createIntegrationService, GMAIL_SCOPE } from '../build/integrations.ts';
-import { integrationLinkSchema, integrationLinksSchema, todoistSources, personalProjects, normalizeEvent, eventOnDay, PERSONAL_CALENDAR } from '../lib/integrations/model.ts';
+import { integrationLinkSchema, integrationLinksSchema, integrationRelationsSchema, gmailRelationSchema, workspaceRelationSchema, todoistSources, personalProjects, normalizeEvent, eventOnDay, todoistAttentionDate, todoistTaskGroup, PERSONAL_CALENDAR } from '../lib/integrations/model.ts';
 
 const zone='America/Los_Angeles';
 const source={id:PERSONAL_CALENDAR,name:'Personal',area:'personal',blocked:false};
@@ -16,7 +16,7 @@ const mail=(id,overrides={})=>({id,threadId:`thread-${id}`,labelIds:['INBOX','UN
 
 async function harness() {
   const directory=await mkdtemp(join(tmpdir(),'workspace-integration-test-'));
-  const remote={calls:[],task:{...baseTask},event:structuredClone(baseEvent),failTasks:false,failEvents:false,failGmail:false,failSendUncertain:false,sendCommittedStatus:null,sendRejectedStatus:null,failModifyUncertain:false,failTrashUncertain:false,gmailMetadataDelay:0,gmailMetadataActive:0,gmailMetadataMax:0,missingGmailIds:new Set(),projects:[{id:'personal',name:'Personal'},{id:'learning',name:'Learning',parent_id:'personal'},{id:'work',name:'Artek'},{id:'work-child',name:'Personal',parent_id:'work'}],pagination:false,primaryId:PERSONAL_CALENDAR,gmailProfile:PERSONAL_CALENDAR,gmailTokenScope:`${GMAIL_SCOPE} openid email https://www.googleapis.com/auth/userinfo.profile`,calendarTokenScope:'https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.events.owned openid profile',gmailMessages:[mail('personal'),mail('personal-two'),mail('header-work',{payload:{headers:[{name:'From',value:'Colleague <person@artek.energy>'},{name:'To',value:PERSONAL_CALENDAR},{name:'Subject',value:'Work mail'}]}}),mail('label-work',{labelIds:['INBOX','UNREAD','Label_Work_Artek']})],tokenExchanges:[],commands:new Map(),googleWrites:[],gmailWrites:[],gmailSends:[],todoistWrites:0,mutationDelay:0};
+  const remote={calls:[],task:{...baseTask},event:structuredClone(baseEvent),failTasks:false,failEvents:false,failGmail:false,failSendUncertain:false,sendCommittedStatus:null,sendRejectedStatus:null,failModifyUncertain:false,failTrashUncertain:false,gmailMetadataDelay:0,gmailMetadataActive:0,gmailMetadataMax:0,missingGmailIds:new Set(),projects:[{id:'personal',name:'Personal'},{id:'learning',name:'Learning',parent_id:'personal'},{id:'work',name:'Artek'},{id:'work-child',name:'Personal',parent_id:'work'}],pagination:false,primaryId:PERSONAL_CALENDAR,gmailProfile:PERSONAL_CALENDAR,gmailTokenScope:`${GMAIL_SCOPE} openid email https://www.googleapis.com/auth/userinfo.profile`,calendarTokenScope:'https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.events.owned openid profile',gmailMessages:[mail('personal'),mail('personal-two'),mail('header-work',{payload:{headers:[{name:'From',value:'Colleague <person@artek.energy>'},{name:'To',value:PERSONAL_CALENDAR},{name:'Subject',value:'Work mail'}]}}),mail('label-work',{labelIds:['INBOX','UNREAD','Label_Work_Artek']})],tokenExchanges:[],commands:new Map(),googleWrites:[],gmailWrites:[],gmailSends:[],todoistWrites:0,mutationDelay:0,googleMutationGate:null,googleMutationStarted:null};
   const json=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{'Content-Type':'application/json'}});
   const fakeFetch=async(input,options={})=>{
     const url=new URL(String(input));remote.calls.push({url:url.href,method:options.method||'GET'});
@@ -46,7 +46,7 @@ async function harness() {
         return json(remote.event);
       }
       if(/\/events\/[a-f0-9]{32}$/.test(url.pathname)&&method==='GET')return json({},404);
-      if(url.pathname.endsWith('/events')&&method==='POST'){if(remote.mutationDelay)await new Promise(resolve=>setTimeout(resolve,remote.mutationDelay));const body=JSON.parse(options.body);remote.googleWrites.push(body);remote.event={...body,etag:'"created"',organizer:{self:true}};return json(remote.event);}
+      if(url.pathname.endsWith('/events')&&method==='POST'){remote.googleMutationStarted?.();if(remote.googleMutationGate)await remote.googleMutationGate;if(remote.mutationDelay)await new Promise(resolve=>setTimeout(resolve,remote.mutationDelay));const body=JSON.parse(options.body);remote.googleWrites.push(body);remote.event={...body,etag:'"created"',organizer:{self:true}};return json(remote.event);}
     }
     if(url.hostname==='gmail.googleapis.com') {
       if(url.pathname.endsWith('/profile'))return json({emailAddress:remote.gmailProfile,messagesTotal:remote.gmailMessages.length,threadsTotal:remote.gmailMessages.length,historyId:'profile-history'});
@@ -75,9 +75,9 @@ async function harness() {
     const before=await view();if(!before.google.configured&&!before.gmail.configured)assert.equal((await post('/google/configure',{installed:{client_id:'test-client.apps.googleusercontent.com',client_secret:'fake-client-secret'}})).status,200);
     const start=await post('/gmail/start',{});assert.equal(start.status,200);const auth=new URL(start.data.url);assert.equal(auth.searchParams.get('scope'),GMAIL_SCOPE);assert.equal(auth.searchParams.get('scope').includes('mail.google.com'),false);assert.equal(auth.searchParams.get('login_hint'),PERSONAL_CALENDAR);assert.equal(auth.searchParams.get('code_challenge_method'),'S256');assert.equal(auth.searchParams.has('include_granted_scopes'),false);
     assert.equal((await fetch(`${origin}/api/integrations/google/callback?state=${auth.searchParams.get('state')}&code=fake`,{redirect:'manual'})).status,400,'Gmail state cannot be redeemed at the Calendar callback');
-    const retry=await post('/gmail/start',{});const retryAuth=new URL(retry.data.url);const callback=await fetch(`${origin}/api/integrations/gmail/callback?state=${retryAuth.searchParams.get('state')}&code=fake`,{redirect:'manual'});assert.equal(callback.status,302);assert.equal(callback.headers.get('location'),'/?connected=gmail');assert.equal(createHash('sha256').update(remote.tokenExchanges.at(-1).code_verifier).digest('base64url'),retryAuth.searchParams.get('code_challenge'));
+    const retry=await post('/gmail/start',{});const retryAuth=new URL(retry.data.url);const callback=await fetch(`${origin}/api/integrations/gmail/callback?state=${retryAuth.searchParams.get('state')}&code=fake`,{redirect:'manual'});assert.equal(callback.status,302);assert.equal(callback.headers.get('location'),'/?connections=1&connected=gmail');assert.equal(createHash('sha256').update(remote.tokenExchanges.at(-1).code_verifier).digest('base64url'),retryAuth.searchParams.get('code_challenge'));
   }
-  return {remote,fakeFetch,post,view,googleConnect,gmailConnect,directory,origin,cleanup:async()=>{await new Promise(resolve=>server.close(resolve));await rm(directory,{recursive:true,force:true});}};
+  return {remote,fakeFetch,post,view,googleConnect,gmailConnect,service,directory,origin,cleanup:async()=>{service.stopScheduler();await new Promise(resolve=>server.close(resolve));await rm(directory,{recursive:true,force:true});}};
 }
 
 test('project boundaries and calendar day normalization',()=>{
@@ -91,6 +91,16 @@ test('project boundaries and calendar day normalization',()=>{
   assert.equal(normalizeEvent({...baseEvent,recurrence:['RRULE:FREQ=WEEKLY']},source,zone).editable,false);
   assert.equal(normalizeEvent({...baseEvent,attendees:[{self:false}]},source,zone).editable,false);
   assert.equal(normalizeEvent({...baseEvent,status:'cancelled'},source,zone),null);
+  const deadlineOnly={id:'deadline',sourceId:'personal',sourceName:'Personal',title:'Deadline only',area:'personal',dueDate:null,dueTime:null,deadline:'2026-09-12',recurring:false,priority:1,version:'v',parentId:null,url:'https://app.todoist.com/app/task/deadline'};
+  assert.equal(todoistTaskGroup(deadlineOnly,'2026-09-11'),'deadlines');assert.equal(todoistTaskGroup({...deadlineOnly,deadline:'2026-09-10'},'2026-09-11'),'overdue');assert.equal(todoistTaskGroup({...deadlineOnly,dueDate:'2026-09-11',deadline:'2026-09-20'},'2026-09-11'),'today');
+  assert.equal(todoistAttentionDate({...deadlineOnly,dueDate:'2026-09-20',deadline:'2026-09-12'}),'2026-09-12');assert.equal(todoistTaskGroup({...deadlineOnly,dueDate:'2026-09-20',deadline:'2026-09-12'},'2026-09-12'),'today');
+});
+
+test('unchanged integration views support conditional polling',async()=>{
+  const h=await harness();try{
+    const first=await fetch(`${h.origin}/api/integrations`);assert.equal(first.status,200);const etag=first.headers.get('etag');assert.match(etag,/^"[a-f0-9]{64}"$/);await first.arrayBuffer();
+    const unchanged=await fetch(`${h.origin}/api/integrations`,{headers:{'If-None-Match':etag}});assert.equal(unchanged.status,304);assert.equal(await unchanged.text(),'');
+  }finally{await h.cleanup();}
 });
 
 test('Todoist sync and guarded write-back',async t=>{
@@ -126,6 +136,30 @@ test('Todoist sync and guarded write-back',async t=>{
     await t.test('missing Personal never falls back to Inbox',async()=>{
       h.remote.projects=[{id:'inbox',name:'Inbox'},{id:'work',name:'Artek'}];assert.equal((await h.post('/todoist/connect',{token:'different-fake-todoist-token'})).status,400);
     });
+  }finally{await h.cleanup();}
+});
+
+test('provider sync and mutation routes stay inside their provider boundary',async()=>{
+  const h=await harness();try{
+    await h.post('/todoist/connect',{token:'provider-boundary-todoist-token'});await h.googleConnect();await h.gmailConnect();
+    const hostsSince=index=>new Set(h.remote.calls.slice(index).map(call=>new URL(call.url).hostname));
+    let before=h.remote.calls.length;const planning=await h.post('/sync',{date:'2026-09-11',timeZone:zone});assert.equal(planning.status,200);assert.deepEqual([...hostsSince(before)].sort(),['api.todoist.com','www.googleapis.com']);assert.deepEqual(planning.data.messages,[],'the compatibility planning sync must not read Gmail for the phone bridge');
+    before=h.remote.calls.length;assert.equal((await h.post('/sync/todoist',{timeZone:zone})).status,200);assert.deepEqual([...hostsSince(before)],['api.todoist.com']);
+    before=h.remote.calls.length;assert.equal((await h.post('/sync/google',{date:'2026-09-12',timeZone:zone})).status,200);assert.deepEqual([...hostsSince(before)],['www.googleapis.com']);
+    before=h.remote.calls.length;assert.equal((await h.post('/gmail/sync',{})).status,200);assert.deepEqual([...hostsSince(before)],['gmail.googleapis.com']);
+
+    const task=(await h.view()).tasks[0];before=h.remote.calls.length;const taskResult=await h.post('/mutate',{provider:'todoist',action:'update',id:task.id,version:task.version,title:'Provider-only task edit',date:task.dueDate,timeZone:zone,requestId:randomUUID()});assert.equal(taskResult.status,200);assert.deepEqual([...hostsSince(before)],['api.todoist.com']);
+    const event=(await h.view()).events[0];before=h.remote.calls.length;const eventResult=await h.post('/mutate',{provider:'google',action:'update',id:event.id,version:event.version,title:'Provider-only event edit',date:event.startDate,endDate:event.endDate,time:event.startTime,endTime:event.endTime,allDay:false,timeZone:zone,requestId:randomUUID()});assert.equal(eventResult.status,200);assert.deepEqual([...hostsSince(before)],['www.googleapis.com']);
+  }finally{await h.cleanup();}
+});
+
+test('the service lifecycle refreshes connected providers without a mounted client',async()=>{
+  const h=await harness();try{
+    await h.post('/todoist/connect',{token:'service-scheduler-todoist-token'});await h.googleConnect();await h.gmailConnect();await h.post('/sync/google',{date:'2031-04-20',timeZone:zone});h.remote.calls.length=0;
+    h.service.startScheduler({todoist:5,google:10,gmail:15});
+    let hosts=new Set();let view;const deadline=Date.now()+5_000;while(Date.now()<deadline){hosts=new Set(h.remote.calls.map(call=>new URL(call.url).hostname));view=await h.view();if(hosts.size===3&&view.todoist.lastSynced&&view.google.lastSynced&&view.gmail.lastSynced)break;await new Promise(resolve=>setTimeout(resolve,20));}h.service.stopScheduler();
+    assert.deepEqual([...hosts].sort(),['api.todoist.com','gmail.googleapis.com','www.googleapis.com']);
+    assert.ok(view.todoist.lastSynced);assert.ok(view.google.lastSynced);assert.ok(view.gmail.lastSynced);assert.equal(view.range.from,'2031-04-13','background refresh keeps the most recently requested Calendar window');
   }finally{await h.cleanup();}
 });
 
@@ -178,6 +212,17 @@ test('integration mutations use a cross-process lock around provider writes',asy
   }finally{if(second)await new Promise(resolve=>second.close(resolve));await h.cleanup();}
 });
 
+test('a delayed provider does not block another provider and both commits survive',async()=>{
+  const h=await harness();try{
+    await h.post('/todoist/connect',{token:'parallel-provider-todoist-token'});await h.googleConnect();
+    let releaseGoogle;h.remote.googleMutationGate=new Promise(resolve=>{releaseGoogle=resolve;});let markGoogleStarted;const googleStarted=new Promise(resolve=>{markGoogleStarted=resolve;});h.remote.googleMutationStarted=markGoogleStarted;
+    const googleRequest=h.post('/mutate',{provider:'google',action:'create',title:'Climbing · Delayed provider',date:'2026-09-20',endDate:'2026-09-20',time:'10:00',endTime:'11:00',allDay:false,anchorDate:'2026-09-20',timeZone:zone,requestId:randomUUID()});await googleStarted;
+    const todoistRequest=h.post('/sync/todoist',{timeZone:zone});let timeout;const winner=await Promise.race([todoistRequest.then(()=> 'todoist'),new Promise(resolve=>{timeout=setTimeout(()=>resolve('timeout'),750);})]);clearTimeout(timeout);releaseGoogle();
+    const [google,todoist]=await Promise.all([googleRequest,todoistRequest]);assert.equal(winner,'todoist','Todoist should finish while the Calendar provider is waiting on the network');assert.equal(google.status,200);assert.equal(todoist.status,200);
+    const saved=JSON.parse(await readFile(join(h.directory,'integrations.private.json'),'utf8'));assert.ok(saved.view.todoist.lastSynced);assert.equal(saved.view.tasks[0].id,'task1');assert.equal(saved.view.events.some(event=>event.title==='Climbing · Delayed provider'),true);assert.equal(saved.storeRevision>0,true);
+  }finally{await h.cleanup();}
+});
+
 test('integration link validation rejects mismatched or non-create mutations',async()=>{
   const h=await harness();try{
     const goal={entityKind:'goal',entityId:randomUUID(),role:'goal-next-step'};
@@ -198,6 +243,40 @@ test('integration link collections allow only one current link for each climbing
   assert.equal(integrationLinksSchema.safeParse([goalLink,planLink]).success,true);
 });
 
+test('Gmail follow-up relations are durable, typed, and reconciled only through their target provider',async()=>{
+  const h=await harness();try{
+    await h.post('/todoist/connect',{token:'gmail-relation-todoist-token'});await h.googleConnect();await h.gmailConnect();await h.post('/gmail/sync',{});const message=(await h.view()).messages[0];
+    const requestId=randomUUID();const input={provider:'todoist',action:'create',sourceId:'personal',title:`Follow up: ${message.subject}`,date:'2026-09-12',anchorDate:'2026-09-12',timeZone:zone,requestId,link:{entityKind:'gmail-message',entityId:message.id,role:'follow-up-task'}};
+    let before=h.remote.calls.length;const created=await h.post('/mutate',input);assert.equal(created.status,200);assert.equal(created.data.links.length,0);assert.equal(created.data.gmail.relations.length,1);assert.deepEqual([...new Set(h.remote.calls.slice(before).map(call=>new URL(call.url).hostname))],['api.todoist.com']);
+    const relation=gmailRelationSchema.parse(created.data.gmail.relations[0]);assert.equal(relation.entityId,message.id);assert.equal(relation.remoteId,'created-task');assert.equal(relation.requestId,requestId);
+    const writes=h.remote.todoistWrites;const replay=await h.post('/mutate',input);assert.equal(replay.status,200);assert.equal(h.remote.todoistWrites,writes);assert.equal(replay.data.gmail.relations[0].id,relation.id);
+    const duplicate=await h.post('/mutate',{...input,requestId:randomUUID()});assert.equal(duplicate.status,409);assert.equal(h.remote.todoistWrites,writes);
+    const calendarRequest=randomUUID();before=h.remote.calls.length;const calendar=await h.post('/mutate',{provider:'google',action:'create',title:`Email: ${message.subject}`,date:'2026-09-12',endDate:'2026-09-12',time:'09:00',endTime:'09:30',allDay:false,anchorDate:'2026-09-12',timeZone:zone,requestId:calendarRequest,link:{entityKind:'gmail-message',entityId:message.id,role:'time-block'}});assert.equal(calendar.status,200);assert.equal(calendar.data.gmail.relations.length,2);assert.deepEqual([...new Set(h.remote.calls.slice(before).map(call=>new URL(call.url).hostname))],['www.googleapis.com']);assert.equal(gmailRelationSchema.parse(calendar.data.gmail.relations.find(item=>item.role==='time-block')).provider,'google');
+    const disconnected=await h.post('/disconnect',{provider:'gmail'});assert.equal(disconnected.data.gmail.connected,false);assert.equal(disconnected.data.gmail.relations.find(item=>item.id===relation.id).id,relation.id);
+    const saved=JSON.parse(await readFile(join(h.directory,'integrations.private.json'),'utf8'));assert.equal(integrationRelationsSchema.parse(saved.relations).find(item=>item.id===relation.id).entityKind,'gmail-message');
+  }finally{await h.cleanup();}
+});
+
+test('capture-derived priority relations verify both local items and replay idempotently',async()=>{
+  const h=await harness();try{
+    const captureId=randomUUID();const otherCaptureId=randomUUID();const priorityId=randomUUID();const otherPriorityId=randomUUID();const stamp=new Date().toISOString();
+    const item=(id,kind,title)=>({id,kind,title,area:'personal',date:kind==='priority'?'2026-09-12':null,time:null,endTime:null,done:false,revision:1,createdAt:stamp,updatedAt:stamp,triageStatus:kind==='note'?'reviewed':null});
+    await writeFile(join(h.directory,'workspace.json'),JSON.stringify({version:2,revision:3,items:[item(captureId,'note','Captured thought'),item(otherCaptureId,'note','Another capture'),item(priorityId,'priority','Derived priority'),item(otherPriorityId,'priority','Another priority')],tombstones:[],receipts:[]}));
+    const requestId=randomUUID();const input={entityKind:'capture',entityId:captureId,role:'capture-derived-priority',targetKind:'priority',targetId:priorityId,requestId};
+    const created=await h.post('/relations',input);assert.equal(created.status,200);assert.equal(created.data.workspaceRelations.length,1);const relation=workspaceRelationSchema.parse(created.data.workspaceRelations[0]);assert.equal(relation.targetId,priorityId);
+    const replay=await h.post('/relations',input);assert.equal(replay.status,200);assert.equal(replay.data.workspaceRelations[0].id,relation.id);
+    const semanticReplay=await h.post('/relations',{...input,requestId:randomUUID()});assert.equal(semanticReplay.status,200);assert.equal(semanticReplay.data.workspaceRelations.length,1);
+    assert.equal((await h.post('/relations',{...input,targetId:otherPriorityId,requestId:randomUUID()})).status,409);
+    assert.equal((await h.post('/relations',{...input,entityId:otherCaptureId,requestId:randomUUID()})).status,409);
+    assert.equal((await h.post('/relations',{...input,entityId:randomUUID(),requestId:randomUUID()})).status,409);
+    const workspacePath=join(h.directory,'workspace.json');const workspace=JSON.parse(await readFile(workspacePath,'utf8'));workspace.items=workspace.items.filter(value=>value.id!==priorityId);workspace.revision++;await writeFile(workspacePath,JSON.stringify(workspace));
+    assert.equal((await h.view()).workspaceRelations.length,0,'relations with a missing local endpoint are not published');
+    assert.equal((await h.post('/unlink',{id:relation.id})).status,200,'a hidden dangling relation can still be removed explicitly');
+    const replacement=await h.post('/relations',{...input,targetId:otherPriorityId,requestId:randomUUID()});assert.equal(replacement.status,200);assert.equal(replacement.data.workspaceRelations[0].targetId,otherPriorityId);
+    const saved=JSON.parse(await readFile(join(h.directory,'integrations.private.json'),'utf8'));assert.equal(integrationRelationsSchema.parse(saved.relations).length,1);assert.equal(JSON.stringify(created.data).includes('Token'),false);
+  }finally{await h.cleanup();}
+});
+
 test('saved integration views without links migrate to an empty link list',async()=>{
   const h=await harness();try{
     assert.equal((await h.post('/todoist/connect',{token:'migration-todoist-token-for-tests'})).status,200);
@@ -211,9 +290,9 @@ test('saved integration views without links migrate to an empty link list',async
 test('Gmail OAuth, personal boundary, bounded cache, and independent disconnect',async t=>{
   await t.test('uses a separate exact-scope PKCE grant and retains only personal mail',async()=>{
     const h=await harness();try{
-      await h.googleConnect();await h.gmailConnect();
+      await h.googleConnect();await h.gmailConnect();await h.post('/sync/google',{date:'2026-09-11',timeZone:zone});
       h.remote.gmailMessages=[mail('header-work',{payload:{headers:[{name:'From',value:'Colleague <person@sub.artek.energy>'},{name:'To',value:PERSONAL_CALENDAR},{name:'Subject',value:'Work mail'}]}}),mail('list-work',{payload:{headers:[{name:'From',value:'Mailer <news@example.com>'},{name:'To',value:PERSONAL_CALENDAR},{name:'List-Id',value:'Artek Updates <updates.sub.artek.energy>'},{name:'Subject',value:'List mail'}]}}),mail('label-work',{labelIds:['INBOX','UNREAD','Label_Work_Artek']}),...Array.from({length:45},(_,index)=>mail(`safe-${index}`,{labelIds:index%2?['INBOX']:['INBOX','UNREAD','STARRED','IMPORTANT']}))];
-      const synced=await h.post('/sync',{date:'2026-09-11',timeZone:zone});assert.equal(synced.status,200);assert.equal(synced.data.gmail.connected,true);assert.equal(synced.data.gmail.account,PERSONAL_CALENDAR);assert.equal(synced.data.messages.length,40);assert.equal(synced.data.gmail.unreadCount,20);assert.equal(synced.data.messages.some(message=>message.id.includes('work')),false);assert.equal(Object.hasOwn(synced.data.messages[0],'messageId'),false);assert.equal(JSON.stringify(synced.data).includes('test-gmail'),false);
+      const synced=await h.post('/gmail/sync',{});assert.equal(synced.status,200);assert.equal(synced.data.gmail.connected,true);assert.equal(synced.data.gmail.account,PERSONAL_CALENDAR);assert.equal(synced.data.messages.length,40);assert.equal(synced.data.gmail.unreadCount,20);assert.equal(synced.data.messages.some(message=>message.id.includes('work')),false);assert.equal(Object.hasOwn(synced.data.messages[0],'messageId'),false);assert.equal(JSON.stringify(synced.data).includes('test-gmail'),false);
       assert.equal(synced.data.google.connected,true,'the Calendar grant remains connected');
       const cached=structuredClone(synced.data.messages);h.remote.failGmail=true;const failed=await h.post('/gmail/sync',{date:'2026-09-11',timeZone:zone});assert.equal(failed.status,200);assert.deepEqual(failed.data.messages,cached);assert.ok(failed.data.gmail.error);h.remote.failGmail=false;
       const charset=await fetch(`${h.origin}/api/integrations/gmail/sync`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json; charset=utf-8'},body:'{}'});assert.equal(charset.status,200);const jsonp=await fetch(`${h.origin}/api/integrations/gmail/sync`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/jsonp'},body:'{}'});assert.equal(jsonp.status,415);

@@ -240,13 +240,6 @@ export function ChessPanel({ active = true, selectedDay }: { active?: boolean; s
     : firstLesson(view));
 
   return <div className={styles.panel}>
-    <div className={styles.toolbar}>
-      <p>Learn deliberately · Recall actively · Give practice a place in your week</p>
-      <div className={styles.toolbarActions}>
-        <Button variant="outline" disabled={integrations.busy} onClick={addReviewTask}><ListTodo size={16}/>Add review task</Button>
-        <Button className={styles.primary} disabled={integrations.busy} onClick={scheduleStudy}><CalendarClock size={16}/>Block 20 minutes</Button>
-      </div>
-    </div>
     {notice && <p className={styles.notice} role="status">{notice}</p>}
     {error && <div className={styles.error} role="alert"><p>{error}</p><div className={styles.errorActions}><button className={styles.quietButton} disabled={busy} onClick={() => void load()}><RotateCcw size={14}/>Load latest saved Chess data</button></div></div>}
     <Tabs className={styles.tabs} value={tab} onValueChange={value => setTab(value as ChessTab)}>
@@ -262,26 +255,27 @@ function Overview({ view, openLesson, openReview, scheduleStudy, addReviewTask }
   const current = currentLesson(view);
   const accuracy = view.summary.recentReviewAccuracy;
   const studyMinutes = view.state.studySessions.reduce((total, session) => total + Math.max(0, new Date(session.endedAt).getTime() - new Date(session.startedAt).getTime()) / 60000, 0);
+  const hasSummary = view.summary.reviewsDue > 0 || view.summary.stepsCovered > 0 || accuracy !== null || view.state.studySessions.length > 0;
   return <div className={styles.stack}>
-    <section className={styles.summary}>
-      <div className={styles.summaryHeading}><div><p className={styles.kicker}>Chess practice</p><h2>{view.summary.reviewsDue ? `${view.summary.reviewsDue} position${view.summary.reviewsDue === 1 ? " is" : "s are"} ready for recall.` : "Your review queue is clear."}</h2></div><p>Moves and ideas stay together, so practice builds a usable map rather than a list to memorize.</p></div>
+    {hasSummary&&<section className={styles.summary}>
+      <div className={styles.summaryHeading}><h2>{view.summary.reviewsDue ? `${view.summary.reviewsDue} position${view.summary.reviewsDue === 1 ? " is" : "s are"} ready for recall.` : "Recent practice"}</h2></div>
       <div className={styles.metrics}>
-        <article><span>Steps covered</span><strong>{view.summary.stepsCovered}/{view.summary.totalSteps}</strong><small>Reveal counts as exposure, not mastery</small></article>
-        <article><span>Due now</span><strong>{view.summary.reviewsDue}</strong><small>{nextDueLabel(view.summary.nextDueAt)}</small></article>
-        <article><span>Recent recall</span><strong>{accuracy === null ? "—" : `${Math.round(accuracy * 100)}%`}</strong><small>Move and reason both correct</small></article>
-        <article><span>Practice time</span><strong>{Math.round(studyMinutes)}m</strong><small>{view.state.studySessions.length} recorded {view.state.studySessions.length === 1 ? "session" : "sessions"}</small></article>
+        {view.summary.stepsCovered>0&&<article><span>Steps covered</span><strong>{view.summary.stepsCovered}/{view.summary.totalSteps}</strong></article>}
+        {view.summary.reviewsDue>0&&<article><span>Due now</span><strong>{view.summary.reviewsDue}</strong><small>{nextDueLabel(view.summary.nextDueAt)}</small></article>}
+        {accuracy!==null&&<article><span>Recent recall</span><strong>{Math.round(accuracy * 100)}%</strong></article>}
+        {view.state.studySessions.length>0&&<article><span>Practice time</span><strong>{Math.round(studyMinutes)}m</strong><small>{view.state.studySessions.length} recorded {view.state.studySessions.length === 1 ? "session" : "sessions"}</small></article>}
       </div>
-    </section>
+    </section>}
     <div className={styles.overviewGrid}>
       <section className={styles.card}>
         <div className={styles.cardHeader}><div><h2>Continue learning</h2><p>Return to the last lesson position or start the course from the beginning.</p></div><span>{view.catalog.courses.length} {view.catalog.courses.length === 1 ? "course" : "courses"}</span></div>
         {current ? <div className={styles.nextLesson}><span className={styles.nextLessonIcon}><BookOpen size={20}/></span><div className={styles.nextLessonCopy}><span>{current.course.title}</span><h3>{current.lesson.title}</h3><p>{current.course.description}</p><Button variant="outline" onClick={() => openLesson({ courseId: current.course.id, lessonId: current.lesson.id })}>Continue lesson <ArrowRight size={15}/></Button></div></div> : <EmptyCatalog/>}
       </section>
       <section className={styles.card}>
-        <div className={styles.cardHeader}><div><h3>Make room for practice</h3><p>Draft the next step in the apps that already shape your day.</p></div></div>
+        <div className={styles.cardHeader}><div><h3>Practice</h3></div></div>
         <div className={styles.planningList}>
-          <button className={styles.planningButton} onClick={scheduleStudy}><span><CalendarClock size={17}/></span><span><strong>Block 20 minutes</strong><small>Open a reviewable Calendar draft</small></span><ChevronRight size={15}/></button>
-          <button className={styles.planningButton} onClick={addReviewTask}><span><ListTodo size={17}/></span><span><strong>Add a review task</strong><small>Open a reviewable Todoist draft</small></span><ChevronRight size={15}/></button>
+          <button className={styles.planningButton} onClick={scheduleStudy}><span><CalendarClock size={17}/></span><span><strong>Block 20 minutes</strong><small>Google Calendar</small></span><ChevronRight size={15}/></button>
+          <button className={styles.planningButton} onClick={addReviewTask}><span><ListTodo size={17}/></span><span><strong>Add a review task</strong><small>Todoist</small></span><ChevronRight size={15}/></button>
           <button className={styles.planningButton} disabled={!view.summary.reviewsDue} onClick={openReview}><span><Target size={17}/></span><span><strong>Start due reviews</strong><small>{view.summary.reviewsDue ? `${view.summary.reviewsDue} ready now` : "Queue clear"}</small></span><ChevronRight size={15}/></button>
         </div>
       </section>
@@ -483,7 +477,7 @@ function LearnView({ view, target, busy, chooseLesson, mutate }: { view: ChessVi
         <ol className={styles.segmentList}>{lesson.segments.map((item, index) => <li key={item.id}><button className={index === segmentIndex ? styles.activeSegmentButton : styles.segmentButton} disabled={busy || progressBlocked} onClick={() => changeSegment(index)}><span>{index + 1}</span>{item.title}</button></li>)}</ol>
         {courseLessons.length > 1 && <div className={styles.lessonPicker}>{courseLessons.map(item => <button key={item.id} aria-current={item.id === lesson.id} disabled={busy || progressBlocked} onClick={() => chooseLesson({ courseId: course.id, lessonId: item.id })}><span>{item.title}</span><small>{item.id === lesson.id ? "Open" : "Study"}</small></button>)}</div>}
       </aside>
-      <div className={styles.boardPane}><div className={styles.boardFrame}><ClientChessboard options={{ allowDrawingArrows: true, animationDurationInMs: 220, arrows: revealed ? [{ color: "rgba(189, 134, 28, 0.8)", startSquare: revealed.from, endSquare: revealed.to }] : [], boardOrientation: orientation, boardStyle: { borderRadius: "8px", boxShadow: "0 16px 48px rgba(24, 38, 31, .16)", overflow: "hidden" }, darkSquareStyle: { backgroundColor: "#6f8f72" }, lightSquareStyle: { backgroundColor: "#f1ecd8" }, onPieceDrop: ({ sourceSquare, targetSquare }) => targetSquare ? attempt(sourceSquare, targetSquare) : false, onSquareClick: clickSquare, position: boardFen, showNotation: true, squareStyles: boardStyles }}/></div></div>
+      <div className={styles.boardPane}><div className={styles.boardFrame}><ClientChessboard options={{ allowDrawingArrows: true, animationDurationInMs: 220, arrows: revealed ? [{ color: "rgba(185, 67, 49, 0.82)", startSquare: revealed.from, endSquare: revealed.to }] : [], boardOrientation: orientation, boardStyle: { borderRadius: "0", boxShadow: "none", overflow: "hidden" }, darkSquareStyle: { backgroundColor: "#6f6e68" }, lightSquareStyle: { backgroundColor: "#f3f2ee" }, onPieceDrop: ({ sourceSquare, targetSquare }) => targetSquare ? attempt(sourceSquare, targetSquare) : false, onSquareClick: clickSquare, position: boardFen, showNotation: true, squareStyles: boardStyles }}/></div></div>
       <section className={styles.lessonPane} aria-label="Lesson content">
         <p className={styles.kicker}>{segment.type === "trainer" ? `Practice ${stepIndex + 1} of ${segment.steps.length}` : segment.type}</p><h2>{segment.title}</h2>
         <div className={styles.bodyCopy}>{segment.body.map(paragraph => <p key={paragraph}>{paragraph}</p>)}</div>
@@ -594,8 +588,8 @@ function ReviewView({ initialView, busy, mutate, scheduleStudy, addReviewTask }:
   return <div className={styles.stack}>
     {localError && <p className={styles.error} role="alert">{localError}</p>}
     <div className={styles.reviewLayout}>
-      <aside className={styles.reviewRail} aria-label="Review status"><p className={styles.kicker}>Active recall</p><h2>Sicilian review</h2><p>Mixed positions from both sides. Play the move, then name the idea.</p><div className={styles.reviewCount}><strong>{run.length - completed}</strong><span>remaining in this session</span></div><div className={styles.reviewProgress}><div><span>{percent}% complete</span></div><div className={styles.progressTrack}><span style={{ width: `${percent}%` }}/></div></div></aside>
-      <div className={styles.boardPane}><div className={styles.boardFrame}><ClientChessboard options={{ allowDrawingArrows: true, animationDurationInMs: 220, arrows: saved && solution ? [{ color: "rgba(189, 134, 28, 0.8)", startSquare: solution.from, endSquare: solution.to }] : [], boardOrientation: current.boardOrientation, boardStyle: { borderRadius: "8px", boxShadow: "0 16px 48px rgba(24, 38, 31, .16)", overflow: "hidden" }, darkSquareStyle: { backgroundColor: "#6f8f72" }, lightSquareStyle: { backgroundColor: "#f1ecd8" }, onPieceDrop: ({ sourceSquare, targetSquare }) => targetSquare ? attemptMove(sourceSquare, targetSquare) : false, onSquareClick: clickSquare, position: boardFen, showNotation: true, squareStyles: boardStyles }}/></div></div>
+      <aside className={styles.reviewRail} aria-label="Review status"><p className={styles.kicker}>Active recall</p><h2>Opening repertoire review</h2><p>Scotch as White · Sicilian as Black. Play the move, then name the idea.</p><div className={styles.reviewCount}><strong>{run.length - completed}</strong><span>remaining in this session</span></div><div className={styles.reviewProgress}><div><span>{percent}% complete</span></div><div className={styles.progressTrack}><span style={{ width: `${percent}%` }}/></div></div></aside>
+      <div className={styles.boardPane}><div className={styles.boardFrame}><ClientChessboard options={{ allowDrawingArrows: true, animationDurationInMs: 220, arrows: saved && solution ? [{ color: "rgba(185, 67, 49, 0.82)", startSquare: solution.from, endSquare: solution.to }] : [], boardOrientation: current.boardOrientation, boardStyle: { borderRadius: "0", boxShadow: "none", overflow: "hidden" }, darkSquareStyle: { backgroundColor: "#6f6e68" }, lightSquareStyle: { backgroundColor: "#f3f2ee" }, onPieceDrop: ({ sourceSquare, targetSquare }) => targetSquare ? attemptMove(sourceSquare, targetSquare) : false, onSquareClick: clickSquare, position: boardFen, showNotation: true, squareStyles: boardStyles }}/></div></div>
       <section className={styles.reviewPane} aria-label="Review prompt"><p className={styles.kicker}>{current.lessonTitle} · Card {index + 1} of {run.length}</p><h2>{current.prompt}</h2><p className={styles.feedback} role="status">{feedback}</p><div className={styles.reasonBlock}><p className={styles.reasonQuestion}>{current.question}</p><div className={styles.choices}>{current.choices.map(choice => <ReviewChoiceControl key={choice.id} choice={choice} disabled={!attempt || Boolean(saved) || busy} selected={reasonId === choice.id} saved={saved} onSelect={setReasonId}/>)}</div></div>
         {saved && <div className={styles.result}><p>Move: <strong>{saved.moveCorrect ? "remembered" : "needs review"}</strong></p><p>Reason: <strong>{saved.reasonCorrect ? "understood" : "needs review"}</strong></p>{solution && <p>Correct move: <strong>{solution.san}</strong> ({solution.uci})</p>}{correctChoice && <p>Key idea: {correctChoice.text}</p>}<p>{current.step.explanation}</p><p>Next due {formatDateTime(saved.dueAt)}.</p></div>}
         <div className={styles.actionRow}><Button className={styles.primary} disabled={!attempt || !reasonId || Boolean(saved) || busy} onClick={() => void submitReview()}>{busy && !saved ? <><LoaderCircle className={styles.spin} size={15}/>Saving…</> : "Submit review"}</Button><Button variant="outline" disabled={!saved || busy} onClick={advance}>{index + 1 < run.length ? "Next position" : "Finish review"}<ChevronRight size={15}/></Button></div>
@@ -626,9 +620,10 @@ export function TodayChessCard({ day, openChess }: { day: string; openChess: () 
   const plannedEvent = integrations.events.filter(event => eventOnDay(event, day) && /^chess\b/i.test(event.title.trim())).sort((a, b) => (a.startTime ?? "99:99").localeCompare(b.startTime ?? "99:99"))[0];
   const plannedTask = integrations.tasks.filter(task => task.dueDate === day && /^chess\b/i.test(task.title.trim()))[0];
   const due = view?.summary.reviewsDue ?? 0;
+  if (!loaded || !view || (!due && !plannedEvent && !plannedTask)) return null;
   return <section className={styles.todayCard} aria-label="Chess today">
     <div className={styles.todayHeader}><div className={styles.todayTitle}><span className={styles.todayIcon}><Crown size={17}/></span><span><strong>Chess</strong><small>Practice loop</small></span></div><button className={styles.todayOpen} onClick={openChess}>Open <ChevronRight size={14}/></button></div>
-    <div className={styles.todayBody}>{!loaded ? <p>Loading Chess…</p> : !view ? <p>Chess is temporarily unavailable.</p> : <><div className={styles.todayLead}><strong>{due ? `${due} due` : "Queue clear"}</strong><span>{view.summary.stepsCovered}/{view.summary.totalSteps} steps covered</span></div><p>{due ? "Recall the move and the reason together." : nextDueLabel(view.summary.nextDueAt)}</p>{plannedEvent ? <span className={styles.todayPlan}><CalendarClock size={13}/>{plannedEvent.allDay ? "Planned today" : `${formatClock(plannedEvent.startTime)} · ${plannedEvent.title}`}</span> : plannedTask ? <span className={styles.todayPlan}><ListTodo size={13}/>{plannedTask.title}</span> : null}</>}</div>
+    <div className={styles.todayBody}><div className={styles.todayLead}><strong>{due ? `${due} due` : "Planned"}</strong></div>{due > 0 && <p>Review due positions.</p>}{plannedEvent ? <span className={styles.todayPlan}><CalendarClock size={13}/>{plannedEvent.allDay ? "Planned today" : `${formatClock(plannedEvent.startTime)} · ${plannedEvent.title}`}</span> : plannedTask ? <span className={styles.todayPlan}><ListTodo size={13}/>{plannedTask.title}</span> : null}</div>
   </section>;
 }
 
@@ -655,9 +650,9 @@ function resetPosition(segment: LessonSegment, step: TrainerStep | null, initial
 }
 function squareStyles(selected: string | null, attempt: Pick<MoveAttempt, "correct" | "from" | "to"> | null, revealed: { from: string; to: string } | null): Record<string, CSSProperties> {
   const result: Record<string, CSSProperties> = {};
-  if (selected) result[selected] = { boxShadow: "inset 0 0 0 4px rgba(44, 112, 79, .58)" };
-  if (attempt) { const color = attempt.correct ? "rgba(44, 112, 79, .65)" : "rgba(177, 67, 48, .66)"; result[attempt.from] = { boxShadow: `inset 0 0 0 4px ${color}` }; result[attempt.to] = { boxShadow: `inset 0 0 0 4px ${color}` }; }
-  if (revealed) { result[revealed.from] = { boxShadow: "inset 0 0 0 4px rgba(189, 134, 28, .8)" }; result[revealed.to] = { boxShadow: "inset 0 0 0 4px rgba(189, 134, 28, .8)" }; }
+  if (selected) result[selected] = { boxShadow: "inset 0 0 0 4px rgba(17, 17, 15, .62)" };
+  if (attempt) { const color = attempt.correct ? "rgba(17, 17, 15, .72)" : "rgba(185, 67, 49, .72)"; result[attempt.from] = { boxShadow: `inset 0 0 0 4px ${color}` }; result[attempt.to] = { boxShadow: `inset 0 0 0 4px ${color}` }; }
+  if (revealed) { result[revealed.from] = { boxShadow: "inset 0 0 0 4px rgba(185, 67, 49, .82)" }; result[revealed.to] = { boxShadow: "inset 0 0 0 4px rgba(185, 67, 49, .82)" }; }
   return result;
 }
 function feedbackClass(kind: Feedback["kind"]) { return kind === "correct" ? styles.feedbackCorrect : kind === "incorrect" ? styles.feedbackIncorrect : kind === "info" ? styles.feedbackInfo : ""; }

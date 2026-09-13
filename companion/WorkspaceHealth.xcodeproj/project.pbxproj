@@ -13,6 +13,8 @@
 		B000000000000000000000004 /* WorkspaceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000004 /* WorkspaceModels.swift */; };
 		B000000000000000000000005 /* WorkspaceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000005 /* WorkspaceStore.swift */; };
 		B000000000000000000000006 /* WorkspaceViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000006 /* WorkspaceViews.swift */; };
+		B000000000000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000007 /* Assets.xcassets */; };
+		B000000000000000000000008 /* WorkspaceBrand.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000008 /* WorkspaceBrand.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -22,6 +24,8 @@
 		A000000000000000000000004 /* WorkspaceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceModels.swift; sourceTree = "<group>"; };
 		A000000000000000000000005 /* WorkspaceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceStore.swift; sourceTree = "<group>"; };
 		A000000000000000000000006 /* WorkspaceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceViews.swift; sourceTree = "<group>"; };
+		A000000000000000000000007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A000000000000000000000008 /* WorkspaceBrand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceBrand.swift; sourceTree = "<group>"; };
 		C00000000000000000000007 /* WorkspaceHealth.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WorkspaceHealth.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -55,6 +59,8 @@
 		C00000000000000000000006 /* WorkspaceHealth */ = {
 			isa = PBXGroup;
 			children = (
+				A000000000000000000000007 /* Assets.xcassets */,
+				A000000000000000000000008 /* WorkspaceBrand.swift */,
 				A000000000000000000000001 /* WorkspaceHealthApp.swift */,
 				A000000000000000000000002 /* BridgeClient.swift */,
 				A000000000000000000000003 /* HealthStore.swift */,
@@ -117,6 +123,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B000000000000000000000007 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -128,6 +135,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B000000000000000000000001 /* WorkspaceHealthApp.swift in Sources */,
+				B000000000000000000000008 /* WorkspaceBrand.swift in Sources */,
 				B000000000000000000000002 /* BridgeClient.swift in Sources */,
 				B000000000000000000000003 /* HealthStore.swift in Sources */,
 				B000000000000000000000004 /* WorkspaceModels.swift in Sources */,
@@ -224,6 +232,7 @@
 		D00000000000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_OBJC_WEAK = YES;
 				CODE_SIGN_ENTITLEMENTS = WorkspaceHealth/WorkspaceHealth.entitlements;
 				CODE_SIGN_STYLE = Automatic;
@@ -236,13 +245,14 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = 1;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Debug;
 		};
 		D00000000000000000000004 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_OBJC_WEAK = YES;
 				CODE_SIGN_ENTITLEMENTS = WorkspaceHealth/WorkspaceHealth.entitlements;
 				CODE_SIGN_STYLE = Automatic;
@@ -255,7 +265,7 @@
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = 1;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
 		};
