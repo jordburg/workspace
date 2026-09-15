@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer, request as httpRequest } from 'node:http';
-import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createClimbingService } from '../build/climbing.ts';
@@ -15,7 +15,11 @@ import {
   consistencyProgress,
   emptyClimbing,
   goalReferenceSchema,
+  isClimbCompletion,
+  prefixByUtf16Units,
+  projectGoalHistory,
   routineSnapshot,
+  sessionSends,
 } from '../lib/climbing.ts';
 
 const at = '2026-09-11T20:00:00.000Z';
@@ -151,7 +155,8 @@ function state(overrides = {}) {
 }
 
 function withoutAdditiveProjectFields(goal) {
-  const { environment, discipline, ropeStyle, attempts, ...legacy } = goal;
+  const legacy = { ...goal };
+  for (const key of ['environment', 'discipline', 'ropeStyle', 'attempts']) delete legacy[key];
   return legacy;
 }
 
@@ -166,6 +171,7 @@ function projectDetails(goal) {
 
 test('Climbing schemas preserve entered grades and enforce climb, goal, and identity invariants', () => {
   const entered = climb();
+  assert.equal(climbSchema.parse(entered).projectGoalId, null, 'legacy climbs gain an explicit null project link');
   assert.equal(climbSchema.parse(entered).grade, 'Blue / V5-ish +');
   assert.equal(climbSchema.safeParse({ ...entered, gradeSystem: null }).success, false);
   assert.equal(climbSchema.safeParse({ ...entered, grade: null }).success, false);
@@ -225,6 +231,112 @@ test('Climbing schemas preserve entered grades and enforce climb, goal, and iden
   assert.equal(climbingStateSchema.safeParse(state({goals:[goal],goalReferences:[reference,reference]})).success,false);
   assert.equal(climbingStateSchema.safeParse(state({goalReferences:[reference]})).success,false);
   assert.equal(climbingStateSchema.safeParse(state({goals:[goal],goalReferences:Array.from({length:13},()=>({...reference,id:randomUUID()}))})).success,false);
+
+  const project = climbingGoalSchema.parse({
+    ...goal,
+    kind: 'project',
+    startDate: null,
+    targetDate: null,
+    sessionTarget: null,
+    environment: 'indoor',
+    discipline: 'boulder',
+    ropeStyle: null,
+    gradeSystem: 'v-scale',
+    grade: 'V7',
+    attempts: 4,
+  });
+  const projectClimb = climb({ projectGoalId: project.id });
+  assert.equal(climbingStateSchema.safeParse(state({ goals: [project], sessions: [session({ climbs: [projectClimb] })] })).success, true);
+  assert.equal(climbingStateSchema.safeParse(state({ goals: [project], sessions: [session({ climbs: [climb({ projectGoalId: project.id, attempts: null })] })] })).success, true, 'a linked project climb may omit an attempt count');
+  assert.equal(climbingStateSchema.safeParse(state({ sessions: [session({ climbs: [projectClimb] })] })).success, false, 'project links must resolve');
+  assert.equal(climbingStateSchema.safeParse(state({ goals: [goal], sessions: [session({ climbs: [climb({ projectGoalId: goal.id })] })] })).success, false, 'project links cannot target another goal kind');
+  assert.equal(climbingStateSchema.safeParse(state({ goals: [project], sessions: [session({ climbs: [projectClimb, climb({ projectGoalId: project.id })] })] })).success, false, 'a session aggregates one climb record per project');
+  assert.equal(climbingStateSchema.safeParse(state({ goals: [{ ...project, archivedAt: at }], sessions: [session({ climbs: [projectClimb] })] })).success, true, 'archiving preserves project history');
+  assert.equal(climbingStateSchema.safeParse(state({ goals: [project], sessions: [session({ deletedAt: at, climbs: [projectClimb] })] })).success, true, 'removed sessions retain a valid project link for restoration');
+  assert.equal(climbingStateSchema.safeParse(state({
+    goals: [project],
+    sessions: [
+      session({ climbs: [projectClimb] }),
+      session({ climbs: [climb({ projectGoalId: project.id, discipline: 'route', ropeStyle: 'sport-lead', gradeSystem: 'yds', grade: '5.12a' })] }),
+    ],
+  })).success, true, 'historical climb details can differ from the current project metadata');
+});
+
+test('Project snapshots keep valid UTF-16 boundaries and repeats do not count as new sends', () => {
+  const ascii = 'a'.repeat(119);
+  assert.equal(prefixByUtf16Units(`${ascii}🧗`, 120), ascii, 'a two-unit scalar is not split at the limit');
+  assert.equal(prefixByUtf16Units(`${'a'.repeat(118)}🧗more`, 120), `${'a'.repeat(118)}🧗`);
+  assert.equal(isClimbCompletion('send'), true);
+  assert.equal(isClimbCompletion('redpoint'), true);
+  assert.equal(isClimbCompletion('repeat'), false);
+  assert.equal(sessionSends(session({ climbs: [climb({ outcome: 'send' }), climb({ outcome: 'repeat' }), climb({ outcome: 'attempt' })] })), 1);
+});
+
+test('Project goal history keeps manual and linked attempts separate and derives reversible completion', () => {
+  const goal = climbingGoalSchema.parse({
+    ...consistencyGoal(),
+    kind: 'project',
+    startDate: null,
+    targetDate: null,
+    sessionTarget: null,
+    environment: 'outdoor',
+    discipline: 'route',
+    ropeStyle: 'sport-lead',
+    gradeSystem: 'yds',
+    grade: '5.12a',
+    attempts: 11,
+  });
+  const first = session({ date: '2026-09-02', climbs: [climb({ projectGoalId: goal.id, outcome: 'attempt', attempts: 2 })] });
+  const sent = session({ date: '2026-09-05', climbs: [climb({ projectGoalId: goal.id, discipline: 'route', ropeStyle: 'sport-lead', gradeSystem: 'yds', grade: '5.12a', outcome: 'redpoint', attempts: 3 })] });
+  const repeated = session({ date: '2026-09-08', climbs: [climb({ projectGoalId: goal.id, outcome: 'repeat', attempts: null })] });
+  const removed = session({ date: '2026-09-01', deletedAt: at, climbs: [climb({ projectGoalId: goal.id, outcome: 'send', attempts: 9 })] });
+  const unrelated = session({ date: '2026-09-10', climbs: [climb({ outcome: 'attempt', attempts: 6 })] });
+
+  const history = projectGoalHistory(goal, [repeated, removed, unrelated, sent, first]);
+  assert.deepEqual(history.entries.map(entry => entry.session.date), ['2026-09-02', '2026-09-05', '2026-09-08']);
+  assert.equal(history.linkedSessionCount, 3);
+  assert.equal(history.linkedClimbCount, 3);
+  assert.equal(history.knownLinkedAttempts, 5);
+  assert.equal(history.uncountedLinkedClimbs, 1, 'the missing count remains explicit instead of contributing zero attempts');
+  assert.equal(history.manualAttemptCount, 11, 'the existing manual running count remains separate because it may overlap linked sessions');
+  assert.equal(history.firstTriedOn, '2026-09-02');
+  assert.equal(history.lastTriedOn, '2026-09-08');
+  assert.equal(history.firstCompletion?.session.id, sent.id);
+  assert.equal(history.firstCompletion?.climb.outcome, 'redpoint');
+  assert.equal(history.completedByLinkedSession, true);
+  assert.equal(history.effectiveStatus, 'completed');
+  assert.equal(history.latestOutcome, 'repeat');
+  assert.equal(history.hasRepeat, true);
+
+  const restored = projectGoalHistory(goal, [{ ...removed, deletedAt: null }, repeated, sent, first]);
+  assert.equal(restored.knownLinkedAttempts, 14);
+  assert.equal(restored.firstTriedOn, '2026-09-01');
+  assert.equal(restored.firstCompletion?.session.id, removed.id);
+
+  const repeatOnly = projectGoalHistory(goal, [repeated]);
+  assert.equal(repeatOnly.knownLinkedAttempts, 0);
+  assert.equal(repeatOnly.uncountedLinkedClimbs, 1);
+  assert.equal(repeatOnly.firstCompletion, null, 'a repeat is evidence of prior completion but is not assigned a new send date');
+  assert.equal(repeatOnly.completedByLinkedSession, false);
+  assert.equal(repeatOnly.effectiveStatus, 'active');
+  assert.equal(repeatOnly.hasRepeat, true);
+
+  const attempted = { ...sent, climbs: sent.climbs.map(item => ({ ...item, outcome: 'attempt' })) };
+  const edited = projectGoalHistory(goal, [attempted]);
+  assert.equal(edited.firstCompletion, null, 'editing a send back to an attempt removes the derived completion');
+  assert.equal(edited.effectiveStatus, 'active');
+
+  const unlinked = { ...sent, climbs: sent.climbs.map(item => ({ ...item, projectGoalId: null })) };
+  const afterUnlink = projectGoalHistory(goal, [unlinked]);
+  assert.equal(afterUnlink.entries.length, 0);
+  assert.equal(afterUnlink.effectiveStatus, 'active', 'unlinking the send removes the derived completion');
+
+  const tombstoned = projectGoalHistory(goal, [{ ...sent, deletedAt: at }]);
+  assert.equal(tombstoned.entries.length, 0);
+  assert.equal(tombstoned.effectiveStatus, 'active', 'removing the send session removes the derived completion until restoration');
+  assert.equal(projectGoalHistory({ ...goal, status: 'paused' }, [sent]).effectiveStatus, 'completed');
+  assert.equal(projectGoalHistory({ ...goal, status: 'paused' }, [{ ...sent, deletedAt: at }]).effectiveStatus, 'paused');
+  assert.equal(projectGoalHistory({ ...goal, status: 'completed' }, []).effectiveStatus, 'completed', 'an explicitly completed goal stays completed without linked history');
 });
 
 test('Climbing plans validate schedules, status transitions, and untouched routine snapshots', () => {
@@ -492,6 +604,90 @@ test('Climbing API persists private state and rejects stale, cross-origin, malfo
       assert.deepEqual(projectDetails(saved.goals[0]), { environment: null, discipline: null, ropeStyle: null, attempts: null });
     });
 
+    await t.test('preserves project climb links omitted by older session writers while honoring explicit unlinks', async () => {
+      const projectGoalId = saved.goals[0].id;
+      const originalSession = saved.sessions[0];
+      const linkedSession = {
+        ...originalSession,
+        climbs: originalSession.climbs.map((item, index) => index === 0 ? { ...item, projectGoalId, attempts: null } : item),
+        updatedAt: '2026-09-13T02:00:00.000Z',
+      };
+      let response = await h.post({
+        requestId: randomUUID(),
+        changes: [{ kind: 'session', expectedUpdatedAt: originalSession.updatedAt, value: linkedSession }],
+      });
+      assert.equal(response.status, 200);
+      saved = await response.json();
+      assert.equal(saved.sessions[0].climbs[0].projectGoalId, projectGoalId);
+      assert.equal(saved.sessions[0].climbs[0].attempts, null);
+
+      const legacyCommandClimb = { ...saved.sessions[0].climbs[0] };
+      delete legacyCommandClimb.projectGoalId;
+      const legacyCommandSession = {
+        ...saved.sessions[0],
+        notes: 'Updated by an older per-record client.',
+        climbs: [legacyCommandClimb],
+        updatedAt: '2026-09-13T03:00:00.000Z',
+      };
+      response = await h.post({
+        requestId: randomUUID(),
+        changes: [{ kind: 'session', expectedUpdatedAt: saved.sessions[0].updatedAt, value: legacyCommandSession }],
+      });
+      assert.equal(response.status, 200);
+      saved = await response.json();
+      assert.equal(saved.sessions[0].climbs[0].projectGoalId, projectGoalId);
+      assert.equal(saved.sessions[0].notes, 'Updated by an older per-record client.');
+
+      const explicitlyUnlinkedSession = {
+        ...saved.sessions[0],
+        climbs: [{ ...saved.sessions[0].climbs[0], projectGoalId: null }],
+        updatedAt: '2026-09-13T04:00:00.000Z',
+      };
+      response = await h.post({
+        requestId: randomUUID(),
+        changes: [{ kind: 'session', expectedUpdatedAt: saved.sessions[0].updatedAt, value: explicitlyUnlinkedSession }],
+      });
+      assert.equal(response.status, 200);
+      saved = await response.json();
+      assert.equal(saved.sessions[0].climbs[0].projectGoalId, null);
+
+      const relinkedSession = {
+        ...saved.sessions[0],
+        climbs: [{ ...saved.sessions[0].climbs[0], projectGoalId }],
+        updatedAt: '2026-09-13T05:00:00.000Z',
+      };
+      response = await h.post({
+        requestId: randomUUID(),
+        changes: [{ kind: 'session', expectedUpdatedAt: saved.sessions[0].updatedAt, value: relinkedSession }],
+      });
+      assert.equal(response.status, 200);
+      saved = await response.json();
+
+      const legacyStateClimb = { ...saved.sessions[0].climbs[0] };
+      delete legacyStateClimb.projectGoalId;
+      const legacyStateSession = {
+        ...saved.sessions[0],
+        notes: 'Updated by an older whole-state client.',
+        climbs: [legacyStateClimb],
+        updatedAt: '2026-09-13T06:00:00.000Z',
+      };
+      response = await h.put({ ...saved, sessions: [legacyStateSession] });
+      assert.equal(response.status, 200);
+      saved = await response.json();
+      assert.equal(saved.sessions[0].climbs[0].projectGoalId, projectGoalId);
+      assert.equal(saved.sessions[0].notes, 'Updated by an older whole-state client.');
+
+      const explicitStateUnlink = {
+        ...saved.sessions[0],
+        climbs: [{ ...saved.sessions[0].climbs[0], projectGoalId: null }],
+        updatedAt: '2026-09-13T07:00:00.000Z',
+      };
+      response = await h.put({ ...saved, sessions: [explicitStateUnlink] });
+      assert.equal(response.status, 200);
+      saved = await response.json();
+      assert.equal(saved.sessions[0].climbs[0].projectGoalId, null);
+    });
+
     await t.test('rejects stale revisions without overwriting current data', async () => {
       const stale = await h.put({ ...saved, revision: 0, sessions: [] });
       assert.equal(stale.status, 409);
@@ -637,6 +833,53 @@ test('Climbing API persists private state and rejects stale, cross-origin, malfo
       assert.deepEqual(await readFile(mediaPath),png);
       assert.equal((await stat(mediaPath)).mode&0o777,0o600);
 
+      const sha256=createHash('sha256').update(png).digest('hex');
+      let cloudResponse=await fetch(`${h.origin}/api/climbing/media/cloud/status`);
+      assert.equal(cloudResponse.status,200);
+      let cloud=await cloudResponse.json();
+      assert.equal(cloud.revision,1);
+      assert.deepEqual(cloud.items,[{
+        referenceId,goalId:goal.id,operation:'upload',status:'pending',sha256,byteSize:png.length,
+        requestedAt:cloud.items[0].requestedAt,updatedAt:cloud.items[0].updatedAt,confirmedAt:null,error:null,
+      }]);
+      const cloudFile=join(h.directory,'climbing-cloud-media.private.json');
+      assert.equal((await stat(cloudFile)).mode&0o777,0o600);
+      assert.equal(JSON.stringify(cloud).includes('assetUrl'),false);
+      assert.equal(JSON.stringify(cloud).includes('credential'),false);
+      assert.equal((await fetch(`${h.origin}/api/climbing/media/cloud/status`,{headers:{Origin:'https://example.com'}})).status,403);
+
+      const badDigestReceipt={requestId:randomUUID(),referenceId,operation:'upload',status:'confirmed',sha256:'0'.repeat(64),byteSize:png.length,error:null};
+      response=await fetch(`${h.origin}/api/climbing/media/cloud/receipt`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json'},body:JSON.stringify(badDigestReceipt)});
+      assert.equal(response.status,409);
+      assert.equal((await response.json()).code,'cloud_media_digest_conflict');
+      const leakedReceipt={requestId:randomUUID(),referenceId,operation:'upload',status:'pending',sha256,byteSize:png.length,error:null,assetUrl:'https://example.com/private'};
+      assert.equal((await fetch(`${h.origin}/api/climbing/media/cloud/receipt`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json'},body:JSON.stringify(leakedReceipt)})).status,400);
+
+      const failedReceipt={requestId:randomUUID(),referenceId,operation:'upload',status:'error',sha256,byteSize:png.length,error:{code:'network_unavailable',message:'iCloud could not be reached.'}};
+      response=await fetch(`${h.origin}/api/climbing/media/cloud/receipt`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json'},body:JSON.stringify(failedReceipt)});
+      assert.equal(response.status,200);
+      cloud=await response.json();
+      assert.equal(cloud.items[0].status,'error');
+      assert.deepEqual({code:cloud.items[0].error.code,message:cloud.items[0].error.message},{code:'network_unavailable',message:'iCloud could not be reached.'});
+
+      const retryReceipt={requestId:randomUUID(),referenceId,operation:'upload',status:'pending',sha256,byteSize:png.length,error:null};
+      response=await fetch(`${h.origin}/api/climbing/media/cloud/receipt`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json'},body:JSON.stringify(retryReceipt)});
+      assert.equal(response.status,200);
+      cloud=await response.json();
+      assert.equal(cloud.items[0].status,'pending');
+      const confirmedReceipt={requestId:randomUUID(),referenceId,operation:'upload',status:'confirmed',sha256,byteSize:png.length,error:null};
+      response=await fetch(`${h.origin}/api/climbing/media/cloud/receipt`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json'},body:JSON.stringify(confirmedReceipt)});
+      assert.equal(response.status,200);
+      cloud=await response.json();
+      assert.equal(cloud.items[0].status,'confirmed');
+      assert.match(cloud.items[0].confirmedAt,/^2026-|^20\d\d-/);
+      response=await fetch(`${h.origin}/api/climbing/media/cloud/receipt`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json'},body:JSON.stringify(confirmedReceipt)});
+      assert.equal(response.status,200);
+      assert.equal(response.headers.get('x-idempotent-replay'),'true');
+      response=await fetch(`${h.origin}/api/climbing/media/cloud/receipt`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json'},body:JSON.stringify({...confirmedReceipt,status:'error',error:{code:'late',message:'Late failure'}})});
+      assert.equal(response.status,409);
+      assert.equal((await response.json()).code,'cloud_media_receipt_conflict');
+
       response=await upload();
       assert.equal(response.status,200);
       assert.equal(response.headers.get('x-idempotent-replay'),'true');
@@ -734,6 +977,33 @@ test('Climbing API persists private state and rejects stale, cross-origin, malfo
       assert.equal(videoDelete.status,200);
       saved=await videoDelete.json();
 
+      const changedPng=Buffer.from(png);
+      changedPng[changedPng.length-1]^=1;
+      const changedSha256=createHash('sha256').update(changedPng).digest('hex');
+      const replacementPath=`${mediaPath}.replacement`;
+      await writeFile(replacementPath,changedPng,{mode:0o600});
+      await rename(replacementPath,mediaPath);
+      cloudResponse=await fetch(`${h.origin}/api/climbing/media/cloud/status`);
+      cloud=await cloudResponse.json();
+      assert.deepEqual(
+        {operation:cloud.items.find(item=>item.referenceId===referenceId).operation,status:cloud.items.find(item=>item.referenceId===referenceId).status,sha256:cloud.items.find(item=>item.referenceId===referenceId).sha256},
+        {operation:'upload',status:'pending',sha256:changedSha256},
+        'same-length file replacement must invalidate a previously confirmed iCloud copy',
+      );
+
+      await rm(mediaPath);
+      const mismatchedRestore=await upload();
+      assert.equal(mismatchedRestore.status,409);
+      assert.equal((await mismatchedRestore.json()).code,'reference_conflict');
+      await assert.rejects(stat(mediaPath),error=>error.code==='ENOENT');
+      await writeFile(mediaPath,png,{mode:0o600});
+      cloudResponse=await fetch(`${h.origin}/api/climbing/media/cloud/status`);
+      cloud=await cloudResponse.json();
+      assert.deepEqual(
+        {status:cloud.items.find(item=>item.referenceId===referenceId).status,sha256:cloud.items.find(item=>item.referenceId===referenceId).sha256},
+        {status:'pending',sha256},
+      );
+
       if (process.platform !== 'win32' && process.getuid?.() !== 0) {
         const mediaDirectory=join(h.directory,'climbing-media');
         await chmod(mediaDirectory,0o500);
@@ -756,6 +1026,15 @@ test('Climbing API persists private state and rejects stale, cross-origin, malfo
       saved=await response.json();
       assert.equal(saved.goalReferences.some(reference=>reference.id===referenceId),false);
       await assert.rejects(stat(mediaPath),error=>error.code==='ENOENT');
+      cloudResponse=await fetch(`${h.origin}/api/climbing/media/cloud/status`);
+      cloud=await cloudResponse.json();
+      const deleteItem=cloud.items.find(item=>item.referenceId===referenceId);
+      assert.deepEqual({operation:deleteItem.operation,status:deleteItem.status,sha256:deleteItem.sha256,byteSize:deleteItem.byteSize},{operation:'delete',status:'pending',sha256,byteSize:png.length});
+      const deleteReceipt={requestId:randomUUID(),referenceId,operation:'delete',status:'confirmed',sha256,byteSize:png.length,error:null};
+      response=await fetch(`${h.origin}/api/climbing/media/cloud/receipt`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json'},body:JSON.stringify(deleteReceipt)});
+      assert.equal(response.status,200);
+      cloud=await response.json();
+      assert.equal(cloud.items.find(item=>item.referenceId===referenceId).status,'confirmed');
       response=await fetch(`${h.origin}/api/climbing/media/delete`,{method:'POST',headers:{Origin:h.origin,'Content-Type':'application/json'},body:JSON.stringify({requestId:randomUUID(),goalId:goal.id,referenceId})});
       assert.equal(response.headers.get('x-idempotent-replay'),'true');
       saved=await response.json();

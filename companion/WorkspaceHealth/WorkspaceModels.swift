@@ -357,6 +357,7 @@ enum ClimbingPlanStatus: String, Codable, CaseIterable, Hashable, Sendable {
 
 struct Climb: Codable, Identifiable, Hashable, Sendable {
     var id: String
+    var projectGoalId: String?
     var name: String
     var discipline: ClimbDiscipline
     var ropeStyle: RopeStyle?
@@ -369,6 +370,7 @@ struct Climb: Codable, Identifiable, Hashable, Sendable {
     static func new(discipline: ClimbDiscipline = .boulder) -> Climb {
         Climb(
             id: UUID().uuidString.lowercased(),
+            projectGoalId: nil,
             name: "",
             discipline: discipline,
             ropeStyle: discipline == .route ? .topRope : nil,
@@ -380,10 +382,11 @@ struct Climb: Codable, Identifiable, Hashable, Sendable {
         )
     }
 
-    enum CodingKeys: String, CodingKey { case id, name, discipline, ropeStyle, gradeSystem, grade, outcome, attempts, notes }
+    enum CodingKeys: String, CodingKey { case id, projectGoalId, name, discipline, ropeStyle, gradeSystem, grade, outcome, attempts, notes }
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(id, forKey: .id)
+        try values.encodeNullable(projectGoalId, forKey: .projectGoalId)
         try values.encode(name, forKey: .name)
         try values.encode(discipline, forKey: .discipline)
         try values.encodeNullable(ropeStyle, forKey: .ropeStyle)

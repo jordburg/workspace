@@ -13,10 +13,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import {
   climbingGoalSchema, climbingPlanSchema, climbingSessionSchema, climbingStateSchema, consistencyProgress, emptyClimbing,
-  focusNames, goalKindNames, gradeSystemNames, routineFocusNames, routineSchema, routineSnapshot, sessionSends,
+  focusNames, goalKindNames, gradeSystemNames, prefixByUtf16Units, projectGoalHistory, routineFocusNames, routineSchema, routineSnapshot, sessionSends,
   type Climb, type ClimbingChange, type ClimbingGoal, type ClimbingPlan, type ClimbingSession, type ClimbingState, type GoalReference, type GradeSystem,
   type Routine, type RoutineExecution, type RoutineStep,
 } from "@/lib/climbing";
+import { climbingCloudMediaViewSchema, emptyClimbingCloudMedia, type ClimbingCloudMediaItem, type ClimbingCloudMediaView } from "@/lib/climbing-cloud-media";
 import { healthWorkoutDay, healthWorkoutTimeZone, uniqueHealthWorkouts, type HealthView, type HealthWorkout } from "@/lib/health";
 import type { IntegrationLink, RemoteEvent, RemoteTask } from "@/lib/integrations/model";
 import { dateKey } from "@/lib/workspace";
@@ -45,11 +46,13 @@ const linkFor = (links: IntegrationLink[], role: IntegrationLink["role"], entity
 const remoteFor = <T extends { id: string }>(items: T[], link?: IntegrationLink) => link ? items.find(item => item.id === link.remoteId) : undefined;
 const referenceHref = (reference: GoalReference) => reference.kind === "link" ? reference.url ?? "" : `/api/climbing/media/${encodeURIComponent(reference.id)}`;
 const referenceName = (reference: GoalReference) => reference.label || reference.fileName || (reference.kind === "link" && reference.url ? new URL(reference.url).hostname : "Beta reference");
-const referenceDetail = (reference: GoalReference) => {
+const referenceDetail = (reference: GoalReference, cloud?: ClimbingCloudMediaItem) => {
   if (reference.kind === "link") { try { return new URL(reference.url ?? "").hostname.replace(/^www\./, ""); } catch { return "Link"; } }
   const size = reference.byteSize ? reference.byteSize >= 1_000_000 ? `${(reference.byteSize / 1_000_000).toFixed(reference.byteSize >= 10_000_000 ? 0 : 1)} MB` : `${Math.max(1, Math.round(reference.byteSize / 1000))} KB` : "";
-  return `${reference.kind === "video" ? "Video" : "Image"}${size ? ` · ${size}` : ""}`;
+  const sync = cloud?.operation === "upload" ? cloud.status === "confirmed" ? "iCloud copy last confirmed" : cloud.status === "error" ? "iCloud copy needs attention" : "iCloud copy pending" : "";
+  return `${reference.kind === "video" ? "Video" : "Image"}${size ? ` · ${size}` : ""}${sync ? ` · ${sync}` : ""}`;
 };
+const outcomeNames: Record<Climb["outcome"], string> = { attempt: "Attempt", send: "Send", flash: "Flash", onsight: "Onsight", redpoint: "Redpoint", repeat: "Repeat" };
 
 function workoutTime(workout: HealthWorkout, snapshotTimeZone: string) { return new Date(workout.start).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZone: healthWorkoutTimeZone(workout, snapshotTimeZone) }); }
 function workoutActivity(workout: HealthWorkout) {
@@ -67,6 +70,16 @@ function newPlan(state: ClimbingState, routine: Routine | null = null): Climbing
   const stamp = now();
   return { id: crypto.randomUUID(), title: routine?.title ?? "Climbing session", date: dateKey(new Date()), startTime: null, endDate: null, endTime: null, environment: recent?.environment ?? "indoor", venue: recent?.venue ?? "", focus: routine ? "training" : recent?.focus ?? "bouldering", goalId: null, routine: routine ? routineSnapshot(routine) : null, status: "planned", sessionId: null, createdAt: stamp, updatedAt: stamp };
 }
+function projectClimb(goal: ClimbingGoal): Climb {
+  const discipline = goal.discipline ?? "boulder";
+  return {
+    id: crypto.randomUUID(), projectGoalId: goal.id, name: prefixByUtf16Units(goal.title, 120), discipline,
+    ropeStyle: discipline === "route" ? goal.ropeStyle ?? "top-rope" : null,
+    gradeSystem: gradeFits(discipline, goal.gradeSystem) ? goal.gradeSystem : null,
+    grade: gradeFits(discipline, goal.gradeSystem) ? goal.grade : null,
+    outcome: "attempt", attempts: null, notes: "",
+  };
+}
 function sessionFromPlan(plan: ClimbingPlan, event?: RemoteEvent): ClimbingSession {
   const stamp = now();
   return { id: crypto.randomUUID(), date: event?.startDate ?? plan.date, environment: plan.environment, venue: event?.location.trim() || plan.venue, focus: plan.focus, durationMinutes: null, effort: null, readiness: null, notes: "", climbs: [], routine: plan.routine ? structuredClone(plan.routine) : null, planId: plan.id, healthWorkoutId: null, deletedAt: null, createdAt: stamp, updatedAt: stamp };
@@ -79,7 +92,7 @@ function newClimb(session: ClimbingSession): Climb {
   const discipline = route ? "route" : "boulder";
   const previous = session.climbs.at(-1);
   const gradeSystem = gradeFits(discipline, previous?.gradeSystem ?? null) ? previous?.gradeSystem ?? null : null;
-  return { id: crypto.randomUUID(), name: "", discipline, ropeStyle: route ? "top-rope" : null, gradeSystem, grade: gradeSystem ? "" : null, outcome: "attempt", attempts: null, notes: "" };
+  return { id: crypto.randomUUID(), projectGoalId: null, name: "", discipline, ropeStyle: route ? "top-rope" : null, gradeSystem, grade: gradeSystem ? "" : null, outcome: "attempt", attempts: null, notes: "" };
 }
 
 function climbingChanges(current: ClimbingState, next: ClimbingState): ClimbingChange[] {
@@ -110,8 +123,11 @@ export function ClimbingPanel({ active = true, openHealth }: { active?: boolean;
   const [health, setHealth] = useState<HealthView | null>(null);
   const [healthLoaded, setHealthLoaded] = useState(false);
   const [healthError, setHealthError] = useState("");
+  const [cloudMedia, setCloudMedia] = useState<ClimbingCloudMediaView>(() => ({ version: emptyClimbingCloudMedia.version, revision: emptyClimbingCloudMedia.revision, items: [] }));
+  const [cloudMediaError, setCloudMediaError] = useState("");
   const dirtyRef = useRef(false);
   const etagRef = useRef("");
+  const cloudMediaEtagRef = useRef("");
 
   const receive = useCallback((next: ClimbingState) => { dataRef.current = next; setData(next); }, []);
   const load = useCallback(async (silent = false) => {
@@ -132,8 +148,17 @@ export function ClimbingPanel({ active = true, openHealth }: { active?: boolean;
     } catch (cause) { setHealthError(errorMessage(cause, "Apple Health could not be loaded.")); }
     finally { setHealthLoaded(true); }
   }, []);
-  useEffect(() => { if (!active) return; const timer = setTimeout(() => { void load(); void loadHealth(); }, 0); return () => clearTimeout(timer); }, [active, load, loadHealth]);
-  useEffect(() => { if (!active) return; const timer = setInterval(() => { if (document.visibilityState === "visible") void load(true); }, 15_000); return () => clearInterval(timer); }, [active, load]);
+  const loadCloudMedia = useCallback(async () => {
+    try {
+      const response = await fetch("/api/climbing/media/cloud/status", { cache: "no-store", headers: cloudMediaEtagRef.current ? { "If-None-Match": cloudMediaEtagRef.current } : {} });
+      if (response.status === 304) return true;
+      const result: unknown = await response.json();
+      if (!response.ok) throw new Error(responseError(result, "Media sync status could not be loaded."));
+      setCloudMedia(climbingCloudMediaViewSchema.parse(result)); cloudMediaEtagRef.current = response.headers.get("etag") || ""; setCloudMediaError(""); return true;
+    } catch (cause) { setCloudMediaError(errorMessage(cause, "Media sync status could not be loaded.")); return false; }
+  }, []);
+  useEffect(() => { if (!active) return; const timer = setTimeout(() => { void load(); void loadHealth(); void loadCloudMedia(); }, 0); return () => clearTimeout(timer); }, [active, load, loadHealth, loadCloudMedia]);
+  useEffect(() => { if (!active) return; const timer = setInterval(() => { if (document.visibilityState === "visible") { void load(true); void loadCloudMedia(); } }, 15_000); return () => clearInterval(timer); }, [active, load, loadCloudMedia]);
   useEffect(() => { if (!active) return; const timer = setInterval(() => { if (document.visibilityState === "visible") void loadHealth(); }, 60000); return () => clearInterval(timer); }, [active, loadHealth]);
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(""), 5000); return () => clearTimeout(timer); }, [notice]);
   useEffect(() => { if (!editor) return; const warn = (event: BeforeUnloadEvent) => { if (dirtyRef.current) event.preventDefault(); }; window.addEventListener("beforeunload", warn); return () => window.removeEventListener("beforeunload", warn); }, [editor]);
@@ -183,7 +208,7 @@ export function ClimbingPanel({ active = true, openHealth }: { active?: boolean;
         if (await referenceOutcome(referenceId, expected)) { setNotice(message); return true; }
         throw cause;
       }
-      etagRef.current = response.headers.get("etag") || ""; setNotice(message); return true;
+      etagRef.current = response.headers.get("etag") || ""; void loadCloudMedia(); setNotice(message); return true;
     } catch (cause) { setError(errorMessage(cause, "That reference could not be saved.")); return false; }
     finally { busyRef.current = false; setBusy(false); }
   }
@@ -217,6 +242,20 @@ export function ClimbingPanel({ active = true, openHealth }: { active?: boolean;
   }
   async function saveEditor(draft: Editor) {
     if (conflict) { setError("This draft is based on an older copy. Copy anything you need, then reopen the latest saved record before editing again."); return; }
+    if (!draft.isNew) {
+      const currentUpdatedAt = draft.kind === "session"
+        ? dataRef.current.sessions.find(item => item.id === draft.value.id)?.updatedAt
+        : draft.kind === "plan"
+          ? dataRef.current.plans.find(item => item.id === draft.value.id)?.updatedAt
+          : draft.kind === "goal"
+            ? dataRef.current.goals.find(item => item.id === draft.value.id)?.updatedAt
+            : dataRef.current.routines.find(item => item.id === draft.value.id)?.updatedAt;
+      if (currentUpdatedAt !== draft.value.updatedAt) {
+        setConflict(true);
+        setError("This record changed while you were editing. Your draft is still here for review or copying; close it and reopen the latest saved version before saving.");
+        return;
+      }
+    }
     try {
       const stamp = now();
       if (draft.kind === "session") {
@@ -291,13 +330,13 @@ export function ClimbingPanel({ active = true, openHealth }: { active?: boolean;
     {integrations.error && !editor && <div className="settings-link-notice" role="alert"><p>Calendar or Todoist items need attention.</p><Button variant="outline" onClick={integrations.openSettings}>Open Settings</Button></div>}
     <Tabs value={tab} onValueChange={value => setTab(value as ClimbingTab)} className="climbing-tabs">
       <TabsList aria-label="Climbing views"><TabsTrigger value="sessions"><CalendarDays/>Sessions</TabsTrigger><TabsTrigger value="goals"><Flag/>Goals</TabsTrigger><TabsTrigger value="routines"><Dumbbell/>Routines</TabsTrigger></TabsList>
-      <TabsContent value="sessions"><SessionsView loaded={loaded} busy={busy} integrationBusy={integrations.busy} sessions={sessions} plans={data.plans} removed={removed} summary={summary} links={links} events={integrations.view.events} calendarConnected={integrations.view.google.connected} edit={session => openEditor({ kind: "session", value: structuredClone(session), isNew: false })} editPlan={plan => openEditor({ kind: "plan", value: structuredClone(plan), isNew: false })} create={createSession} createPlan={createPlan} schedule={schedulePlan} openCalendar={event => openRemote({ provider: "google", item: event, day: event.startDate })} logPlan={(plan, event) => openEditor({ kind: "session", value: sessionFromPlan(plan, event), isNew: true })} togglePlan={togglePlan} forgetLink={setForgetCandidate} restore={restore}/></TabsContent>
-      <TabsContent value="goals"><GoalsView loaded={loaded} busy={busy || integrations.busy} goals={activeGoals} archived={archivedGoals} goalReferences={data.goalReferences} sessions={sessions} links={links} tasks={integrations.view.tasks} todoistConnected={integrations.view.todoist.connected} edit={goal => openEditor({ kind: "goal", value: structuredClone(goal), isNew: false })} create={createGoal} archive={toggleGoal} createTask={createGoalTask} openTask={task => openRemote({ provider: "todoist", item: task, day: task.dueDate ?? dateKey(new Date()) })}/></TabsContent>
+      <TabsContent value="sessions"><SessionsView loaded={loaded} busy={busy} integrationBusy={integrations.busy} sessions={sessions} goals={data.goals} plans={data.plans} removed={removed} summary={summary} links={links} events={integrations.view.events} calendarConnected={integrations.view.google.connected} edit={session => openEditor({ kind: "session", value: structuredClone(session), isNew: false })} editPlan={plan => openEditor({ kind: "plan", value: structuredClone(plan), isNew: false })} create={createSession} createPlan={createPlan} schedule={schedulePlan} openCalendar={event => openRemote({ provider: "google", item: event, day: event.startDate })} logPlan={(plan, event) => openEditor({ kind: "session", value: sessionFromPlan(plan, event), isNew: true })} togglePlan={togglePlan} forgetLink={setForgetCandidate} restore={restore}/></TabsContent>
+      <TabsContent value="goals"><GoalsView loaded={loaded} busy={busy || integrations.busy} goals={activeGoals} archived={archivedGoals} goalReferences={data.goalReferences} sessions={sessions} links={links} tasks={integrations.view.tasks} todoistConnected={integrations.view.todoist.connected} edit={goal => openEditor({ kind: "goal", value: structuredClone(goal), isNew: false })} editSession={session => openEditor({ kind: "session", value: structuredClone(session), isNew: false })} create={createGoal} archive={toggleGoal} createTask={createGoalTask} openTask={task => openRemote({ provider: "todoist", item: task, day: task.dueDate ?? dateKey(new Date()) })}/></TabsContent>
       <TabsContent value="routines"><RoutinesView loaded={loaded} busy={busy} routines={activeRoutines} archived={archivedRoutines} edit={routine => openEditor({ kind: "routine", value: structuredClone(routine), isNew: false })} create={createRoutine} archive={toggleRoutine} use={useRoutine} plan={planRoutine}/></TabsContent>
     </Tabs>
-    <Dialog open={editor?.kind === "session"} onOpenChange={open => { if (!open && !busy) requestEditorClose(); }}>{editor?.kind === "session" && <DialogContent className="editor-dialog climbing-dialog"><DialogTitle>{editor.isNew ? editor.value.planId ? "Log your planned session" : editor.value.routine ? `Use ${editor.value.routine.title}` : "Log a climbing session" : "Edit climbing session"}</DialogTitle><DialogDescription>{editor.value.planId ? "Record what happened. Saving links the session back to its plan in one step." : "Record what happened as completely or lightly as you like. Climb-by-climb details are optional."}</DialogDescription>{error && <EditorError error={error} conflict={conflict}/>}<SessionEditor draft={editor} dirtyRef={dirtyRef} busy={busy} blocked={conflict} health={health} healthLoaded={healthLoaded} healthError={healthError} allSessions={data.sessions} openHealth={() => { finishEditor(); openHealth(); }} save={saveEditor} remove={session => setRemoveSession(session)}/></DialogContent>}</Dialog>
+    <Dialog open={editor?.kind === "session"} onOpenChange={open => { if (!open && !busy) requestEditorClose(); }}>{editor?.kind === "session" && <DialogContent className="editor-dialog climbing-dialog"><DialogTitle>{editor.isNew ? editor.value.planId ? "Log your planned session" : editor.value.routine ? `Use ${editor.value.routine.title}` : "Log a climbing session" : "Edit climbing session"}</DialogTitle><DialogDescription>{editor.value.planId ? "Record what happened. Saving links the session back to its plan in one step." : "Record what happened as completely or lightly as you like. Climb-by-climb details are optional."}</DialogDescription>{error && <EditorError error={error} conflict={conflict}/>}<SessionEditor draft={editor} goals={data.goals} plannedProject={editor.value.planId ? data.goals.find(goal => goal.kind === "project" && goal.id === data.plans.find(plan => plan.id === editor.value.planId)?.goalId) ?? null : null} dirtyRef={dirtyRef} busy={busy} blocked={conflict} health={health} healthLoaded={healthLoaded} healthError={healthError} allSessions={data.sessions} openHealth={() => { finishEditor(); openHealth(); }} save={saveEditor} remove={session => setRemoveSession(session)}/></DialogContent>}</Dialog>
     <Dialog open={editor?.kind === "plan"} onOpenChange={open => { if (!open && !busy) requestEditorClose(); }}>{editor?.kind === "plan" && <DialogContent className="editor-dialog climbing-dialog"><DialogTitle>{editor.isNew ? "Plan a climbing session" : "Edit climbing plan"}</DialogTitle><DialogDescription>Choose the local intent first. You can review and add the plan to Google Calendar after it is saved.</DialogDescription>{error && <EditorError error={error} conflict={conflict}/>}<PlanEditor draft={editor} goals={data.goals} routines={data.routines} calendarLink={linkFor(links, "scheduled-session", editor.value.id)} event={remoteFor(integrations.view.events, linkFor(links, "scheduled-session", editor.value.id))} dirtyRef={dirtyRef} busy={busy} blocked={conflict} save={saveEditor}/></DialogContent>}</Dialog>
-    <Dialog open={editor?.kind === "goal"} onOpenChange={open => { if (!open && !busy) requestEditorClose(); }}>{editor?.kind === "goal" && <DialogContent className="editor-dialog climbing-dialog"><DialogTitle>{editor.isNew ? "Set a climbing goal" : "Edit climbing goal"}</DialogTitle><DialogDescription>Use a climb project for a specific route or problem, or track consistency, skill, and training.</DialogDescription>{error && <EditorError error={error} conflict={conflict}/>}<GoalEditor draft={editor} routines={data.routines} references={data.goalReferences.filter(reference => reference.goalId === editor.value.id)} dirtyRef={dirtyRef} busy={busy} blocked={conflict} save={saveEditor} addLink={addGoalLink} uploadFile={uploadGoalFile} removeReference={setRemoveReference}/></DialogContent>}</Dialog>
+    <Dialog open={editor?.kind === "goal"} onOpenChange={open => { if (!open && !busy) requestEditorClose(); }}>{editor?.kind === "goal" && <DialogContent className="editor-dialog climbing-dialog"><DialogTitle>{editor.isNew ? "Set a climbing goal" : "Edit climbing goal"}</DialogTitle><DialogDescription>Use a climb project for a specific route or problem, or track consistency, skill, and training.</DialogDescription>{error && <EditorError error={error} conflict={conflict}/>}<GoalEditor draft={editor} routines={data.routines} references={data.goalReferences.filter(reference => reference.goalId === editor.value.id)} cloudItems={cloudMedia.items} cloudError={cloudMediaError} sessions={data.sessions} dirtyRef={dirtyRef} busy={busy} blocked={conflict} save={saveEditor} addLink={addGoalLink} uploadFile={uploadGoalFile} removeReference={setRemoveReference}/></DialogContent>}</Dialog>
     <Dialog open={editor?.kind === "routine"} onOpenChange={open => { if (!open && !busy) requestEditorClose(); }}>{editor?.kind === "routine" && <DialogContent className="editor-dialog climbing-dialog"><DialogTitle>{editor.isNew ? "Create a training routine" : "Edit training routine"}</DialogTitle><DialogDescription>Write the workload you want to follow. Each plan or session keeps a copy of the version used.</DialogDescription>{error && <EditorError error={error} conflict={conflict}/>}<RoutineEditor draft={editor} dirtyRef={dirtyRef} busy={busy} blocked={conflict} save={saveEditor}/></DialogContent>}</Dialog>
     <AlertDialog open={!!removeSession} onOpenChange={open => !open && setRemoveSession(null)}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Remove this session?</AlertDialogTitle><AlertDialogDescription>It will stop counting toward summaries and goals. You can restore it from the removed sessions list. Any linked plan and Health workout are retained for a safe restore.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel disabled={busy}>Keep session</AlertDialogCancel><AlertDialogAction variant="destructive" disabled={busy} onClick={() => removeSession && void tombstone(removeSession)}>Remove session</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
     <AlertDialog open={!!removeReference} onOpenChange={open => !open && setRemoveReference(null)}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Remove this reference?</AlertDialogTitle><AlertDialogDescription>{removeReference?.kind === "link" ? "The saved link will be removed from this goal." : "The saved file will be permanently removed from this Mac."}</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel disabled={busy}>Keep reference</AlertDialogCancel><AlertDialogAction variant="destructive" disabled={busy} onClick={() => removeReference && void deleteGoalReference(removeReference)}>Remove</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
@@ -311,14 +350,15 @@ function EditorError({ error, conflict }: { error: string; conflict: boolean }) 
 
 type Summary = { count: number; minutes: number; timed: number; indoor: number; outdoor: number; sends: number; attempts: number };
 
-function SessionsView({ loaded, busy, integrationBusy, sessions, plans, removed, summary, links, events, calendarConnected, edit, editPlan, create, createPlan, schedule, openCalendar, logPlan, togglePlan, forgetLink, restore }: {
-  loaded: boolean; busy: boolean; integrationBusy: boolean; sessions: ClimbingSession[]; plans: ClimbingPlan[]; removed: ClimbingSession[]; summary: Summary;
+function SessionsView({ loaded, busy, integrationBusy, sessions, goals, plans, removed, summary, links, events, calendarConnected, edit, editPlan, create, createPlan, schedule, openCalendar, logPlan, togglePlan, forgetLink, restore }: {
+  loaded: boolean; busy: boolean; integrationBusy: boolean; sessions: ClimbingSession[]; goals: ClimbingGoal[]; plans: ClimbingPlan[]; removed: ClimbingSession[]; summary: Summary;
   links: IntegrationLink[]; events: RemoteEvent[]; calendarConnected: boolean; edit: (session: ClimbingSession) => void; editPlan: (plan: ClimbingPlan) => void;
   create: () => void; createPlan: () => void; schedule: (plan: ClimbingPlan) => void; openCalendar: (event: RemoteEvent) => void; logPlan: (plan: ClimbingPlan, event?: RemoteEvent) => void;
   togglePlan: (plan: ClimbingPlan) => Promise<void>; forgetLink: (link: IntegrationLink) => void; restore: (session: ClimbingSession) => Promise<void>;
 }) {
   const planned = plans.filter(plan => plan.status === "planned").sort((a, b) => a.date.localeCompare(b.date) || (a.startTime ?? "").localeCompare(b.startTime ?? ""));
   const cancelled = plans.filter(plan => plan.status === "cancelled").sort((a, b) => b.date.localeCompare(a.date));
+  const goalsById = new Map(goals.map(goal => [goal.id, goal]));
   const today = dateKey(new Date());
   return <div className="climbing-stack">
     {loaded && summary.count > 0 && <section className="climbing-summary"><div className="climbing-summary-heading"><div><span className="climbing-kicker">LAST 4 WEEKS</span><h2>Recent climbing</h2></div><span>{summary.indoor} gym · {summary.outdoor} outside</span></div><div className="climbing-metrics"><article><span>Sessions</span><strong>{summary.count}</strong></article>{summary.minutes > 0 && <article><span>Time</span><strong>{minutesLabel(summary.minutes)}</strong></article>}{summary.sends > 0 && <article><span>Sends</span><strong>{summary.sends}</strong></article>}{summary.attempts > 0 && <article><span>Attempts</span><strong>{summary.attempts}</strong></article>}</div></section>}
@@ -350,21 +390,46 @@ function SessionsView({ loaded, busy, integrationBusy, sessions, plans, removed,
       {!loaded ? <p className="climbing-loading">Loading your climbing log…</p> : sessions.length ? <div className="session-list">{sessions.map(session => {
         const sends = sessionSends(session);
         const planLink = session.planId ? linkFor(links, "scheduled-session", session.planId) : undefined;
-        return <button className="session-row" key={session.id} onClick={() => edit(session)} aria-label={`Edit climbing session at ${session.venue} on ${dayLabel(session.date)}`}><span className={`session-marker ${session.environment}`}><Mountain/></span><span className="session-main"><strong>{dayLabel(session.date)} · {session.venue}</strong><small>{focusNames[session.focus]}{session.durationMinutes ? ` · ${minutesLabel(session.durationMinutes)}` : ""}</small><span className="climbing-session-links">{planLink && <span className="connection-chip calendar"><CalendarDays/>Planned in Calendar</span>}{session.healthWorkoutId && <span className="connection-chip health"><HeartPulse/>Health linked</span>}</span>{session.notes && <p>{session.notes}</p>}</span><span className="session-counts">{session.climbs.length ? <><strong>{session.climbs.length}</strong><small>climbs</small><em>{sends} {sends === 1 ? "send" : "sends"}</em></> : session.routine ? <><Dumbbell/><small>{session.routine.title}</small></> : <small>Session note</small>}</span></button>;
+        const projectIds = [...new Set(session.climbs.flatMap(climb => climb.projectGoalId ? [climb.projectGoalId] : []))];
+        const projectLabel = projectIds.length === 1 ? `Project · ${goalsById.get(projectIds[0])?.title ?? "Linked project"}` : `${projectIds.length} projects`;
+        return <button className="session-row" key={session.id} onClick={() => edit(session)} aria-label={`Edit climbing session at ${session.venue} on ${dayLabel(session.date)}`}><span className={`session-marker ${session.environment}`}><Mountain/></span><span className="session-main"><strong>{dayLabel(session.date)} · {session.venue}</strong><small>{focusNames[session.focus]}{session.durationMinutes ? ` · ${minutesLabel(session.durationMinutes)}` : ""}</small><span className="climbing-session-links">{projectIds.length > 0 && <span className="connection-chip project"><Flag/>{projectLabel}</span>}{planLink && <span className="connection-chip calendar"><CalendarDays/>Planned in Calendar</span>}{session.healthWorkoutId && <span className="connection-chip health"><HeartPulse/>Health linked</span>}</span>{session.notes && <p>{session.notes}</p>}</span><span className="session-counts">{session.climbs.length ? <><strong>{session.climbs.length}</strong><small>climbs</small><em>{sends} {sends === 1 ? "send" : "sends"}</em></> : session.routine ? <><Dumbbell/><small>{session.routine.title}</small></> : <small>Session note</small>}</span></button>;
       })}</div> : <div className="climbing-empty"><span><Mountain/></span><h3>Log your last climbing session.</h3><p>A quick entry only needs a date, place, and session type. Add climbs or training detail when it helps.</p><Button disabled={busy} onClick={create}><Plus/>Log a session</Button></div>}
       {removed.length > 0 && <details className="climbing-archive"><summary>{removed.length} removed {removed.length === 1 ? "session" : "sessions"}</summary>{removed.map(session => <div key={session.id}><span><strong>{dayLabel(session.date)} · {session.venue}</strong><small>{focusNames[session.focus]}{session.planId ? " · plan link retained" : ""}{session.healthWorkoutId ? " · Health link retained" : ""}</small></span><Button size="sm" variant="outline" disabled={busy} onClick={() => void restore(session)}><RotateCcw/>Restore</Button></div>)}</details>}
     </section>
   </div>;
 }
 
-function GoalsView({ loaded, busy, goals, archived, goalReferences, sessions, links, tasks, todoistConnected, edit, create, archive, createTask, openTask }: {
+type ProjectHistory = ReturnType<typeof projectGoalHistory>;
+
+function ProjectStats({ history }: { history: ProjectHistory }) {
+  const manualAttempts = history.manualAttemptCount ?? 0;
+  if (!history.linkedSessionCount && !history.knownLinkedAttempts && !manualAttempts && !history.uncountedLinkedClimbs) return null;
+  return <section className="goal-project-stats" aria-label="Project session totals">
+    <div>{history.linkedSessionCount > 0 && <span><strong>{history.linkedSessionCount}</strong><small>{history.linkedSessionCount === 1 ? "linked session" : "linked sessions"}</small></span>}{history.knownLinkedAttempts > 0 && <span><strong>{history.knownLinkedAttempts}</strong><small>session-recorded attempts</small></span>}{manualAttempts > 0 && <span><strong>{manualAttempts}</strong><small>manual attempt total</small></span>}{history.uncountedLinkedClimbs > 0 && <span className="needs-count"><strong>{history.uncountedLinkedClimbs}</strong><small>{history.uncountedLinkedClimbs === 1 ? "linked entry without a count" : "linked entries without counts"}</small></span>}</div>
+    {(history.lastTriedOn || history.firstCompletion) && <p>{history.lastTriedOn && <span>Last worked {dayLabel(history.lastTriedOn)}</span>}{history.firstCompletion && <span>Sent {dayLabel(history.firstCompletion.session.date)} · {outcomeNames[history.firstCompletion.climb.outcome]}</span>}</p>}
+  </section>;
+}
+
+function ProjectHistoryDetails({ history, openSession }: { history: ProjectHistory; openSession?: (session: ClimbingSession) => void }) {
+  if (!history.entries.length) return null;
+  return <details className="goal-project-history">
+    <summary><span><Activity/>Session history</span><small>{history.linkedSessionCount}</small></summary>
+    <div>{[...history.entries].reverse().map(({ session, climb }) => {
+      const copy = <><span><strong>{dayLabel(session.date)} · {session.venue}</strong><small>{outcomeNames[climb.outcome]} · {climb.attempts === null ? "Attempt count missing" : `${climb.attempts} ${climb.attempts === 1 ? "attempt" : "attempts"}`}</small>{climb.notes && <small className="project-history-note">{climb.notes}</small>}</span>{openSession && <ExternalLink/>}</>;
+      return openSession ? <button type="button" key={`${session.id}:${climb.id}`} onClick={() => openSession(session)} aria-label={`Open ${session.venue} session from ${dayLabel(session.date)}`}>{copy}</button> : <div key={`${session.id}:${climb.id}`}>{copy}</div>;
+    })}</div>
+  </details>;
+}
+
+function GoalsView({ loaded, busy, goals, archived, goalReferences, sessions, links, tasks, todoistConnected, edit, editSession, create, archive, createTask, openTask }: {
   loaded: boolean; busy: boolean; goals: ClimbingGoal[]; archived: ClimbingGoal[]; goalReferences: GoalReference[]; sessions: ClimbingSession[]; links: IntegrationLink[]; tasks: RemoteTask[]; todoistConnected: boolean;
-  edit: (goal: ClimbingGoal) => void; create: () => void; archive: (goal: ClimbingGoal) => Promise<void>; createTask: (goal: ClimbingGoal) => void; openTask: (task: RemoteTask) => void;
+  edit: (goal: ClimbingGoal) => void; editSession: (session: ClimbingSession) => void; create: () => void; archive: (goal: ClimbingGoal) => Promise<void>; createTask: (goal: ClimbingGoal) => void; openTask: (task: RemoteTask) => void;
 }) {
   return <div className="climbing-stack"><section className="climbing-card"><div className="climbing-card-heading"><div><h2>What you’re working toward</h2></div>{goals.length > 0 && <Button variant="outline" disabled={busy} onClick={create}><Plus/>New goal</Button>}</div>
     {!loaded ? <p className="climbing-loading">Loading your goals…</p> : goals.length ? <div className="goal-grid">{goals.map(goal => {
       const measured = consistencyProgress(goal, sessions);
       const percent = goal.kind === "consistency" ? measured.percent : goal.progress;
+      const history = goal.kind === "project" ? projectGoalHistory(goal, sessions) : null;
       const taskLinks = links.filter(link => link.role === "goal-next-step" && link.entityId === goal.id);
       const references = goalReferences.filter(reference => reference.goalId === goal.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       const firstReference = references[0];
@@ -373,11 +438,11 @@ function GoalsView({ loaded, busy, goals, archived, goalReferences, sessions, li
         goal.venue,
         goal.environment === "indoor" ? "Gym" : goal.environment === "outdoor" ? "Outside" : null,
         goal.ropeStyle ? ropeStyleNames[goal.ropeStyle] : null,
-        typeof goal.attempts === "number" ? `${goal.attempts} ${goal.attempts === 1 ? "attempt" : "attempts"}` : null,
       ].filter(Boolean).join(" · ") : "";
       const projectKind = goal.discipline === "boulder" ? "Boulder project" : goal.discipline === "route" ? "Route project" : goalKindNames.project;
-      const statusLabel = goal.kind === "project" ? { active: "Projecting", paused: "Paused", completed: "Sent" }[goal.status] : goal.status;
-      return <article className="goal-card" key={goal.id}><div className="goal-top"><span className={`goal-status ${goal.status}`}>{statusLabel}</span><span>{goal.kind === "project" ? projectKind : goalKindNames[goal.kind]}</span></div><div className="goal-body"><h3>{goal.title}</h3>{projectMeta && <div className="goal-project-meta">{projectMeta}</div>}{goal.description && <p>{goal.description}</p>}{goal.kind !== "project" && <div className="goal-progress"><Progress value={percent} aria-label={`${goal.title} progress`}/><span>{goal.kind === "consistency" ? `${measured.completed} of ${measured.target} sessions` : `${goal.progress}%`}</span></div>}{goal.nextStep && <small><strong>Next:</strong> {goal.nextStep}</small>}{goal.targetDate && <small>Target · {dayLabel(goal.targetDate)}</small>}
+      const effectiveProjectStatus = goal.kind === "project" && history ? history.effectiveStatus : goal.status;
+      const statusLabel = goal.kind === "project" ? { active: "Projecting", paused: "Paused", completed: "Sent" }[effectiveProjectStatus] : goal.status;
+      return <article className="goal-card" key={goal.id}><div className="goal-top"><span className={`goal-status ${effectiveProjectStatus}`}>{statusLabel}</span><span>{goal.kind === "project" ? projectKind : goalKindNames[goal.kind]}</span></div><div className="goal-body"><h3>{goal.title}</h3>{projectMeta && <div className="goal-project-meta">{projectMeta}</div>}{goal.description && <p>{goal.description}</p>}{history && <><ProjectStats history={history}/><ProjectHistoryDetails history={history} openSession={editSession}/></>}{goal.kind !== "project" && <div className="goal-progress"><Progress value={percent} aria-label={`${goal.title} progress`}/><span>{goal.kind === "consistency" ? `${measured.completed} of ${measured.target} sessions` : `${goal.progress}%`}</span></div>}{goal.nextStep && <small><strong>Next:</strong> {goal.nextStep}</small>}{goal.targetDate && <small>Target · {dayLabel(goal.targetDate)}</small>}
         {firstReference && <a className="goal-reference-summary" href={referenceHref(firstReference)} target="_blank" rel="noreferrer" aria-label={`Open ${referenceName(firstReference)} for ${goal.title}`}><ReferenceIcon reference={firstReference}/><span><strong>Beta · {references.length}</strong><small>{referenceName(firstReference)}</small></span><ExternalLink/></a>}
         {taskLinks.length > 0 && <div className="goal-linked-tasks" aria-label={`Todoist actions linked to ${goal.title}`}>{taskLinks.map(link => { const task = remoteFor(tasks, link); return task ? <button key={link.id} disabled={busy} onClick={() => openTask(task)} aria-label={`Edit linked Todoist task ${task.title}`}><ListTodo/><span><strong>{task.title}</strong><small>{task.dueDate ? `Due ${dayLabel(task.dueDate)}` : "No due date"}</small></span></button> : <div className="goal-missing-task" key={link.id}><ListTodo/><span><strong>{todoistConnected ? "No longer active in Todoist" : "Todoist disconnected"}</strong><small>{todoistConnected ? "It may be completed, deleted, or moved outside Personal." : "The saved task link is retained."}</small></span></div>; })}</div>}
       </div><div className="goal-actions"><div className="goal-primary-actions"><Button size="sm" variant="outline" disabled={busy} onClick={() => createTask(goal)}>{todoistConnected ? <><Plus/>Add next action to Todoist</> : <><Link2/>Open Settings</>}</Button><button className="climbing-quiet-action" disabled={busy} onClick={() => edit(goal)}>Edit goal</button></div><button className="climbing-quiet-action" disabled={busy} onClick={() => void archive(goal)}><Archive/>Archive</button></div></article>;
@@ -425,8 +490,8 @@ function PlanEditor({ draft, goals, routines, calendarLink, event, dirtyRef, bus
   </form>;
 }
 
-function SessionEditor({ draft, dirtyRef, busy, blocked, health, healthLoaded, healthError, allSessions, openHealth, save, remove }: {
-  draft: Extract<Editor, { kind: "session" }>; dirtyRef: MutableRefObject<boolean>; busy: boolean; blocked: boolean; health: HealthView | null;
+function SessionEditor({ draft, goals, plannedProject, dirtyRef, busy, blocked, health, healthLoaded, healthError, allSessions, openHealth, save, remove }: {
+  draft: Extract<Editor, { kind: "session" }>; goals: ClimbingGoal[]; plannedProject: ClimbingGoal | null; dirtyRef: MutableRefObject<boolean>; busy: boolean; blocked: boolean; health: HealthView | null;
   healthLoaded: boolean; healthError: string; allSessions: ClimbingSession[]; openHealth: () => void; save: (draft: Editor) => Promise<void>; remove: (session: ClimbingSession) => void;
 }) {
   const [value, setValue] = useState(draft.value);
@@ -434,6 +499,16 @@ function SessionEditor({ draft, dirtyRef, busy, blocked, health, healthLoaded, h
   const dirty = JSON.stringify(value) !== JSON.stringify(draft.value);
   useEffect(() => { dirtyRef.current = dirty; return () => { dirtyRef.current = false; }; }, [dirty, dirtyRef]);
   const updateClimb = (id: string, update: Partial<Climb>) => setValue(current => ({ ...current, climbs: current.climbs.map(climb => climb.id === id ? { ...climb, ...update } : climb) }));
+  const projectGoals = goals.filter(goal => goal.kind === "project").sort((a, b) => Number(!!a.archivedAt) - Number(!!b.archivedAt) || a.title.localeCompare(b.title));
+  const linkedProjectIds = new Set(value.climbs.flatMap(climb => climb.projectGoalId ? [climb.projectGoalId] : []));
+  const persistedClimbIds = new Set(draft.isNew ? [] : draft.value.climbs.map(climb => climb.id));
+  const availableProjects = projectGoals.filter(goal => !linkedProjectIds.has(goal.id));
+  const suggestedProject = plannedProject && !linkedProjectIds.has(plannedProject.id) ? plannedProject : null;
+  const pickerProjects = availableProjects.filter(goal => goal.id !== suggestedProject?.id);
+  const addProject = (goalId: string) => {
+    const goal = projectGoals.find(candidate => candidate.id === goalId);
+    if (goal && !linkedProjectIds.has(goal.id)) setValue(current => ({ ...current, climbs: [...current.climbs, projectClimb(goal)] }));
+  };
   const updateRoutine = (update: RoutineExecution) => setValue(current => ({ ...current, routine: update }));
   const snapshot = health?.snapshot;
   const selectedWorkoutId = value.healthWorkoutId?.toLowerCase() ?? null;
@@ -450,7 +525,7 @@ function SessionEditor({ draft, dirtyRef, busy, blocked, health, healthLoaded, h
     <div className="climbing-form-grid three"><label>Duration <span>optional</span><Input type="number" min={5} max={900} disabled={busy} value={value.durationMinutes ?? ""} placeholder="Minutes" onChange={event => setValue({ ...value, durationMinutes: nullableNumber(event.target.value) })}/></label><label>Effort <span>optional</span><select disabled={busy} value={value.effort ?? ""} onChange={event => setValue({ ...value, effort: nullableNumber(event.target.value) })}><option value="">Not logged</option>{Array.from({ length: 10 }, (_, index) => <option key={index + 1} value={index + 1}>{index + 1} / 10</option>)}</select></label><label>How you arrived <span>optional</span><select disabled={busy} value={value.readiness ?? ""} onChange={event => setValue({ ...value, readiness: event.target.value ? event.target.value as ClimbingSession["readiness"] : null })}><option value="">Not logged</option><option value="fresh">Fresh</option><option value="steady">Steady</option><option value="tired">Tired</option><option value="sore">Sore</option></select></label></div>
     <HealthContext health={health} healthLoaded={healthLoaded} error={healthError} day={value.date} healthDay={healthDay} workouts={workouts} linkedWorkout={linkedWorkout} linkedWorkoutDay={linkedWorkoutDay} selectedId={value.healthWorkoutId ?? null} duration={value.durationMinutes} busy={busy} navigationDisabled={dirty} choose={id => setValue(current => ({ ...current, healthWorkoutId: id }))} applyDuration={minutes => setValue(current => ({ ...current, durationMinutes: minutes }))} openHealth={openHealth}/>
     {value.routine && <section className="routine-execution"><div><span className="climbing-kicker">ROUTINE SNAPSHOT · V{value.routine.version}</span><h3>{value.routine.title}</h3><p>{value.routine.description || "This copy belongs to this session and will not change when you edit the routine."}{value.routine.estimatedMinutes ? ` · Planned ${value.routine.estimatedMinutes} minutes.` : ""}</p></div>{value.routine.steps.map((step, index) => <div className="execution-step" key={step.id}><span>{index + 1}</span><div><strong>{step.name}</strong><small>{step.prescription}{step.rest ? ` · Rest ${step.rest}` : ""}{step.notes ? ` · ${step.notes}` : ""}</small><select aria-label={`${step.name} status`} disabled={busy} value={step.status} onChange={event => updateRoutine({ ...value.routine!, steps: value.routine!.steps.map(item => item.id === step.id ? { ...item, status: event.target.value as typeof step.status } : item) })}><option value="not-logged">Not marked</option><option value="done">Done as planned</option><option value="modified">Modified</option><option value="skipped">Skipped</option></select><Input aria-label={`${step.name} result`} disabled={busy} maxLength={500} value={step.result} placeholder="What you did (optional)" onChange={event => updateRoutine({ ...value.routine!, steps: value.routine!.steps.map(item => item.id === step.id ? { ...item, result: event.target.value } : item) })}/></div></div>)}</section>}
-    <section className="climb-editor"><div className="climbing-card-heading"><div><h3>Climbs</h3><p>Optional details, kept exactly as you log them.</p></div><Button type="button" variant="outline" disabled={busy || value.climbs.length >= 200} onClick={() => setValue({ ...value, climbs: [...value.climbs, newClimb(value)] })}><Plus/>Add climb</Button></div>{value.climbs.map((climb, index) => <ClimbEditor key={climb.id} climb={climb} index={index} busy={busy} update={update => updateClimb(climb.id, update)} remove={() => setValue({ ...value, climbs: value.climbs.filter(item => item.id !== climb.id) })}/>)}</section>
+    <section className="climb-editor"><div className="climbing-card-heading"><div><h3>Climbs</h3><p>Link project work here so attempts and sends stay with both records.</p></div><div className="climb-editor-actions">{pickerProjects.length > 0 && value.climbs.length < 200 && <label><Flag/><span>Project</span><select aria-label="Add a project climb" disabled={busy} value="" onChange={event => addProject(event.target.value)}><option value="" disabled>Add project climb…</option>{pickerProjects.map(goal => <option key={goal.id} value={goal.id}>{goal.title}{goal.grade ? ` · ${goal.grade}` : ""}{goal.archivedAt ? " (archived)" : ""}</option>)}</select></label>}<Button type="button" variant="outline" disabled={busy || value.climbs.length >= 200} onClick={() => setValue({ ...value, climbs: [...value.climbs, newClimb(value)] })}><Plus/>Add other climb</Button></div></div>{suggestedProject && value.climbs.length < 200 && <div className="planned-project-suggestion"><Flag/><span><strong>{suggestedProject.title}</strong><small>Planned project{suggestedProject.archivedAt ? " · archived" : ""}. Add it only if you worked on it.</small></span><Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => addProject(suggestedProject.id)}>Add project work</Button></div>}{value.climbs.map((climb, index) => <ClimbEditor key={climb.id} climb={climb} index={index} busy={busy} projects={projectGoals.filter(goal => !linkedProjectIds.has(goal.id) || goal.id === climb.projectGoalId)} preserveSnapshotOnLink={persistedClimbIds.has(climb.id)} update={update => updateClimb(climb.id, update)} remove={() => setValue({ ...value, climbs: value.climbs.filter(item => item.id !== climb.id) })}/>)}</section>
     <label>Session notes <span>optional</span><Textarea maxLength={5000} disabled={busy} value={value.notes} placeholder="What felt good, what you learned, or what to return to…" onChange={event => setValue({ ...value, notes: event.target.value })}/></label>
     <div className="editor-actions">{!draft.isNew ? <button className="delete-button" type="button" disabled={busy} onClick={() => remove(value)}><Trash2/>Remove session</button> : <span/>}<div><DialogClose asChild><Button type="button" variant="outline" disabled={busy}>Cancel</Button></DialogClose><Button type="submit" disabled={busy || blocked}>{busy ? "Saving…" : blocked ? "Reopen latest to save" : draft.isNew ? "Save session" : "Save changes"}</Button></div></div>
   </form>;
@@ -477,14 +552,31 @@ function HealthContext({ health, healthLoaded, error, day, healthDay, workouts, 
   </section>;
 }
 
-function ClimbEditor({ climb, index, busy, update, remove }: { climb: Climb; index: number; busy: boolean; update: (value: Partial<Climb>) => void; remove: () => void }) {
+function ClimbEditor({ climb, index, busy, projects, preserveSnapshotOnLink, update, remove }: { climb: Climb; index: number; busy: boolean; projects: ClimbingGoal[]; preserveSnapshotOnLink: boolean; update: (value: Partial<Climb>) => void; remove: () => void }) {
   function chooseDiscipline(discipline: Climb["discipline"]) {
     const incompatibleGrade = !gradeFits(discipline, climb.gradeSystem);
     const incompatibleOutcome = discipline === "boulder" && ["onsight", "redpoint"].includes(climb.outcome);
     update({ discipline, ropeStyle: discipline === "route" ? climb.ropeStyle ?? "top-rope" : null, ...(incompatibleGrade ? { gradeSystem: null, grade: null } : {}), ...(incompatibleOutcome ? { outcome: "send" } : {}) });
   }
+  function chooseProject(goalId: string) {
+    if (!goalId) { update({ projectGoalId: null }); return; }
+    const goal = projects.find(candidate => candidate.id === goalId);
+    if (!goal) return;
+    if (preserveSnapshotOnLink) { update({ projectGoalId: goal.id }); return; }
+    const discipline = goal.discipline ?? climb.discipline;
+    const gradeSystem = gradeFits(discipline, goal.gradeSystem) ? goal.gradeSystem : null;
+    update({
+      projectGoalId: goal.id, name: prefixByUtf16Units(goal.title, 120), discipline,
+      ropeStyle: discipline === "route" ? goal.ropeStyle ?? climb.ropeStyle ?? "top-rope" : null,
+      gradeSystem, grade: gradeSystem ? goal.grade : null,
+      ...(discipline === "boulder" && ["onsight", "redpoint"].includes(climb.outcome) ? { outcome: "send" as const } : {}),
+    });
+  }
+  const linkedProject = projects.find(goal => goal.id === climb.projectGoalId);
   return <fieldset className="climb-entry">
     <legend>Climb {index + 1}</legend><button className="icon-button" type="button" aria-label={`Remove climb ${index + 1}`} disabled={busy} onClick={remove}><Trash2/></button>
+    {(projects.length > 0 || climb.projectGoalId) && <label className="climb-project-link">Project link <span>optional</span><select disabled={busy} value={climb.projectGoalId ?? ""} onChange={event => chooseProject(event.target.value)}><option value="">Not a project climb</option>{projects.map(goal => <option key={goal.id} value={goal.id}>{goal.title}{goal.grade ? ` · ${goal.grade}` : ""}{goal.archivedAt ? " (archived)" : ""}</option>)}</select></label>}
+    {linkedProject && <p className="climb-project-note"><Flag/>Linked to {linkedProject.title}. The identity below is this session’s editable snapshot.</p>}
     <label>Problem or route<Input required maxLength={120} disabled={busy} value={climb.name} placeholder="Name, number, or wall label" onChange={event => update({ name: event.target.value })}/></label>
     <div className="climbing-form-grid three"><label>Climbing type<select disabled={busy} value={climb.discipline} onChange={event => chooseDiscipline(event.target.value as Climb["discipline"])}><option value="boulder">Boulder</option><option value="route">Roped route</option></select></label>{climb.discipline === "route" && <label>Rope style<select disabled={busy} value={climb.ropeStyle ?? "top-rope"} onChange={event => update({ ropeStyle: event.target.value as NonNullable<Climb["ropeStyle"]> })}><option value="top-rope">Top rope</option><option value="sport-lead">Sport lead</option><option value="trad-lead">Trad lead</option><option value="follow">Follow</option><option value="auto-belay">Auto belay</option></select></label>}<label>Outcome<select disabled={busy} value={climb.outcome} onChange={event => { const outcome = event.target.value as Climb["outcome"]; update({ outcome, ...(["flash", "onsight"].includes(outcome) ? { attempts: 1 } : {}) }); }}><option value="attempt">Attempt</option><option value="send">Send</option><option value="flash">Flash</option>{climb.discipline === "route" && <><option value="onsight">Onsight</option><option value="redpoint">Redpoint</option></>}<option value="repeat">Repeat</option></select></label></div>
     <div className="climbing-form-grid three"><label>Grade system<select disabled={busy} value={climb.gradeSystem ?? ""} onChange={event => update(event.target.value ? { gradeSystem: event.target.value as GradeSystem, grade: climb.grade ?? "" } : { gradeSystem: null, grade: null })}><option value="">Ungraded</option>{Object.entries(gradeSystemNames).filter(([key]) => climb.discipline === "boulder" ? !["yds", "french", "uiaa", "uk"].includes(key) : !["v-scale", "font"].includes(key)).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></label><label>Grade label<Input required={!!climb.gradeSystem} maxLength={30} disabled={busy || !climb.gradeSystem} value={climb.grade ?? ""} placeholder={climb.gradeSystem ? "Keep the original label" : "Choose a system first"} onChange={event => update({ grade: event.target.value })}/></label><label>Attempts <span>optional</span><Input type="number" min={1} max={99} disabled={busy || ["flash", "onsight"].includes(climb.outcome)} value={climb.attempts ?? ""} placeholder="Not logged" onChange={event => update({ attempts: nullableNumber(event.target.value) })}/></label></div>
@@ -496,8 +588,8 @@ function ReferenceIcon({ reference }: { reference: GoalReference }) {
   return <span className={`goal-reference-icon ${reference.kind}`} aria-hidden="true">{reference.kind === "video" ? <FileVideo/> : reference.kind === "image" ? <ImageIcon/> : <Link2/>}</span>;
 }
 
-function GoalReferencesEditor({ goalId, references, busy, addLink, uploadFile, removeReference }: {
-  goalId: string; references: GoalReference[]; busy: boolean;
+function GoalReferencesEditor({ goalId, references, cloudItems, cloudError, busy, addLink, uploadFile, removeReference }: {
+  goalId: string; references: GoalReference[]; cloudItems: ClimbingCloudMediaItem[]; cloudError: string; busy: boolean;
   addLink: (goalId: string, label: string, url: string) => Promise<boolean>;
   uploadFile: (goalId: string, file: File) => Promise<boolean>;
   removeReference: (reference: GoalReference) => void;
@@ -525,6 +617,7 @@ function GoalReferencesEditor({ goalId, references, busy, addLink, uploadFile, r
       <Button type="button" size="sm" variant="outline" disabled={busy || full} onClick={() => fileInput.current?.click()}><Upload/>Add file</Button>
       <Button type="button" size="sm" variant="outline" disabled={busy || full} aria-expanded={linkOpen} onClick={() => { setLinkOpen(open => !open); setLinkError(""); }}><Link2/>Add link</Button>
       {full && <span>12-reference limit reached</span>}
+      {cloudError && <span role="status">iCloud copy status unavailable</span>}
     </div>
     {linkOpen && <div className="goal-reference-link-fields">
       <label>Link<Input type="url" inputMode="url" autoComplete="url" disabled={busy || full} value={linkUrl} placeholder="https://…" onChange={event => setLinkUrl(event.target.value)} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); void submitLink(); } }}/></label>
@@ -533,17 +626,19 @@ function GoalReferencesEditor({ goalId, references, busy, addLink, uploadFile, r
       {linkError && <p role="alert">{linkError}</p>}
     </div>}
     {sorted.length > 0 && <div className="goal-reference-list">{sorted.map(reference => <div className="goal-reference-row" key={reference.id}>
-      <ReferenceIcon reference={reference}/><a href={referenceHref(reference)} target="_blank" rel="noreferrer"><strong>{referenceName(reference)}</strong><small>{referenceDetail(reference)}</small></a><button type="button" className="icon-button" disabled={busy} aria-label={`Remove ${referenceName(reference)}`} onClick={() => removeReference(reference)}><Trash2/></button>
+      <ReferenceIcon reference={reference}/><a href={referenceHref(reference)} target="_blank" rel="noreferrer"><strong>{referenceName(reference)}</strong><small>{referenceDetail(reference, cloudItems.find(item => item.referenceId === reference.id))}</small></a><button type="button" className="icon-button" disabled={busy} aria-label={`Remove ${referenceName(reference)}`} onClick={() => removeReference(reference)}><Trash2/></button>
     </div>)}</div>}
   </details>;
 }
 
-function GoalEditor({ draft, routines, references, dirtyRef, busy, blocked, save, addLink, uploadFile, removeReference }: {
-  draft: Extract<Editor, { kind: "goal" }>; routines: Routine[]; references: GoalReference[]; dirtyRef: MutableRefObject<boolean>; busy: boolean; blocked: boolean;
+function GoalEditor({ draft, routines, references, cloudItems, cloudError, sessions, dirtyRef, busy, blocked, save, addLink, uploadFile, removeReference }: {
+  draft: Extract<Editor, { kind: "goal" }>; routines: Routine[]; references: GoalReference[]; cloudItems: ClimbingCloudMediaItem[]; cloudError: string; sessions: ClimbingSession[]; dirtyRef: MutableRefObject<boolean>; busy: boolean; blocked: boolean;
   save: (draft: Editor) => Promise<void>; addLink: (goalId: string, label: string, url: string) => Promise<boolean>; uploadFile: (goalId: string, file: File) => Promise<boolean>; removeReference: (reference: GoalReference) => void;
 }) {
   const [value, setValue] = useState(draft.value);
   const routineOptions = routines.filter(routine => !routine.archived || routine.id === value.routineId);
+  const hasLinkedSession = sessions.some(session => session.climbs.some(climb => climb.projectGoalId === value.id));
+  const history = value.kind === "project" ? projectGoalHistory(value, sessions) : null;
   function normalizedGoal(candidate: ClimbingGoal) {
     const project = candidate.kind === "project";
     const gradeSystem = project && candidate.discipline && gradeFits(candidate.discipline, candidate.gradeSystem) ? candidate.gradeSystem : null;
@@ -568,7 +663,7 @@ function GoalEditor({ draft, routines, references, dirtyRef, busy, blocked, save
       ...current,
       kind,
       ...(kind === "consistency" ? { startDate: current.startDate ?? dateKey(new Date()), sessionTarget: current.sessionTarget ?? 8 } : {}),
-      ...(kind === "project" ? { environment: current.environment ?? "indoor", discipline: current.discipline ?? "boulder", attempts: current.attempts ?? 0 } : {}),
+      ...(kind === "project" ? { environment: current.environment ?? "indoor", discipline: current.discipline ?? "boulder" } : {}),
     }));
   }
   function chooseDiscipline(discipline: NonNullable<ClimbingGoal["discipline"]>) {
@@ -577,7 +672,9 @@ function GoalEditor({ draft, routines, references, dirtyRef, busy, blocked, save
   const projectGradeSystems = Object.entries(gradeSystemNames).filter(([key]) => !value.discipline || gradeFits(value.discipline, key as GradeSystem));
   const visibleGradeSystem = value.gradeSystem && (!value.discipline || gradeFits(value.discipline, value.gradeSystem)) ? value.gradeSystem : null;
   return <form className="climbing-form" onSubmit={event => { event.preventDefault(); void save({ ...draft, value: normalizedGoal(value) }); }}>
-    <div className="climbing-form-grid two"><label>Goal type<select disabled={busy} value={value.kind} onChange={event => chooseKind(event.target.value as ClimbingGoal["kind"])}>{Object.entries(goalKindNames).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></label><label>Status<select disabled={busy} value={value.status} onChange={event => setValue({ ...value, status: event.target.value as ClimbingGoal["status"] })}><option value="active">Active</option><option value="paused">Paused</option><option value="completed">{value.kind === "project" ? "Sent" : "Completed"}</option></select></label></div>
+    <div className="climbing-form-grid two"><label>Goal type<select disabled={busy || hasLinkedSession} value={value.kind} onChange={event => chooseKind(event.target.value as ClimbingGoal["kind"])}>{Object.entries(goalKindNames).map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></label><label>Status<select disabled={busy} value={value.status} onChange={event => setValue({ ...value, status: event.target.value as ClimbingGoal["status"] })}><option value="active">{value.kind === "project" ? "Projecting" : "Active"}</option><option value="paused">Paused</option><option value="completed">{value.kind === "project" ? "Sent" : "Completed"}</option></select></label></div>
+    {value.kind === "project" && history?.completedByLinkedSession && value.status !== "completed" && <p className="climbing-form-note"><Check/>A linked session records a send, so this project appears as Sent. This saved status remains available if that session is later edited, unlinked, or removed.</p>}
+    {hasLinkedSession && <p className="climbing-form-note"><Flag/>This remains a climb project because session history is linked to it.</p>}
     <label>{value.kind === "project" ? "Route or problem name" : "Goal"}<Input required maxLength={200} disabled={busy} value={value.title} placeholder={value.kind === "project" ? "Name of the route or boulder problem" : "What are you working toward?"} onChange={event => setValue({ ...value, title: event.target.value })}/></label>
     <label>{value.kind === "project" ? "Project notes" : "What success means"} <span>optional</span><Textarea maxLength={3000} disabled={busy} value={value.description} placeholder={value.kind === "project" ? "Key moves, why it matters, or useful context…" : "A clear finish line, or why this matters…"} onChange={event => setValue({ ...value, description: event.target.value })}/></label>
     {value.kind === "consistency" && <div className="climbing-form-grid three"><label>Start date<Input required type="date" disabled={busy} value={value.startDate ?? ""} onChange={event => setValue({ ...value, startDate: event.target.value || null })}/></label><label>End date<Input required type="date" disabled={busy} min={value.startDate ?? undefined} value={value.targetDate ?? ""} onChange={event => setValue({ ...value, targetDate: event.target.value || null })}/></label><label>Sessions to log<Input required type="number" min={1} max={365} disabled={busy} value={value.sessionTarget ?? ""} onChange={event => setValue({ ...value, sessionTarget: nullableNumber(event.target.value) })}/></label></div>}
@@ -590,12 +687,13 @@ function GoalEditor({ draft, routines, references, dirtyRef, busy, blocked, save
       </div>
       <label>Gym, crag, or area <span>optional</span><Input maxLength={200} disabled={busy} value={value.venue ?? ""} placeholder={value.environment === "indoor" ? "Gym or wall" : "Crag, area, or sector"} onChange={event => setValue({ ...value, venue: event.target.value || null })}/></label>
       <div className="climbing-form-grid two"><label>Grade system <span>optional</span><select disabled={busy || !value.discipline} value={visibleGradeSystem ?? ""} onChange={event => { const gradeSystem = event.target.value ? event.target.value as GradeSystem : null; setValue({ ...value, gradeSystem, grade: gradeSystem ? gradeSystem === value.gradeSystem ? value.grade ?? "" : "" : null }); }}><option value="">Ungraded</option>{projectGradeSystems.map(([key, label]) => <option value={key} key={key}>{label}</option>)}</select></label><label>Grade<Input required={!!visibleGradeSystem} maxLength={30} disabled={busy || !visibleGradeSystem} value={visibleGradeSystem ? value.grade ?? "" : ""} placeholder="V7, 5.12a, blue…" onChange={event => setValue({ ...value, grade: event.target.value })}/></label></div>
-      <div className="climbing-form-grid two"><label>Target date <span>optional</span><Input type="date" disabled={busy} value={value.targetDate ?? ""} onChange={event => setValue({ ...value, targetDate: event.target.value || null })}/></label><label>Attempts so far <span>manual running count</span><Input required type="number" min={0} max={9999} step={1} disabled={busy} value={value.attempts ?? ""} onChange={event => setValue({ ...value, attempts: nullableNumber(event.target.value) })}/></label></div>
-      <p className="climbing-form-note"><Activity/>Update attempts here for now; logged sessions do not change this count automatically.</p>
+      <div className="climbing-form-grid two"><label>Target date <span>optional</span><Input type="date" disabled={busy} value={value.targetDate ?? ""} onChange={event => setValue({ ...value, targetDate: event.target.value || null })}/></label><label>Manual attempt total <span>optional, kept separate</span><Input type="number" min={0} max={9999} step={1} disabled={busy} value={value.attempts ?? ""} placeholder="Not set" onChange={event => setValue({ ...value, attempts: nullableNumber(event.target.value) })}/></label></div>
+      <p className="climbing-form-note"><Activity/>Use this only for a separate total you maintain yourself. It may overlap session-recorded attempts, so Workspace never adds the two together.</p>
+      {history && <section className="project-editor-history"><div><span className="climbing-kicker">PROJECT WORK</span><h3>Linked sessions</h3></div><ProjectStats history={history}/>{history.entries.length ? <ProjectHistoryDetails history={history}/> : <p>No sessions are linked yet. Add this project while logging a climb to build its history.</p>}</section>}
     </>}
     {value.kind === "training" && <label>Related routine <span>optional</span><select disabled={busy} value={value.routineId ?? ""} onChange={event => setValue({ ...value, routineId: event.target.value || null })}><option value="">No linked routine</option>{routineOptions.map(routine => <option key={routine.id} value={routine.id}>{routine.title}{routine.archived ? " (archived)" : ""}</option>)}</select></label>}
     <label>Next action <span>optional</span><Input maxLength={500} disabled={busy} value={value.nextStep} placeholder="The next useful move" onChange={event => setValue({ ...value, nextStep: event.target.value })}/></label>
-    {!draft.isNew && <GoalReferencesEditor goalId={value.id} references={references} busy={busy} addLink={addLink} uploadFile={uploadFile} removeReference={removeReference}/>}
+    {!draft.isNew && <GoalReferencesEditor goalId={value.id} references={references} cloudItems={cloudItems} cloudError={cloudError} busy={busy} addLink={addLink} uploadFile={uploadFile} removeReference={removeReference}/>}
     <p className="climbing-form-note"><ListTodo/>Saving this goal stays local. Use “Add next action to Todoist” on its card when you want a connected task.</p>
     <div className="editor-actions"><span/><div><DialogClose asChild><Button type="button" variant="outline" disabled={busy}>Cancel</Button></DialogClose><Button type="submit" disabled={busy || blocked}>{busy ? "Saving…" : blocked ? "Reopen latest to save" : draft.isNew ? "Add goal" : "Save changes"}</Button></div></div>
   </form>;

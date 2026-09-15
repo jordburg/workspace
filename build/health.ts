@@ -65,6 +65,8 @@ const phoneWorkspaceRoutes:Record<string,PhoneWorkspaceRoute>={
   "POST /v1/climbing/command":{path:"/api/climbing",method:"POST",max:1_000_000},
   "POST /v1/climbing/media/link":{path:"/api/climbing/media/link",method:"POST",max:40_000},
   "POST /v1/climbing/media/delete":{path:"/api/climbing/media/delete",method:"POST",max:20_000},
+  "GET /v1/climbing/media/cloud/status":{path:"/api/climbing/media/cloud/status",method:"GET"},
+  "POST /v1/climbing/media/cloud/receipt":{path:"/api/climbing/media/cloud/receipt",method:"POST",max:16_000},
   "GET /v1/chess":{path:"/api/chess",method:"GET"},
   "POST /v1/chess/progress":{path:"/api/chess/progress",method:"POST",max:128_000},
   "POST /v1/chess/session":{path:"/api/chess/session",method:"POST",max:128_000},

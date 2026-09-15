@@ -55,6 +55,8 @@ test('Health HTTPS multi-device pairing, private device scope, and confirmed wei
   const mediaBytes=Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,1,2,3,4]);
   const mediaGoalId=randomUUID(),mediaReferenceId=randomUUID(),planningLinkId=randomUUID(),gmailRelationId=randomUUID();
   const mediaState={version:1,revision:4,sessions:[],goals:[],routines:[],plans:[],goalReferences:[{id:mediaReferenceId,goalId:mediaGoalId,kind:'image',label:'Crux',url:null,fileName:'beta.png',mimeType:'image/png',byteSize:mediaBytes.length,createdAt:'2026-09-12T08:00:00.000Z'}]};
+  const mediaDigest=createHash('sha256').update(mediaBytes).digest('hex');
+  const cloudMediaView={version:1,revision:1,items:[{referenceId:mediaReferenceId,goalId:mediaGoalId,operation:'upload',status:'pending',sha256:mediaDigest,byteSize:mediaBytes.length,requestedAt:'2026-09-12T08:00:00.000Z',updatedAt:'2026-09-12T08:00:00.000Z',confirmedAt:null,error:null}]};
   const integrationView={
     todoist:{connected:true,configured:true,sources:[],selected:[],lastSynced:'2026-09-12T08:00:00.000Z',error:null},
     google:{connected:true,configured:true,sources:[],selected:[],lastSynced:'2026-09-12T08:00:00.000Z',error:null},
@@ -81,6 +83,8 @@ test('Health HTTPS multi-device pairing, private device scope, and confirmed wei
       if(path==='/api/climbing'&&method==='POST')return {status:200,data:{version:1,revision:3,sessions:[],goals:[],routines:[],plans:[]}};
       if(path==='/api/climbing/media/link'&&method==='POST')return {status:200,data:mediaState};
       if(path==='/api/climbing/media/delete'&&method==='POST')return {status:200,data:{...mediaState,revision:5,goalReferences:[]}};
+      if(path==='/api/climbing/media/cloud/status'&&method==='GET')return {status:200,data:cloudMediaView};
+      if(path==='/api/climbing/media/cloud/receipt'&&method==='POST')return {status:200,data:{...cloudMediaView,revision:2,items:[{...cloudMediaView.items[0],status:body.status,confirmedAt:body.status==='confirmed'?'2026-09-12T08:01:00.000Z':null}]}};
       if(path==='/api/chess'&&method==='GET')return {status:200,data:{capability:{id:'chess',version:1,canWrite:true},catalog:{courses:[],lessons:[]},reviewQueue:[],state:{version:1,revision:0,progress:[],reviewCards:[],reviewAttempts:[],studySessions:[]},summary:{reviewsDue:0}}};
       if(path==='/api/chess/progress'&&method==='POST')return {status:200,data:{view:{state:{revision:body.revision+1}},replayed:false}};
       if(path==='/api/chess/session'&&method==='POST')return {status:200,data:{view:{state:{revision:body.revision+1}},replayed:false,session:{id:body.requestId}}};
@@ -166,6 +170,13 @@ test('Health HTTPS multi-device pairing, private device scope, and confirmed wei
     const mediaDeleteCommand={requestId:randomUUID(),goalId:mediaGoalId,referenceId:mediaReferenceId};
     assert.equal((await phone('/v1/climbing/media/delete',token,mediaDeleteCommand)).data.revision,5);
     assert.deepEqual(proxyCalls.at(-1),{path:'/api/climbing/media/delete',method:'POST',body:mediaDeleteCommand});
+    assert.deepEqual((await phone('/v1/climbing/media/cloud/status',token)).data,cloudMediaView);
+    assert.deepEqual(proxyCalls.at(-1),{path:'/api/climbing/media/cloud/status',method:'GET',body:undefined});
+    assert.deepEqual((await phone('/v1/climbing/media/cloud/status',secondToken)).data,cloudMediaView);
+    const cloudReceipt={requestId:randomUUID(),referenceId:mediaReferenceId,operation:'upload',status:'confirmed',sha256:mediaDigest,byteSize:mediaBytes.length,error:null};
+    assert.equal((await phone('/v1/climbing/media/cloud/receipt',token,cloudReceipt)).data.items[0].status,'confirmed');
+    assert.deepEqual(proxyCalls.at(-1),{path:'/api/climbing/media/cloud/receipt',method:'POST',body:cloudReceipt});
+    assert.equal((await phone('/v1/climbing/media/cloud/receipt',secondToken,{...cloudReceipt,requestId:randomUUID()})).status,200);
 
     assert.equal((await phoneRaw(`/v1/climbing/media/${mediaReferenceId}`,'wrong')).status,401);
     assert.equal(rawProxyCalls.length,0);
@@ -293,7 +304,7 @@ test('Health HTTPS multi-device pairing, private device scope, and confirmed wei
     assert.equal((await fetch(origin+'/api/health',{headers:{Origin:'https://example.com'}})).status,403);
     const tokenHash=createHash('sha256').update(token).digest('hex');
     const saved=JSON.parse(await readFile(join(directory,'health.private.json'),'utf8'));saved.tokens.find(entry=>entry.hash===tokenHash).scope='health';await writeFile(join(directory,'health.private.json'),JSON.stringify(saved));
-    assert.deepEqual((await phone('/capabilities',token)).data,{version:2,scope:'health',deviceClass:'phone',workspace:false,health:true});assert.equal((await phone('/v1/workspace',token)).status,403);assert.equal((await phoneRaw(`/v1/climbing/media/${mediaReferenceId}`,token)).status,403);assert.equal((await phone('/commands',token)).status,200);
+    assert.deepEqual((await phone('/capabilities',token)).data,{version:2,scope:'health',deviceClass:'phone',workspace:false,health:true});assert.equal((await phone('/v1/workspace',token)).status,403);assert.equal((await phoneRaw(`/v1/climbing/media/${mediaReferenceId}`,token)).status,403);assert.equal((await phone('/v1/climbing/media/cloud/status',token)).status,403);assert.equal((await phone('/v1/climbing/media/cloud/receipt',token,cloudReceipt)).status,403);assert.equal((await phone('/commands',token)).status,200);
     assert.deepEqual((await phone('/capabilities',secondToken)).data,{version:2,scope:'workspace',deviceClass:'tablet',workspace:true,health:false});publicView=await (await fetch(origin+'/api/health')).json();assert.equal(publicView.phoneScope,'health');
     saved.tokens.find(entry=>entry.hash===tokenHash).scope='workspace';await writeFile(join(directory,'health.private.json'),JSON.stringify(saved));
     assert.equal((await phone('/unpair',token)).status,404);

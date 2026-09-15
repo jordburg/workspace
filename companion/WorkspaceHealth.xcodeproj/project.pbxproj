@@ -15,6 +15,8 @@
 		B000000000000000000000006 /* WorkspaceViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000006 /* WorkspaceViews.swift */; };
 		B000000000000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000007 /* Assets.xcassets */; };
 		B000000000000000000000008 /* WorkspaceBrand.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000008 /* WorkspaceBrand.swift */; };
+		B000000000000000000000009 /* ClimbingMediaCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = A000000000000000000000009 /* ClimbingMediaCache.swift */; };
+		B00000000000000000000000A /* ClimbingCloudMediaStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000000A /* ClimbingCloudMediaStore.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,6 +28,8 @@
 		A000000000000000000000006 /* WorkspaceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceViews.swift; sourceTree = "<group>"; };
 		A000000000000000000000007 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A000000000000000000000008 /* WorkspaceBrand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceBrand.swift; sourceTree = "<group>"; };
+		A000000000000000000000009 /* ClimbingMediaCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClimbingMediaCache.swift; sourceTree = "<group>"; };
+		A00000000000000000000000A /* ClimbingCloudMediaStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClimbingCloudMediaStore.swift; sourceTree = "<group>"; };
 		C00000000000000000000007 /* WorkspaceHealth.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WorkspaceHealth.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -63,6 +67,8 @@
 				A000000000000000000000008 /* WorkspaceBrand.swift */,
 				A000000000000000000000001 /* WorkspaceHealthApp.swift */,
 				A000000000000000000000002 /* BridgeClient.swift */,
+				A00000000000000000000000A /* ClimbingCloudMediaStore.swift */,
+				A000000000000000000000009 /* ClimbingMediaCache.swift */,
 				A000000000000000000000003 /* HealthStore.swift */,
 				A000000000000000000000004 /* WorkspaceModels.swift */,
 				A000000000000000000000005 /* WorkspaceStore.swift */,
@@ -137,6 +143,8 @@
 				B000000000000000000000001 /* WorkspaceHealthApp.swift in Sources */,
 				B000000000000000000000008 /* WorkspaceBrand.swift in Sources */,
 				B000000000000000000000002 /* BridgeClient.swift in Sources */,
+				B00000000000000000000000A /* ClimbingCloudMediaStore.swift in Sources */,
+				B000000000000000000000009 /* ClimbingMediaCache.swift in Sources */,
 				B000000000000000000000003 /* HealthStore.swift in Sources */,
 				B000000000000000000000004 /* WorkspaceModels.swift in Sources */,
 				B000000000000000000000005 /* WorkspaceStore.swift in Sources */,

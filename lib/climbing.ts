@@ -10,7 +10,7 @@ export const climbDisciplineSchema = z.enum(["boulder", "route"]);
 export const ropeStyleSchema = z.enum(["top-rope", "sport-lead", "trad-lead", "follow", "auto-belay"]);
 export const routineFocusSchema = z.enum(["technique", "strength", "power", "power-endurance", "endurance", "mobility", "recovery", "general"]);
 export const climbSchema = z.object({
-  id: z.string().uuid(), name: z.string().trim().min(1).max(120), discipline: climbDisciplineSchema,
+  id: z.string().uuid(), projectGoalId: z.string().uuid().nullable().default(null), name: z.string().trim().min(1).max(120), discipline: climbDisciplineSchema,
   ropeStyle: ropeStyleSchema.nullable(),
   gradeSystem: gradeSystemSchema.nullable(), grade: z.string().trim().min(1).max(30).nullable(),
   outcome: z.enum(["flash", "onsight", "redpoint", "send", "repeat", "attempt"]), attempts: z.number().int().min(1).max(99).nullable(), notes: optionalText(1000),
@@ -100,6 +100,19 @@ export const climbingStateSchema = z.object({
   const routineIds = new Set(state.routines.map(r => r.id));
   if (state.goals.some(goal => goal.routineId && !routineIds.has(goal.routineId))) ctx.addIssue({ code: "custom", message: "A goal links to a routine that no longer exists." });
   const goalIds = new Set(state.goals.map(goal => goal.id));
+  const goalsById = new Map(state.goals.map(goal => [goal.id, goal]));
+  for (const [sessionIndex, session] of state.sessions.entries()) {
+    const linkedProjects = new Set<string>();
+    for (const [climbIndex, climb] of session.climbs.entries()) {
+      if (!climb.projectGoalId) continue;
+      const path = ["sessions", sessionIndex, "climbs", climbIndex, "projectGoalId"];
+      const goal = goalsById.get(climb.projectGoalId);
+      if (!goal) ctx.addIssue({ code: "custom", path, message: "A logged project climb links to a goal that no longer exists." });
+      else if (goal.kind !== "project") ctx.addIssue({ code: "custom", path, message: "A logged project climb must link to a climb project goal." });
+      if (linkedProjects.has(climb.projectGoalId)) ctx.addIssue({ code: "custom", path, message: "A climbing session can log each project climb only once." });
+      linkedProjects.add(climb.projectGoalId);
+    }
+  }
   if (new Set(state.goalReferences.map(reference => reference.id)).size !== state.goalReferences.length) ctx.addIssue({ code: "custom", path: ["goalReferences"], message: "Goal reference IDs must be unique." });
   for (const [index, reference] of state.goalReferences.entries()) if (!goalIds.has(reference.goalId)) ctx.addIssue({ code: "custom", path: ["goalReferences", index, "goalId"], message: "A media reference links to a goal that no longer exists." });
   for (const goalId of goalIds) if (state.goalReferences.filter(reference => reference.goalId === goalId).length > 12) ctx.addIssue({ code: "custom", path: ["goalReferences"], message: "A climbing goal can keep at most 12 media references." });
@@ -153,11 +166,49 @@ export const gradeSystemNames: Record<GradeSystem, string> = { "v-scale": "V-sca
 export const focusNames: Record<ClimbingSession["focus"], string> = { bouldering: "Bouldering", routes: "Routes", mixed: "Mixed climbing", training: "Training", other: "Other" };
 export const routineFocusNames: Record<Routine["focus"], string> = { technique: "Technique", strength: "Strength", power: "Power", "power-endurance": "Power endurance", endurance: "Endurance", mobility: "Mobility", recovery: "Recovery", general: "General" };
 export const goalKindNames: Record<ClimbingGoal["kind"], string> = { consistency: "Consistency", project: "Climb project", skill: "Skill", training: "Training", custom: "Custom" };
-export const sessionSends = (session: ClimbingSession) => session.climbs.filter(climb => climb.outcome !== "attempt").length;
+export const isClimbCompletion = (outcome: Climb["outcome"]) => ["flash", "onsight", "redpoint", "send"].includes(outcome);
+export const sessionSends = (session: ClimbingSession) => session.climbs.filter(climb => isClimbCompletion(climb.outcome)).length;
+export function prefixByUtf16Units(value: string, limit: number) {
+  let result = "";
+  let used = 0;
+  for (const character of value) {
+    if (used + character.length > limit) break;
+    result += character;
+    used += character.length;
+  }
+  return result;
+}
 export function consistencyProgress(goal: ClimbingGoal, sessions: ClimbingSession[]) {
   if (goal.kind !== "consistency" || !goal.startDate || !goal.targetDate || !goal.sessionTarget) return { completed: 0, target: 0, percent: goal.progress };
   const completed = sessions.filter(session => !session.deletedAt && session.date >= goal.startDate! && session.date <= goal.targetDate!).length;
   return { completed, target: goal.sessionTarget, percent: Math.min(100, completed / goal.sessionTarget * 100) };
+}
+export type ProjectGoalHistoryEntry = { session: ClimbingSession; climb: Climb };
+export function projectGoalHistory(goal: ClimbingGoal, sessions: ClimbingSession[]) {
+  const entries: ProjectGoalHistoryEntry[] = sessions
+    .filter(session => !session.deletedAt)
+    .flatMap(session => session.climbs.map((climb, index) => ({ session, climb, index })))
+    .filter(entry => entry.climb.projectGoalId === goal.id)
+    .sort((a, b) => a.session.date.localeCompare(b.session.date) || a.session.createdAt.localeCompare(b.session.createdAt) || a.index - b.index)
+    .map(({ session, climb }) => ({ session, climb }));
+  const firstCompletion = entries.find(entry => isClimbCompletion(entry.climb.outcome)) ?? null;
+  const countedAttempts = entries.flatMap(entry => entry.climb.attempts === null ? [] : [entry.climb.attempts]);
+  const uncountedLinkedClimbs = entries.length - countedAttempts.length;
+  return {
+    entries,
+    linkedSessionCount: new Set(entries.map(entry => entry.session.id)).size,
+    linkedClimbCount: entries.length,
+    knownLinkedAttempts: countedAttempts.reduce((total, attempts) => total + attempts, 0),
+    uncountedLinkedClimbs,
+    manualAttemptCount: goal.attempts,
+    firstTriedOn: entries[0]?.session.date ?? null,
+    lastTriedOn: entries.at(-1)?.session.date ?? null,
+    firstCompletion,
+    completedByLinkedSession: firstCompletion !== null,
+    effectiveStatus: firstCompletion ? "completed" as const : goal.status,
+    latestOutcome: entries.at(-1)?.climb.outcome ?? null,
+    hasRepeat: entries.some(entry => entry.climb.outcome === "repeat"),
+  };
 }
 export function routineSnapshot(routine: Routine): RoutineExecution {
   return { routineId: routine.id, version: routine.version, title: routine.title, focus: routine.focus, description: routine.description, estimatedMinutes: routine.estimatedMinutes, steps: routine.steps.map(step => ({ ...step, status: "not-logged", result: "" })) };

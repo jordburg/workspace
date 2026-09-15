@@ -1,3 +1,4 @@
+@preconcurrency import CloudKit
 import Foundation
 import Combine
 import UniformTypeIdentifiers
@@ -12,7 +13,27 @@ struct RevisionConflict<Value: Equatable & Sendable>: Identifiable, Equatable, S
 private struct EmptyBridgeBody: Codable, Sendable {}
 private struct SavedBridgeResponse: Decodable, Sendable { let saved: Bool }
 private struct WeightCommandsResponse: Decodable, Sendable { let commands: [WeightCommand] }
+private struct ClimbingMediaOperationContext: Sendable {
+    let pairingEpoch: Int
+    let cacheEpoch: Int
+    let credentials: BridgeCredentials
+}
 private let capturePersistenceError = "This device could not protect the Capture draft. Keep this screen open and try again."
+private let climbingCloudApprovalIdentityKey = "climbingCloudMediaApprovalIdentity"
+
+private struct ClimbingCloudWriteApproval: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+
+    let version: Int
+    let pairingFingerprint: String
+    let cloudAccountIdentityDigest: String
+
+    init(pairingFingerprint: String, cloudAccountIdentityDigest: String) {
+        self.version = Self.currentVersion
+        self.pairingFingerprint = pairingFingerprint
+        self.cloudAccountIdentityDigest = cloudAccountIdentityDigest
+    }
+}
 
 enum CompanionConnectionState: Equatable, Sendable {
     case unpaired
@@ -384,6 +405,14 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var lastSuccessfulContact: Date?
     @Published private(set) var captureDraft = ""
     @Published private(set) var pendingCaptureCount = 0
+    @Published private(set) var cachedClimbingMediaIDs: Set<String> = []
+    @Published private(set) var cloudClimbingMediaIDs: Set<String> = []
+    @Published private(set) var climbingCloudAccountState: ClimbingCloudAccountState = .notChecked
+    @Published private(set) var climbingCloudSyncPreflight: ClimbingCloudSyncPreflight?
+    @Published private(set) var climbingCloudSyncProgress: ClimbingCloudSyncProgress?
+    @Published private(set) var climbingCloudSyncMessage: String?
+    @Published private(set) var lastClimbingCloudSync: Date?
+    @Published private(set) var syncingClimbingMediaWithCloud = false
 
     @Published private(set) var workspaceConflict: RevisionConflict<WorkspaceState>?
     @Published private(set) var climbingConflict: RevisionConflict<ClimbingState>?
@@ -402,6 +431,13 @@ final class WorkspaceStore: ObservableObject {
     @Published var status = "Pair with your Mac to begin."
 
     let health: HealthStore
+    private let climbingMediaCache: ClimbingMediaCache
+    private let climbingCloudMediaStore: ClimbingCloudMediaStore
+    private var climbingMediaCacheEpoch = 0
+    private var climbingCloudOperationEpoch = 0
+    private var climbingCloudReferenceTasks: [String: Task<Void, Never>] = [:]
+    private var climbingCloudReferenceGenerations: [String: Int] = [:]
+    private var climbingCloudSyncPreflightPairingIdentity: String?
     private var cancelHistoryRequested = false
     private var clearAfterUnpair = false
     private var pairingEpoch = 0
@@ -419,6 +455,13 @@ final class WorkspaceStore: ObservableObject {
     var isPaired: Bool { credentials != nil }
     var isOnline: Bool { connectionState == .online }
     var hasCachedContent: Bool { !loadedAreas.isEmpty }
+    var cachedClimbingMediaCount: Int { cachedClimbingMediaIDs.count }
+    var cloudClimbingMediaCount: Int { cloudClimbingMediaIDs.count }
+    var climbingCloudInitialSyncApproved: Bool {
+        guard let fingerprint = credentials?.fingerprint,
+              let approval = storedClimbingCloudWriteApproval else { return false }
+        return approval.pairingFingerprint == fingerprint
+    }
     var managesAppleHealth: Bool { health.supportsLocalHealthSync }
     var connectionNeedsAttention: Bool {
         if case .error = connectionState { return true }
@@ -457,8 +500,18 @@ final class WorkspaceStore: ObservableObject {
         return priority.compactMap { areaErrors[$0] }.first
     }
 
-    init(credentials suppliedCredentials: BridgeCredentials? = nil, health: HealthStore = HealthStore()) {
+    init(
+        credentials suppliedCredentials: BridgeCredentials? = nil,
+        health: HealthStore = HealthStore(),
+        climbingMediaCache: ClimbingMediaCache = ClimbingMediaCache(),
+        climbingCloudMediaStore: ClimbingCloudMediaStore = ClimbingCloudMediaStore()
+    ) {
         self.health = health
+        self.climbingMediaCache = climbingMediaCache
+        self.climbingCloudMediaStore = climbingCloudMediaStore
+        self.lastClimbingCloudSync = UserDefaults.standard.object(
+            forKey: "climbingCloudMediaLastSync"
+        ) as? Date
         let restoredLocalState = CompanionPersistence.loadLocalState()
         if let cached = CompanionPersistence.loadSnapshot() {
             snapshotCache = cached
@@ -504,6 +557,9 @@ final class WorkspaceStore: ObservableObject {
                 CompanionPersistence.removeLocalState()
             }
         }
+        Task { [weak self] in
+            await self?.refreshCachedClimbingMediaIDs()
+        }
     }
 
     func isLoading(_ area: WorkspaceArea) -> Bool { busyAreas.contains(area) }
@@ -519,6 +575,21 @@ final class WorkspaceStore: ObservableObject {
 
     func cachedAt(_ area: WorkspaceArea) -> Date? {
         snapshotCache.areaSavedAt[area.rawValue]
+    }
+
+    func isClimbingMediaAvailableOffline(_ referenceID: String) -> Bool {
+        cachedClimbingMediaIDs.contains(referenceID)
+    }
+
+    func isClimbingMediaAvailableInCloud(_ referenceID: String) -> Bool {
+        cloudClimbingMediaIDs.contains(referenceID)
+    }
+
+    func climbingMediaAvailabilityLabel(_ referenceID: String) -> String {
+        if isClimbingMediaAvailableOffline(referenceID) { return "Available offline" }
+        if isClimbingMediaAvailableInCloud(referenceID) { return "Available in iCloud" }
+        if syncingClimbingMediaWithCloud { return "Checking iCloud…" }
+        return isOnline ? "Tap to download" : "Not downloaded"
     }
 
     func updateCaptureDraft(_ value: String) {
@@ -654,6 +725,7 @@ final class WorkspaceStore: ObservableObject {
         }
         guard begin(.pairing) else { return }
         defer { finish(.pairing) }
+        let previousCredentials = credentials
         connectionState = .connecting
         postUnpairStatus = nil
         let expectedEpoch = pairingEpoch
@@ -674,6 +746,7 @@ final class WorkspaceStore: ObservableObject {
                 BridgeKeychain.remove()
                 return
             }
+            pairingEpoch += 1
             let hasPendingCapture = !captureDraft.isEmpty || !captureOutbox.isEmpty
             let canAdoptUnboundCapture = credentials == nil && capturePairingIdentity == nil
             let canCarrySameMacPairing = credentials?.fingerprint == paired.fingerprint
@@ -682,6 +755,41 @@ final class WorkspaceStore: ObservableObject {
                 hasPendingCapture && (canAdoptUnboundCapture || canCarrySameMacPairing)
                     ? (captureDraft, captureOutbox)
                     : nil
+            if credentials?.fingerprint != paired.fingerprint {
+                climbingMediaCacheEpoch += 1
+                do {
+                    try await climbingMediaCache.clear()
+                    cachedClimbingMediaIDs = []
+                } catch {
+                    try? await BridgeClient(paired).revokePairing()
+                    if let previousCredentials {
+                        do {
+                            try BridgeKeychain.save(previousCredentials)
+                            credentials = previousCredentials
+                            connectionState = loadedAreas.isEmpty ? .connecting : .offlineWithCache
+                            status = "The new pairing could not replace this device’s existing Workspace because its downloaded media could not be removed. The previous Workspace remains paired."
+                            record(error, area: .pairing)
+                            await refreshCachedClimbingMediaIDs()
+                            return
+                        } catch {
+                            // Fall through to a safely unpaired state if the
+                            // previous credential cannot be restored securely.
+                        }
+                    }
+                    BridgeKeychain.remove()
+                    credentials = nil
+                    resetWorkspaceState()
+                    CompanionPersistence.removeSnapshot()
+                    connectionState = .unpaired
+                    await refreshCachedClimbingMediaIDs()
+                    let failure = BridgeError.message(
+                        "The new pairing was cancelled because this device could not remove media from the previous Workspace. This device is now unpaired; retry removal in Settings or delete the app to remove the remaining downloads."
+                    )
+                    record(failure, area: .pairing)
+                    status = failure.localizedDescription
+                    return
+                }
+            }
             resetWorkspaceState()
             credentials = paired
             if let retainedCapture {
@@ -730,12 +838,22 @@ final class WorkspaceStore: ObservableObject {
         }
         unpairing = true
         pairingEpoch += 1
+        climbingMediaCacheEpoch += 1
         clearAfterUnpair = true
         let hadCredentials = credentials != nil
         let savedClient = credentials.flatMap { try? BridgeClient($0) }
         var completionStatus = "Pair with your Mac to begin."
+        var cacheRemovalFailed = false
         BridgeKeychain.remove()
         credentials = nil
+        do {
+            try await climbingMediaCache.clear()
+            cachedClimbingMediaIDs = []
+        } catch {
+            record(error, area: .climbing)
+            cacheRemovalFailed = true
+            completionStatus = "This device is unpaired, but some downloaded climbing media could not be removed. Deleting the app will remove it."
+        }
         resetWorkspaceState()
         CompanionPersistence.removeSnapshot()
         connectionState = .unpaired
@@ -756,6 +874,9 @@ final class WorkspaceStore: ObservableObject {
         guard let savedClient else {
             if hadCredentials {
                 completionStatus = "This device is unpaired locally. The Mac did not confirm revocation, so disable companion sync on the Mac to invalidate its saved token."
+                if cacheRemovalFailed {
+                    completionStatus += " Some downloaded climbing media also could not be removed; deleting the app will remove it."
+                }
             }
             return
         }
@@ -763,6 +884,9 @@ final class WorkspaceStore: ObservableObject {
             try await savedClient.revokePairing()
         } catch {
             completionStatus = "This device is unpaired locally. The Mac did not confirm revocation, so disable companion sync on the Mac to invalidate its saved token."
+            if cacheRemovalFailed {
+                completionStatus += " Some downloaded climbing media also could not be removed; deleting the app will remove it."
+            }
         }
     }
 
@@ -838,6 +962,7 @@ final class WorkspaceStore: ObservableObject {
         defer { finish(area) }
         guard let client = makeClient() else { return false }
         do {
+            var climbingCacheReconciled = true
             if area != .health || credentials?.scope == .workspace {
                 try await requireWorkspace(using: client)
             }
@@ -845,7 +970,9 @@ final class WorkspaceStore: ObservableObject {
             case .workspace:
                 workspace = try await client.get("v1/workspace")
             case .climbing:
-                climbing = try await client.get("v1/climbing")
+                let latest: ClimbingState = try await client.get("v1/climbing")
+                climbing = latest
+                climbingCacheReconciled = await reconcileCachedClimbingMedia(with: latest.goalReferences)
             case .chess:
                 chess = try await client.get("v1/chess")
             case .finance:
@@ -863,7 +990,9 @@ final class WorkspaceStore: ObservableObject {
                 return true
             }
             loadedAreas.insert(area)
-            clearRecordedError(area)
+            if area != .climbing || climbingCacheReconciled {
+                clearRecordedError(area)
+            }
             markConnectionSucceeded()
             cacheCurrent(area)
             return true
@@ -1102,11 +1231,13 @@ final class WorkspaceStore: ObservableObject {
         }
 
         do {
-            climbing = try await client.send("v1/climbing/command", input: command)
+            let latest: ClimbingState = try await client.send("v1/climbing/command", input: command)
+            climbing = latest
+            let cacheReconciled = await reconcileCachedClimbingMedia(with: latest.goalReferences)
             climbingRecordAttempts.removeValue(forKey: attemptKey)
             climbingConflict = nil
             loadedAreas.insert(.climbing)
-            clearRecordedError(.climbing)
+            if cacheReconciled { clearRecordedError(.climbing) }
             markConnectionSucceeded()
             cacheCurrent(.climbing)
             status = "Climbing saved."
@@ -1115,6 +1246,7 @@ final class WorkspaceStore: ObservableObject {
             let latest: ClimbingState? = try? await client.get("v1/climbing")
             if let latest {
                 climbing = latest
+                await reconcileCachedClimbingMedia(with: latest.goalReferences)
                 loadedAreas.insert(.climbing)
                 cacheCurrent(.climbing)
                 markConnectionSucceeded()
@@ -1210,7 +1342,7 @@ final class WorkspaceStore: ObservableObject {
         )
         do {
             let latest: ClimbingState = try await client.send("v1/climbing/media/link", input: command)
-            applyClimbingMediaResult(latest, status: "Reference added.")
+            await applyClimbingMediaResult(latest, status: "Reference added.")
             return true
         } catch {
             if await reconcileClimbingMedia(using: client, referenceId: reference.id, shouldExist: true) {
@@ -1266,6 +1398,11 @@ final class WorkspaceStore: ObservableObject {
         guard begin(.climbing) else { return false }
         defer { finish(.climbing) }
         guard let client = workspaceClient(area: .climbing) else { return false }
+        let operation = ClimbingMediaOperationContext(
+            pairingEpoch: pairingEpoch,
+            cacheEpoch: climbingMediaCacheEpoch,
+            credentials: client.credentials
+        )
 
         let headers = [
             "X-Workspace-Request-Id": requestId,
@@ -1281,12 +1418,49 @@ final class WorkspaceStore: ObservableObject {
                 contentType: contentType,
                 headers: headers
             )
-            applyClimbingMediaResult(latest, status: "Attachment added.")
+            guard await applyClimbingMediaResult(
+                latest,
+                status: "Attachment added.",
+                guarding: operation
+            ) else {
+                return false
+            }
+            let availableOffline = await cacheClimbingMediaFile(
+                file,
+                referenceID: referenceId,
+                guarding: operation
+            )
+            guard mediaBridgeOperationIsCurrent(operation) else { return false }
+            if availableOffline,
+               let reference = climbing.goalReferences.first(where: { $0.id == referenceId }) {
+                scheduleCloudMirror(for: reference)
+            }
+            status = availableOffline
+                ? "Attachment added and saved on this device."
+                : "Attachment added without an offline copy. Open it while the Mac is available to save it on this device."
             return true
         } catch {
             if Task.isCancelled || bridgeOperationWasCancelled(error) { return false }
-            if await reconcileClimbingMedia(using: client, referenceId: referenceId, shouldExist: true) {
-                status = "Attachment added."
+            guard mediaBridgeOperationIsCurrent(operation) else { return false }
+            if await reconcileClimbingMedia(
+                using: client,
+                referenceId: referenceId,
+                shouldExist: true,
+                guarding: operation
+            ) {
+                let availableOffline = await cacheClimbingMediaFile(
+                    file,
+                    referenceID: referenceId,
+                    guarding: operation
+                )
+                guard mediaBridgeOperationIsCurrent(operation) else { return false }
+                if availableOffline,
+                   let reference = climbing.goalReferences.first(where: { $0.id == referenceId }) {
+                    scheduleCloudMirror(for: reference)
+                }
+                status = availableOffline
+                    ? "Attachment added and saved on this device."
+                    : "Attachment added without an offline copy. Open it while the Mac is available to save it on this device."
                 return true
             }
             record(error, area: .climbing)
@@ -1316,11 +1490,14 @@ final class WorkspaceStore: ObservableObject {
         )
         do {
             let latest: ClimbingState = try await client.send("v1/climbing/media/delete", input: command)
-            applyClimbingMediaResult(latest, status: "Reference removed.")
+            await applyClimbingMediaResult(latest, status: "Reference removed.")
+            _ = await removeCachedClimbingMedia(reference.id, reportFailure: true)
+            scheduleCloudDeletion(for: reference)
             return true
         } catch {
             if await reconcileClimbingMedia(using: client, referenceId: reference.id, shouldExist: false) {
-                status = "Reference removed."
+                _ = await removeCachedClimbingMedia(reference.id, reportFailure: true)
+                scheduleCloudDeletion(for: reference)
                 return true
             }
             record(error, area: .climbing)
@@ -1332,13 +1509,88 @@ final class WorkspaceStore: ObservableObject {
     func downloadClimbingGoalReference(_ reference: ClimbingGoalReference) async -> URL? {
         guard reference.kind != .link,
               validMediaIdentifier(reference.id),
-              validMediaIdentifier(reference.goalId) else {
+              validMediaIdentifier(reference.goalId),
+              climbing.goalReferences.contains(where: {
+                  $0.id == reference.id && $0.goalId == reference.goalId && $0.kind == reference.kind
+              }) else {
             record(BridgeError.message("This goal attachment is invalid."), area: .climbing)
             return nil
         }
         guard !unpairing else { return nil }
-        let expectedEpoch = pairingEpoch
+        let expectedPairingEpoch = pairingEpoch
+        let expectedCacheEpoch = climbingMediaCacheEpoch
+        if let cached = await climbingMediaCache.fileURL(for: reference) {
+            guard expectedPairingEpoch == pairingEpoch,
+                  expectedCacheEpoch == climbingMediaCacheEpoch,
+                  climbing.goalReferences.contains(where: { $0.id == reference.id }) else {
+                return nil
+            }
+            cachedClimbingMediaIDs.insert(reference.id)
+            clearRecordedError(.climbing)
+            return cached
+        }
+        guard expectedPairingEpoch == pairingEpoch,
+              expectedCacheEpoch == climbingMediaCacheEpoch else { return nil }
+        cachedClimbingMediaIDs.remove(reference.id)
+
+        do {
+            switch try await climbingCloudMediaStore.fetch(reference) {
+            case .missing, .stale:
+                cloudClimbingMediaIDs.remove(reference.id)
+            case .downloaded(let asset):
+                defer { try? FileManager.default.removeItem(at: asset.fileURL) }
+                guard expectedPairingEpoch == pairingEpoch,
+                      expectedCacheEpoch == climbingMediaCacheEpoch,
+                      climbing.goalReferences.contains(where: { $0.id == reference.id }),
+                      !Task.isCancelled else { return nil }
+                let receipt = try await climbingMediaCache.importFile(at: asset.fileURL, for: reference)
+                guard receipt.sha256 == asset.sha256,
+                      mediaReferenceIsCurrent(reference),
+                      expectedPairingEpoch == pairingEpoch,
+                      expectedCacheEpoch == climbingMediaCacheEpoch else {
+                    _ = try? await climbingMediaCache.removeIfCurrent(receipt)
+                    _ = await refreshCachedClimbingMediaIDs(expectedEpoch: expectedCacheEpoch)
+                    return nil
+                }
+                guard await refreshCachedClimbingMediaIDs(expectedEpoch: expectedCacheEpoch) else {
+                    _ = try? await climbingMediaCache.removeIfCurrent(receipt)
+                    return nil
+                }
+                cloudClimbingMediaIDs.insert(reference.id)
+                climbingCloudAccountState = .available
+                climbingCloudSyncMessage = nil
+                clearRecordedError(.climbing)
+                return receipt.fileURL
+            }
+        } catch {
+            if Task.isCancelled { return nil }
+            climbingCloudAccountState = await climbingCloudMediaStore.accountState()
+            climbingCloudSyncMessage = "iCloud was unavailable, so Workspace will try your Mac."
+        }
+
+        guard expectedPairingEpoch == pairingEpoch,
+              expectedCacheEpoch == climbingMediaCacheEpoch else { return nil }
+        guard let downloaded = await downloadClimbingMediaFromMac(
+            reference,
+            pairingEpoch: expectedPairingEpoch,
+            cacheEpoch: expectedCacheEpoch
+        ) else { return nil }
+        scheduleCloudMirror(for: reference)
+        return downloaded
+    }
+
+    private func downloadClimbingMediaFromMac(
+        _ reference: ClimbingGoalReference,
+        pairingEpoch expectedPairingEpoch: Int,
+        cacheEpoch expectedCacheEpoch: Int
+    ) async -> URL? {
+
         guard let client = workspaceClient(area: .climbing) else { return nil }
+        let operation = ClimbingMediaOperationContext(
+            pairingEpoch: expectedPairingEpoch,
+            cacheEpoch: expectedCacheEpoch,
+            credentials: client.credentials
+        )
 
         let displayFileExtension = reference.fileName.flatMap { name in
             let value = URL(fileURLWithPath: name).pathExtension
@@ -1347,17 +1599,32 @@ final class WorkspaceStore: ObservableObject {
         let fileExtension = reference.mimeType.flatMap { UTType(mimeType: $0)?.preferredFilenameExtension }
             ?? displayFileExtension
         do {
-            let file = try await client.download(
+            let temporary = try await client.download(
                 "v1/climbing/media/\(reference.id)",
                 fileExtension: fileExtension
             )
-            guard expectedEpoch == pairingEpoch, credentials != nil, !Task.isCancelled else {
-                try? FileManager.default.removeItem(at: file)
+            defer { try? FileManager.default.removeItem(at: temporary) }
+            guard mediaCacheOperationIsCurrent(operation),
+                  climbing.goalReferences.contains(where: { $0.id == reference.id }),
+                  !Task.isCancelled else {
+                return nil
+            }
+            let receipt = try await climbingMediaCache.importFile(at: temporary, for: reference)
+            guard mediaCacheOperationIsCurrent(operation),
+                  climbing.goalReferences.contains(where: { $0.id == reference.id }) else {
+                _ = try? await climbingMediaCache.removeIfCurrent(receipt)
+                _ = await refreshCachedClimbingMediaIDs(expectedEpoch: operation.cacheEpoch)
+                return nil
+            }
+            guard await refreshCachedClimbingMediaIDs(expectedEpoch: operation.cacheEpoch),
+                  mediaCacheOperationIsCurrent(operation) else {
+                _ = try? await climbingMediaCache.removeIfCurrent(receipt)
+                _ = await refreshCachedClimbingMediaIDs(expectedEpoch: operation.cacheEpoch)
                 return nil
             }
             clearRecordedError(.climbing)
             markConnectionSucceeded()
-            return file
+            return receipt.fileURL
         } catch {
             if Task.isCancelled || bridgeOperationWasCancelled(error) { return nil }
             record(error, area: .climbing)
@@ -1394,25 +1661,840 @@ final class WorkspaceStore: ObservableObject {
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
     }
 
-    private func applyClimbingMediaResult(_ latest: ClimbingState, status message: String) {
+    @discardableResult
+    func clearClimbingMediaDownloads() async -> Bool {
+        climbingMediaCacheEpoch += 1
+        do {
+            try await climbingMediaCache.clear()
+            cachedClimbingMediaIDs = []
+            clearRecordedError(.climbing)
+            status = "Downloaded climbing media removed from this device."
+            return true
+        } catch {
+            record(error, area: .climbing)
+            return false
+        }
+    }
+
+    private var storedClimbingCloudWriteApproval: ClimbingCloudWriteApproval? {
+        guard let data = UserDefaults.standard.data(forKey: climbingCloudApprovalIdentityKey),
+              let approval = try? JSONDecoder().decode(ClimbingCloudWriteApproval.self, from: data),
+              approval.version == ClimbingCloudWriteApproval.currentVersion,
+              canonicalDigest(approval.cloudAccountIdentityDigest) else { return nil }
+        return approval
+    }
+
+    private func saveClimbingCloudWriteApproval(
+        pairingFingerprint: String,
+        cloudAccountIdentityDigest: String
+    ) throws {
+        let approval = ClimbingCloudWriteApproval(
+            pairingFingerprint: pairingFingerprint,
+            cloudAccountIdentityDigest: cloudAccountIdentityDigest
+        )
+        UserDefaults.standard.set(
+            try JSONEncoder().encode(approval),
+            forKey: climbingCloudApprovalIdentityKey
+        )
+    }
+
+    private func clearClimbingCloudWriteApproval() {
+        UserDefaults.standard.removeObject(forKey: climbingCloudApprovalIdentityKey)
+    }
+
+    private func approvedClimbingCloudAccountIdentityDigest() async -> String? {
+        guard let pairingFingerprint = credentials?.fingerprint,
+              let approval = storedClimbingCloudWriteApproval,
+              approval.pairingFingerprint == pairingFingerprint else { return nil }
+        do {
+            let current = try await climbingCloudMediaStore.accountIdentityDigest()
+            guard current == approval.cloudAccountIdentityDigest else {
+                clearClimbingCloudWriteApproval()
+                cloudClimbingMediaIDs = []
+                climbingCloudSyncMessage = "Your iCloud account changed. Review the climbing-media copy before Workspace writes to this private library."
+                return nil
+            }
+            return current
+        } catch {
+            climbingCloudAccountState = await climbingCloudMediaStore.accountState()
+            if climbingCloudAccountState == .noAccount {
+                clearClimbingCloudWriteApproval()
+                cloudClimbingMediaIDs = []
+            }
+            return nil
+        }
+    }
+
+    func refreshClimbingCloudAccountState() async {
+        climbingCloudAccountState = .checking
+        let latest = await climbingCloudMediaStore.accountState()
+        climbingCloudAccountState = latest
+        if latest == .available, climbingCloudInitialSyncApproved {
+            _ = await approvedClimbingCloudAccountIdentityDigest()
+        } else if latest == .noAccount {
+            clearClimbingCloudWriteApproval()
+            cloudClimbingMediaIDs = []
+        }
+        if latest == .available,
+           climbingCloudSyncMessage == "iCloud was unavailable, so Workspace will try your Mac." {
+            climbingCloudSyncMessage = nil
+        }
+    }
+
+    func refreshClimbingCloudIndex() async {
+        let account = await climbingCloudMediaStore.accountState()
+        climbingCloudAccountState = account
+        guard account.canSync else {
+            cloudClimbingMediaIDs = []
+            return
+        }
+        do {
+            let remote = try await climbingCloudMediaStore.allRecordStates()
+            var available: Set<String> = []
+            for reference in climbing.goalReferences
+                where reference.kind == .image || reference.kind == .video {
+                if case .active(let metadata) = remote[reference.id],
+                   metadata.matches(reference) {
+                    available.insert(reference.id)
+                }
+            }
+            cloudClimbingMediaIDs = available
+            climbingCloudSyncMessage = nil
+        } catch {
+            climbingCloudAccountState = await climbingCloudMediaStore.accountState()
+            cloudClimbingMediaIDs = []
+            climbingCloudSyncMessage = error.localizedDescription
+        }
+    }
+
+    func prepareClimbingCloudSync() async -> ClimbingCloudSyncPreflight? {
+        guard !syncingClimbingMediaWithCloud else { return nil }
+        climbingCloudSyncPreflight = nil
+        climbingCloudSyncPreflightPairingIdentity = nil
+        climbingCloudSyncMessage = nil
+        await refreshClimbingCloudAccountState()
+        guard climbingCloudAccountState.canSync else {
+            climbingCloudSyncMessage = climbingCloudAccountState.guidance
+                ?? "Private iCloud storage is not available right now."
+            return nil
+        }
+        let reviewedCloudAccountIdentity: String
+        do {
+            reviewedCloudAccountIdentity = try await climbingCloudMediaStore.accountIdentityDigest()
+        } catch {
+            climbingCloudSyncMessage = error.localizedDescription
+            return nil
+        }
+        guard await load(.climbing, force: true) else {
+            climbingCloudSyncMessage = "Open Workspace on your Mac and keep both devices on the same private Wi-Fi to review the initial media copy."
+            return nil
+        }
+        guard let client = workspaceClient(area: .climbing) else { return nil }
+
+        do {
+            let ledger: ClimbingCloudLedger = try await client.get("v1/climbing/media/cloud/status")
+            guard validClimbingCloudLedger(ledger) else {
+                throw BridgeError.message("The Mac returned an invalid climbing-media sync list.")
+            }
+            let remote = try await climbingCloudMediaStore.allRecordStates()
+            let referencePairs: [(String, ClimbingGoalReference)] = climbing.goalReferences.compactMap {
+                ($0.kind == .image || $0.kind == .video) ? ($0.id, $0) : nil
+            }
+            let references = Dictionary(uniqueKeysWithValues: referencePairs)
+            var files = 0
+            var bytes: Int64 = 0
+            var deletions = 0
+            var alreadyAvailable = 0
+            var availableIDs: Set<String> = []
+
+            for item in ledger.items {
+                switch item.operation {
+                case .upload:
+                    guard let reference = references[item.referenceId],
+                          reference.goalId == item.goalId else {
+                        throw BridgeError.message("The Mac’s climbing-media sync list contains a stale upload.")
+                    }
+                    if case .active(let metadata) = remote[item.referenceId],
+                       metadata.matches(reference),
+                       metadata.sha256 == item.sha256,
+                       metadata.byteSize == item.byteSize {
+                        alreadyAvailable += 1
+                        availableIDs.insert(item.referenceId)
+                    } else {
+                        files += 1
+                        let (next, overflow) = bytes.addingReportingOverflow(Int64(item.byteSize))
+                        guard !overflow else {
+                            throw BridgeError.message("The climbing-media copy is too large to summarize safely.")
+                        }
+                        bytes = next
+                    }
+                case .delete:
+                    if item.status != .confirmed
+                        || !isCloudTombstone(remote[item.referenceId]) {
+                        deletions += 1
+                    }
+                }
+            }
+            guard try await climbingCloudMediaStore.accountIdentityDigest()
+                    == reviewedCloudAccountIdentity else {
+                throw BridgeError.message("Your iCloud account changed while Workspace was preparing this review. Review it again before copying media.")
+            }
+            cloudClimbingMediaIDs = availableIDs
+            let result = ClimbingCloudSyncPreflight(
+                ledgerRevision: ledger.revision,
+                cloudAccountIdentityDigest: reviewedCloudAccountIdentity,
+                fileCount: files,
+                byteCount: bytes,
+                deletionCount: deletions,
+                alreadyAvailableCount: alreadyAvailable
+            )
+            climbingCloudSyncPreflight = result
+            climbingCloudSyncPreflightPairingIdentity = credentials?.fingerprint
+            return result
+        } catch {
+            climbingCloudAccountState = await climbingCloudMediaStore.accountState()
+            climbingCloudSyncMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    @discardableResult
+    func syncClimbingMediaWithCloud() async -> Bool {
+        guard !syncingClimbingMediaWithCloud else { return false }
+        guard let approvedPreflight = climbingCloudSyncPreflight,
+              let pairingIdentity = credentials?.fingerprint,
+              climbingCloudSyncPreflightPairingIdentity == pairingIdentity else {
+            climbingCloudSyncMessage = "Review the file count and size before starting the iCloud copy."
+            return false
+        }
+        climbingCloudSyncPreflight = nil
+        climbingCloudSyncPreflightPairingIdentity = nil
+        syncingClimbingMediaWithCloud = true
+        climbingCloudOperationEpoch += 1
+        let operationEpoch = climbingCloudOperationEpoch
+        climbingCloudSyncMessage = nil
+        climbingCloudSyncProgress = ClimbingCloudSyncProgress(
+            completed: 0,
+            total: 1,
+            message: "Checking private iCloud storage…"
+        )
+        defer {
+            syncingClimbingMediaWithCloud = false
+            climbingCloudSyncProgress = nil
+        }
+
+        await settleClimbingCloudReferenceTasks()
+        guard operationEpoch == climbingCloudOperationEpoch else { return false }
+
+        await refreshClimbingCloudAccountState()
+        guard climbingCloudAccountState.canSync else {
+            climbingCloudSyncMessage = climbingCloudAccountState.guidance
+                ?? "Private iCloud storage is not available right now."
+            return false
+        }
+
+        climbingCloudSyncProgress = ClimbingCloudSyncProgress(
+            completed: 0,
+            total: 1,
+            message: "Refreshing the attachment list from your Mac…"
+        )
+        guard await load(.climbing, force: true),
+              operationEpoch == climbingCloudOperationEpoch else {
+            climbingCloudSyncMessage = "Open Workspace on your Mac to reconcile climbing media before copying it to iCloud."
+            return false
+        }
+        guard begin(.climbing) else {
+            climbingCloudSyncMessage = "Wait for the current Climbing update to finish, then try again."
+            return false
+        }
+        defer { finish(.climbing) }
+        guard let client = workspaceClient(area: .climbing) else { return false }
+
+        do {
+            climbingCloudSyncProgress = ClimbingCloudSyncProgress(
+                completed: 0,
+                total: 1,
+                message: "Comparing your Mac and iCloud copies…"
+            )
+            let ledger: ClimbingCloudLedger = try await client.get("v1/climbing/media/cloud/status")
+            guard validClimbingCloudLedger(ledger) else {
+                throw BridgeError.message("The Mac returned an invalid climbing-media sync list.")
+            }
+            guard ledger.revision == approvedPreflight.ledgerRevision else {
+                climbingCloudSyncMessage = "The attachment list changed after review. Review the updated file count and size before syncing."
+                return false
+            }
+            guard try await climbingCloudMediaStore.accountIdentityDigest()
+                    == approvedPreflight.cloudAccountIdentityDigest else {
+                climbingCloudSyncMessage = "Your iCloud account changed after review. Review the climbing-media copy again before syncing."
+                clearClimbingCloudWriteApproval()
+                return false
+            }
+            var remote = try await climbingCloudMediaStore.allRecordStates()
+            guard operationEpoch == climbingCloudOperationEpoch else { return false }
+            guard try await climbingCloudMediaStore.accountIdentityDigest()
+                    == approvedPreflight.cloudAccountIdentityDigest else {
+                climbingCloudSyncMessage = "Your iCloud account changed after review. Review the climbing-media copy again before syncing."
+                clearClimbingCloudWriteApproval()
+                return false
+            }
+            try saveClimbingCloudWriteApproval(
+                pairingFingerprint: pairingIdentity,
+                cloudAccountIdentityDigest: approvedPreflight.cloudAccountIdentityDigest
+            )
+
+            let referencePairs: [(String, ClimbingGoalReference)] = climbing.goalReferences.compactMap { reference in
+                guard reference.kind == .image || reference.kind == .video else { return nil }
+                return (reference.id, reference)
+            }
+            let references: [String: ClimbingGoalReference] = Dictionary(
+                uniqueKeysWithValues: referencePairs
+            )
+            var availableInCloud: Set<String> = []
+            var failures = 0
+            let total = max(ledger.items.count, 1)
+
+            for (index, item) in ledger.items.enumerated() {
+                try Task.checkCancellation()
+                guard operationEpoch == climbingCloudOperationEpoch else { return false }
+                climbingCloudSyncProgress = ClimbingCloudSyncProgress(
+                    completed: index,
+                    total: total,
+                    message: item.operation == .upload
+                        ? "Copying attachment \(index + 1) of \(ledger.items.count)…"
+                        : "Reconciling removed attachment \(index + 1) of \(ledger.items.count)…"
+                )
+
+                do {
+                    switch item.operation {
+                    case .upload:
+                        guard let reference = references[item.referenceId],
+                              reference.goalId == item.goalId else {
+                            throw BridgeError.message("The Mac’s climbing-media upload no longer matches a project attachment.")
+                        }
+                        if case .active(let metadata) = remote[item.referenceId],
+                           metadata.matches(reference),
+                           metadata.sha256 == item.sha256,
+                           metadata.byteSize == item.byteSize {
+                            availableInCloud.insert(item.referenceId)
+                        } else {
+                            let prepared = try await prepareClimbingAssetForCloud(
+                                reference: reference,
+                                ledgerItem: item,
+                                client: client,
+                                operationEpoch: operationEpoch
+                            )
+                            do {
+                                let metadata = try await climbingCloudMediaStore.upload(
+                                    reference,
+                                    asset: prepared.asset,
+                                    expectedAccountIdentityDigest: approvedPreflight.cloudAccountIdentityDigest
+                                )
+                                if let transient = prepared.transientReceipt {
+                                    _ = try? await climbingMediaCache.removeIfCurrent(transient)
+                                }
+                                guard operationEpoch == climbingCloudOperationEpoch else { return false }
+                                remote[item.referenceId] = .active(metadata)
+                                availableInCloud.insert(item.referenceId)
+                            } catch {
+                                if let transient = prepared.transientReceipt {
+                                    _ = try? await climbingMediaCache.removeIfCurrent(transient)
+                                }
+                                throw error
+                            }
+                        }
+                        guard operationEpoch == climbingCloudOperationEpoch else { return false }
+                        if item.status != .confirmed {
+                            _ = try await sendClimbingCloudReceipt(
+                                for: item,
+                                status: .confirmed,
+                                error: nil,
+                                using: client
+                            )
+                        }
+
+                    case .delete:
+                        if !isCloudTombstone(remote[item.referenceId]) {
+                            try await climbingCloudMediaStore.tombstone(
+                                referenceID: item.referenceId,
+                                expectedAccountIdentityDigest: approvedPreflight.cloudAccountIdentityDigest
+                            )
+                            remote[item.referenceId] = .tombstone
+                        }
+                        guard operationEpoch == climbingCloudOperationEpoch else { return false }
+                        availableInCloud.remove(item.referenceId)
+                        if item.status != .confirmed {
+                            _ = try await sendClimbingCloudReceipt(
+                                for: item,
+                                status: .confirmed,
+                                error: nil,
+                                using: client
+                            )
+                        }
+                    }
+                } catch {
+                    if error is CancellationError { throw error }
+                    guard operationEpoch == climbingCloudOperationEpoch else { return false }
+                    failures += 1
+                    _ = try? await sendClimbingCloudReceipt(
+                        for: item,
+                        status: .error,
+                        error: cloudReceiptError(error),
+                        using: client
+                    )
+                }
+            }
+
+            guard operationEpoch == climbingCloudOperationEpoch else { return false }
+            cloudClimbingMediaIDs = availableInCloud
+            _ = await refreshCachedClimbingMediaIDs()
+            if failures == 0 {
+                let now = Date()
+                lastClimbingCloudSync = now
+                UserDefaults.standard.set(now, forKey: "climbingCloudMediaLastSync")
+                climbingCloudSyncMessage = ledger.items.isEmpty
+                    ? "Your climbing-media library is already synchronized."
+                    : "Climbing media is synchronized across your devices."
+                return true
+            }
+            climbingCloudSyncMessage = failures == 1
+                ? "One attachment still needs attention. Try the sync again while your Mac remains available."
+                : "\(failures) attachments still need attention. Try the sync again while your Mac remains available."
+            return false
+        } catch {
+            if error is CancellationError { return false }
+            climbingCloudAccountState = await climbingCloudMediaStore.accountState()
+            climbingCloudSyncMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    private struct PreparedClimbingCloudAsset {
+        let asset: ClimbingMediaCache.CachedAsset
+        let transientReceipt: ClimbingMediaCache.ImportReceipt?
+    }
+
+    private func prepareClimbingAssetForCloud(
+        reference: ClimbingGoalReference,
+        ledgerItem: ClimbingCloudLedgerItem,
+        client: BridgeClient,
+        operationEpoch: Int
+    ) async throws -> PreparedClimbingCloudAsset {
+        if let cached = await climbingMediaCache.cachedAsset(for: reference),
+           cached.sha256 == ledgerItem.sha256,
+           cached.byteSize == ledgerItem.byteSize {
+            return PreparedClimbingCloudAsset(asset: cached, transientReceipt: nil)
+        }
+
+        if await climbingMediaCache.cachedAsset(for: reference) != nil {
+            try await climbingMediaCache.remove(referenceID: reference.id)
+        }
+        let temporary = try await downloadClimbingMediaTemporaryFromMac(
+            reference,
+            using: client,
+            operationEpoch: operationEpoch
+        )
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let receipt = try await climbingMediaCache.importFile(at: temporary, for: reference)
+        guard receipt.sha256 == ledgerItem.sha256,
+              let asset = await climbingMediaCache.cachedAsset(for: reference),
+              asset.byteSize == ledgerItem.byteSize,
+              asset.sha256 == ledgerItem.sha256 else {
+            _ = try? await climbingMediaCache.removeIfCurrent(receipt)
+            throw BridgeError.message("The attachment downloaded from the Mac did not match its verified sync record.")
+        }
+        return PreparedClimbingCloudAsset(asset: asset, transientReceipt: receipt)
+    }
+
+    private func downloadClimbingMediaTemporaryFromMac(
+        _ reference: ClimbingGoalReference,
+        using client: BridgeClient,
+        operationEpoch: Int
+    ) async throws -> URL {
+        guard operationEpoch == climbingCloudOperationEpoch,
+              mediaReferenceIsCurrent(reference) else { throw CancellationError() }
+        let fileExtension = reference.mimeType.flatMap { UTType(mimeType: $0)?.preferredFilenameExtension }
+            ?? reference.fileName.map { URL(fileURLWithPath: $0).pathExtension }.flatMap { $0.isEmpty ? nil : $0 }
+        let temporary = try await client.download(
+            "v1/climbing/media/\(reference.id)",
+            fileExtension: fileExtension
+        )
+        guard operationEpoch == climbingCloudOperationEpoch,
+              mediaReferenceIsCurrent(reference),
+              !Task.isCancelled else {
+            try? FileManager.default.removeItem(at: temporary)
+            throw CancellationError()
+        }
+        return temporary
+    }
+
+    private func sendClimbingCloudReceipt(
+        for item: ClimbingCloudLedgerItem,
+        status receiptStatus: ClimbingCloudLedgerStatus,
+        error: ClimbingCloudLedgerError?,
+        using client: BridgeClient
+    ) async throws -> ClimbingCloudLedger {
+        let receipt = ClimbingCloudReceipt(
+            requestId: UUID().uuidString.lowercased(),
+            referenceId: item.referenceId,
+            operation: item.operation,
+            status: receiptStatus,
+            sha256: item.sha256,
+            byteSize: item.byteSize,
+            error: error
+        )
+        return try await client.send("v1/climbing/media/cloud/receipt", input: receipt)
+    }
+
+    private func validClimbingCloudLedger(_ ledger: ClimbingCloudLedger) -> Bool {
+        guard ledger.version == 1, ledger.revision >= 0 else { return false }
+        var seen: Set<String> = []
+        for item in ledger.items {
+            guard canonicalMediaIdentifier(item.referenceId),
+                  canonicalMediaIdentifier(item.goalId),
+                  seen.insert(item.referenceId).inserted,
+                  item.sha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                  item.byteSize > 0,
+                  item.byteSize <= ClimbingMediaCache.maximumMediaBytes,
+                  !item.requestedAt.isEmpty,
+                  !item.updatedAt.isEmpty,
+                  (item.status == .error) == (item.error != nil) else { return false }
+        }
+        return true
+    }
+
+    private func canonicalMediaIdentifier(_ value: String) -> Bool {
+        guard let uuid = UUID(uuidString: value) else { return false }
+        return value == uuid.uuidString.lowercased()
+    }
+
+    private func canonicalDigest(_ value: String) -> Bool {
+        value.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil
+    }
+
+    private func cloudReceiptError(_ error: Error) -> ClimbingCloudLedgerError {
+        let nsError = error as NSError
+        let code: String
+        if nsError.domain == CKErrorDomain {
+            code = "cloudkit_\(nsError.code)"
+        } else if error is CancellationError {
+            code = "cancelled"
+        } else {
+            code = "cloud_sync_failed"
+        }
+        return ClimbingCloudLedgerError(
+            code: String(code.prefix(80)),
+            message: prefixUTF16(error.localizedDescription, limit: 500)
+        )
+    }
+
+    private func prefixUTF16(_ value: String, limit: Int) -> String {
+        guard value.utf16.count > limit else { return value }
+        var result = ""
+        result.reserveCapacity(limit)
+        for character in value {
+            if (result + String(character)).utf16.count > limit { break }
+            result.append(character)
+        }
+        return result
+    }
+
+    private func isCloudTombstone(_ state: ClimbingCloudRecordState?) -> Bool {
+        if case .tombstone = state { return true }
+        return false
+    }
+
+    private func scheduleCloudMirror(for reference: ClimbingGoalReference) {
+        guard reference.kind == .image || reference.kind == .video,
+              hasWorkspaceAccess,
+              climbingCloudInitialSyncApproved,
+              !syncingClimbingMediaWithCloud else { return }
+        enqueueClimbingCloudTask(referenceID: reference.id) { [weak self] generation in
+            await self?.mirrorClimbingMediaToCloud(reference, generation: generation)
+        }
+    }
+
+    private func scheduleCloudDeletion(for reference: ClimbingGoalReference) {
+        guard reference.kind == .image || reference.kind == .video,
+              climbingCloudInitialSyncApproved else { return }
+        cloudClimbingMediaIDs.remove(reference.id)
+        enqueueClimbingCloudTask(referenceID: reference.id) { [weak self] generation in
+            await self?.deleteClimbingMediaFromCloud(reference, generation: generation)
+        }
+    }
+
+    private func enqueueClimbingCloudTask(
+        referenceID: String,
+        operation: @escaping @MainActor (Int) async -> Void
+    ) {
+        let previous = climbingCloudReferenceTasks[referenceID]
+        let generation = (climbingCloudReferenceGenerations[referenceID] ?? 0) + 1
+        climbingCloudReferenceGenerations[referenceID] = generation
+        let task = Task { [weak self] in
+            _ = await previous?.value
+            guard !Task.isCancelled,
+                  let self,
+                  self.climbingCloudReferenceGenerations[referenceID] == generation else { return }
+            await operation(generation)
+            self.finishClimbingCloudTask(referenceID: referenceID, generation: generation)
+        }
+        climbingCloudReferenceTasks[referenceID] = task
+    }
+
+    private func finishClimbingCloudTask(referenceID: String, generation: Int) {
+        guard climbingCloudReferenceGenerations[referenceID] == generation else { return }
+        climbingCloudReferenceTasks.removeValue(forKey: referenceID)
+    }
+
+    private func settleClimbingCloudReferenceTasks() async {
+        let tasks = Array(climbingCloudReferenceTasks.values)
+        tasks.forEach { $0.cancel() }
+        for task in tasks { await task.value }
+        climbingCloudReferenceTasks.removeAll()
+    }
+
+    private func mirrorClimbingMediaToCloud(
+        _ reference: ClimbingGoalReference,
+        generation: Int
+    ) async {
+        guard climbingCloudReferenceGenerations[reference.id] == generation,
+              mediaReferenceIsCurrent(reference),
+              let client = workspaceClient(area: .climbing) else { return }
+        guard let expectedAccountIdentityDigest = await approvedClimbingCloudAccountIdentityDigest()
+        else { return }
+        climbingCloudAccountState = .available
+
+        do {
+            let ledger: ClimbingCloudLedger = try await client.get("v1/climbing/media/cloud/status")
+            guard validClimbingCloudLedger(ledger),
+                  let item = ledger.items.first(where: {
+                      $0.referenceId == reference.id && $0.operation == .upload
+                  }),
+                  let asset = await climbingMediaCache.cachedAsset(for: reference),
+                  asset.sha256 == item.sha256,
+                  asset.byteSize == item.byteSize,
+                  climbingCloudReferenceGenerations[reference.id] == generation,
+                  mediaReferenceIsCurrent(reference),
+                  !Task.isCancelled else { return }
+
+            _ = try await climbingCloudMediaStore.upload(
+                reference,
+                asset: asset,
+                expectedAccountIdentityDigest: expectedAccountIdentityDigest
+            )
+            guard climbingCloudReferenceGenerations[reference.id] == generation,
+                  mediaReferenceIsCurrent(reference),
+                  !Task.isCancelled else { return }
+            _ = try await sendClimbingCloudReceipt(
+                for: item,
+                status: .confirmed,
+                error: nil,
+                using: client
+            )
+            cloudClimbingMediaIDs.insert(reference.id)
+            climbingCloudSyncMessage = nil
+        } catch {
+            if error is CancellationError || Task.isCancelled { return }
+            climbingCloudAccountState = await climbingCloudMediaStore.accountState()
+            climbingCloudSyncMessage = "One climbing attachment is waiting to copy to iCloud."
+            if let ledger: ClimbingCloudLedger = try? await client.get("v1/climbing/media/cloud/status"),
+               let item = ledger.items.first(where: {
+                   $0.referenceId == reference.id && $0.operation == .upload && $0.status != .confirmed
+               }) {
+                _ = try? await sendClimbingCloudReceipt(
+                    for: item,
+                    status: .error,
+                    error: cloudReceiptError(error),
+                    using: client
+                )
+            }
+        }
+    }
+
+    private func deleteClimbingMediaFromCloud(
+        _ reference: ClimbingGoalReference,
+        generation: Int
+    ) async {
+        guard climbingCloudReferenceGenerations[reference.id] == generation,
+              !Task.isCancelled else { return }
+        guard let expectedAccountIdentityDigest = await approvedClimbingCloudAccountIdentityDigest()
+        else { return }
+        climbingCloudAccountState = .available
+
+        let client = credentials.flatMap { try? BridgeClient($0) }
+        do {
+            try await climbingCloudMediaStore.tombstone(
+                reference,
+                expectedAccountIdentityDigest: expectedAccountIdentityDigest
+            )
+            guard climbingCloudReferenceGenerations[reference.id] == generation,
+                  !Task.isCancelled else { return }
+            if let client,
+               let ledger: ClimbingCloudLedger = try? await client.get("v1/climbing/media/cloud/status"),
+               let item = ledger.items.first(where: {
+                   $0.referenceId == reference.id && $0.operation == .delete
+               }) {
+                _ = try await sendClimbingCloudReceipt(
+                    for: item,
+                    status: .confirmed,
+                    error: nil,
+                    using: client
+                )
+            }
+            cloudClimbingMediaIDs.remove(reference.id)
+        } catch {
+            if error is CancellationError || Task.isCancelled { return }
+            climbingCloudAccountState = await climbingCloudMediaStore.accountState()
+            climbingCloudSyncMessage = "A removed climbing attachment is waiting for iCloud cleanup."
+            if let client,
+               let ledger: ClimbingCloudLedger = try? await client.get("v1/climbing/media/cloud/status"),
+               let item = ledger.items.first(where: {
+                   $0.referenceId == reference.id && $0.operation == .delete && $0.status != .confirmed
+               }) {
+                _ = try? await sendClimbingCloudReceipt(
+                    for: item,
+                    status: .error,
+                    error: cloudReceiptError(error),
+                    using: client
+                )
+            }
+        }
+    }
+
+    private func mediaReferenceIsCurrent(_ reference: ClimbingGoalReference) -> Bool {
+        climbing.goalReferences.contains {
+            $0.id == reference.id
+                && $0.goalId == reference.goalId
+                && $0.kind == reference.kind
+                && $0.fileName == reference.fileName
+                && $0.byteSize == reference.byteSize
+        }
+    }
+
+    @discardableResult
+    private func refreshCachedClimbingMediaIDs(expectedEpoch: Int? = nil) async -> Bool {
+        let publicationEpoch = expectedEpoch ?? climbingMediaCacheEpoch
+        let available = await climbingMediaCache.availableReferenceIDs()
+        guard publicationEpoch == climbingMediaCacheEpoch else { return false }
+        cachedClimbingMediaIDs = available
+        return true
+    }
+
+    @discardableResult
+    private func reconcileCachedClimbingMedia(with references: [ClimbingGoalReference]) async -> Bool {
+        let expectedEpoch = climbingMediaCacheEpoch
+        // The authoritative Workspace data remains usable even if pruning a
+        // disposable copy fails. Refresh the published set either way so files
+        // removed before a catalog write error do not appear available.
+        let reconciled: Bool
+        do {
+            try await climbingMediaCache.reconcile(with: references)
+            reconciled = true
+        } catch {
+            reconciled = false
+        }
+        _ = await refreshCachedClimbingMediaIDs(expectedEpoch: expectedEpoch)
+        return reconciled
+    }
+
+    private func mediaBridgeOperationIsCurrent(_ operation: ClimbingMediaOperationContext) -> Bool {
+        guard !unpairing,
+              pairingEpoch == operation.pairingEpoch,
+              let current = credentials else { return false }
+        return current.url == operation.credentials.url
+            && current.fingerprint == operation.credentials.fingerprint
+            && current.token == operation.credentials.token
+            && current.scope == operation.credentials.scope
+    }
+
+    private func mediaCacheOperationIsCurrent(_ operation: ClimbingMediaOperationContext) -> Bool {
+        mediaBridgeOperationIsCurrent(operation)
+            && climbingMediaCacheEpoch == operation.cacheEpoch
+    }
+
+    private func cacheClimbingMediaFile(
+        _ file: URL,
+        referenceID: String,
+        guarding operation: ClimbingMediaOperationContext
+    ) async -> Bool {
+        guard mediaCacheOperationIsCurrent(operation),
+              let reference = climbing.goalReferences.first(where: { $0.id == referenceID }) else {
+            return false
+        }
+        do {
+            let receipt = try await climbingMediaCache.importFile(at: file, for: reference)
+            guard mediaCacheOperationIsCurrent(operation),
+                  climbing.goalReferences.contains(where: { $0.id == referenceID }) else {
+                _ = try? await climbingMediaCache.removeIfCurrent(receipt)
+                _ = await refreshCachedClimbingMediaIDs(expectedEpoch: operation.cacheEpoch)
+                return false
+            }
+            guard await refreshCachedClimbingMediaIDs(expectedEpoch: operation.cacheEpoch),
+                  mediaCacheOperationIsCurrent(operation) else {
+                _ = try? await climbingMediaCache.removeIfCurrent(receipt)
+                _ = await refreshCachedClimbingMediaIDs(expectedEpoch: operation.cacheEpoch)
+                return false
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    private func removeCachedClimbingMedia(_ referenceID: String, reportFailure: Bool) async -> Bool {
+        let expectedEpoch = climbingMediaCacheEpoch
+        do {
+            try await climbingMediaCache.remove(referenceID: referenceID)
+            _ = await refreshCachedClimbingMediaIDs(expectedEpoch: expectedEpoch)
+            return true
+        } catch {
+            _ = await refreshCachedClimbingMediaIDs(expectedEpoch: expectedEpoch)
+            if reportFailure {
+                let failure = BridgeError.message(
+                    "The reference was removed, but its downloaded copy could not be removed. Try Remove downloaded media in Settings; deleting the app will also remove it."
+                )
+                record(failure, area: .climbing)
+                status = failure.localizedDescription
+            }
+            return false
+        }
+    }
+
+    @discardableResult
+    private func applyClimbingMediaResult(
+        _ latest: ClimbingState,
+        status message: String,
+        guarding operation: ClimbingMediaOperationContext? = nil
+    ) async -> Bool {
+        if let operation, !mediaBridgeOperationIsCurrent(operation) { return false }
+        let cacheReconciled = await reconcileCachedClimbingMedia(with: latest.goalReferences)
+        if let operation, !mediaBridgeOperationIsCurrent(operation) { return false }
         climbing = latest
         loadedAreas.insert(.climbing)
-        clearRecordedError(.climbing)
+        if cacheReconciled { clearRecordedError(.climbing) }
         markConnectionSucceeded()
         cacheCurrent(.climbing)
         status = message
+        return true
     }
 
     private func reconcileClimbingMedia(
         using client: BridgeClient,
         referenceId: String,
-        shouldExist: Bool
+        shouldExist: Bool,
+        guarding operation: ClimbingMediaOperationContext? = nil
     ) async -> Bool {
+        if let operation, !mediaBridgeOperationIsCurrent(operation) { return false }
         guard let latest: ClimbingState = try? await client.get("v1/climbing") else { return false }
+        if let operation, !mediaBridgeOperationIsCurrent(operation) { return false }
         let exists = latest.goalReferences.contains { $0.id == referenceId }
         guard exists == shouldExist else { return false }
-        applyClimbingMediaResult(latest, status: shouldExist ? "Reference added." : "Reference removed.")
-        return true
+        return await applyClimbingMediaResult(
+            latest,
+            status: shouldExist ? "Reference added." : "Reference removed.",
+            guarding: operation
+        )
     }
 
     @discardableResult
@@ -2157,6 +3239,16 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func resetWorkspaceState() {
+        climbingCloudOperationEpoch += 1
+        climbingCloudReferenceTasks.values.forEach { $0.cancel() }
+        climbingCloudReferenceTasks = [:]
+        climbingCloudReferenceGenerations = [:]
+        cloudClimbingMediaIDs = []
+        climbingCloudSyncPreflight = nil
+        climbingCloudSyncPreflightPairingIdentity = nil
+        climbingCloudSyncProgress = nil
+        syncingClimbingMediaWithCloud = false
+        UserDefaults.standard.removeObject(forKey: climbingCloudApprovalIdentityKey)
         clearCaptureState()
         capabilities = nil
         workspace = .empty

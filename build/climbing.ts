@@ -1,7 +1,7 @@
 import { createReadStream } from "node:fs";
 import { execFile } from "node:child_process";
 import { chmod, link, mkdir, open, readFile, readdir, rename, stat, statfs, unlink } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -18,6 +18,14 @@ import {
   type ClimbingState,
   type GoalReference,
 } from "../lib/climbing.ts";
+import {
+  climbingCloudMediaLedgerSchema,
+  climbingCloudMediaReceiptSchema,
+  emptyClimbingCloudMedia,
+  type ClimbingCloudMediaItem,
+  type ClimbingCloudMediaLedger,
+  type ClimbingCloudMediaView,
+} from "../lib/climbing-cloud-media.ts";
 import { StoreBusyError, withPrivateLock, writePrivateJson } from "./private-store.ts";
 
 class ClimbingError extends Error {
@@ -39,6 +47,8 @@ const MAX_TOTAL_MEDIA_BYTES = 5_000_000_000;
 const MIN_FREE_SPACE_BYTES = 250_000_000;
 const MAX_MEDIA_PROBE_BYTES = 25_000_000;
 const MAX_CONCURRENT_UPLOADS = 1;
+const MAX_CLOUD_RECEIPTS = 500;
+const MAX_CONFIRMED_CLOUD_DELETIONS = 1_000;
 const execFileAsync = promisify(execFile);
 const identifierSchema = z.string().uuid();
 const storedIdentifierPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -47,6 +57,7 @@ const fileNameSchema = z.string().trim().min(1).max(240)
 const linkInputSchema = z.object({ requestId: identifierSchema, reference: goalReferenceSchema }).strict();
 const deleteInputSchema = z.object({ requestId: identifierSchema, goalId: identifierSchema, referenceId: identifierSchema }).strict();
 const additiveGoalKeys = ["environment", "discipline", "ropeStyle", "attempts"] as const;
+const additiveClimbKeys = ["projectGoalId"] as const;
 const allowedUploadTypes = new Set([
   "application/octet-stream",
   "image/jpeg",
@@ -69,28 +80,58 @@ function preserveOmittedGoalFields(value: unknown, current: ClimbingState["goals
   return next;
 }
 
-function preserveCommandGoalFields(value: unknown, current: ClimbingState) {
-  if (!jsonRecord(value) || !Array.isArray(value.changes)) return value;
+function preserveOmittedClimbFields(value: unknown, current: ClimbingState["sessions"][number]["climbs"][number] | undefined) {
+  if (!current || !jsonRecord(value)) return value;
+  const next = { ...value };
+  for (const key of additiveClimbKeys) if (!Object.hasOwn(value, key)) next[key] = current[key];
+  return next;
+}
+
+function preserveOmittedSessionFields(value: unknown, current: ClimbingState["sessions"][number] | undefined) {
+  if (!current || !jsonRecord(value) || !Array.isArray(value.climbs)) return value;
   return {
     ...value,
-    changes: value.changes.map(change => {
-      if (!jsonRecord(change) || change.kind !== "goal" || !jsonRecord(change.value) || typeof change.value.id !== "string") return change;
-      const goalId = change.value.id;
-      const existing = current.goals.find(goal => goal.id === goalId);
-      return { ...change, value: preserveOmittedGoalFields(change.value, existing) };
+    climbs: value.climbs.map(climb => {
+      if (!jsonRecord(climb) || typeof climb.id !== "string") return climb;
+      return preserveOmittedClimbFields(climb, current.climbs.find(item => item.id === climb.id));
     }),
   };
 }
 
-function preserveStateGoalFields(value: unknown, current: ClimbingState) {
-  if (!jsonRecord(value) || !Array.isArray(value.goals)) return value;
+function preserveCommandAdditiveFields(value: unknown, current: ClimbingState) {
+  if (!jsonRecord(value) || !Array.isArray(value.changes)) return value;
   return {
     ...value,
-    goals: value.goals.map(goal => {
+    changes: value.changes.map(change => {
+      if (!jsonRecord(change) || !jsonRecord(change.value) || typeof change.value.id !== "string") return change;
+      const changeValue = change.value;
+      if (change.kind === "goal") {
+        const existing = current.goals.find(goal => goal.id === changeValue.id);
+        return { ...change, value: preserveOmittedGoalFields(changeValue, existing) };
+      }
+      if (change.kind === "session") {
+        const existing = current.sessions.find(session => session.id === changeValue.id);
+        return { ...change, value: preserveOmittedSessionFields(changeValue, existing) };
+      }
+      return change;
+    }),
+  };
+}
+
+function preserveStateAdditiveFields(value: unknown, current: ClimbingState) {
+  if (!jsonRecord(value)) return value;
+  return {
+    ...value,
+    ...(Array.isArray(value.goals) ? { goals: value.goals.map(goal => {
       if (!jsonRecord(goal) || typeof goal.id !== "string") return goal;
       const existing = current.goals.find(item => item.id === goal.id);
       return preserveOmittedGoalFields(goal, existing);
-    }),
+    }) } : {}),
+    ...(Array.isArray(value.sessions) ? { sessions: value.sessions.map(session => {
+      if (!jsonRecord(session) || typeof session.id !== "string") return session;
+      const existing = current.sessions.find(item => item.id === session.id);
+      return preserveOmittedSessionFields(session, existing);
+    }) } : {}),
   };
 }
 
@@ -282,14 +323,22 @@ async function probeMedia(path: string, detected: { kind: "image" | "video"; mim
 
 export function createClimbingService(directory: string) {
   const file = join(directory, "climbing.private.json");
+  const cloudMediaFile = join(directory, "climbing-cloud-media.private.json");
   const mediaDirectory = join(directory, "climbing-media");
   const uploadGate = join(directory, "climbing-media-upload");
   let queue: Promise<unknown> = Promise.resolve();
+  let cloudQueue: Promise<unknown> = Promise.resolve();
   let activeUploads = 0;
   let mediaReady: Promise<void> | undefined;
+  const mediaDigestCache = new Map<string, { signature: string; sha256: string }>();
   const exclusive = <T>(operation: () => Promise<T>) => {
     const next = queue.catch(() => {}).then(() => withPrivateLock(file, operation));
     queue = next;
+    return next;
+  };
+  const cloudExclusive = <T>(operation: () => Promise<T>) => {
+    const next = cloudQueue.catch(() => {}).then(() => withPrivateLock(cloudMediaFile, operation));
+    cloudQueue = next;
     return next;
   };
 
@@ -301,6 +350,164 @@ export function createClimbingService(directory: string) {
       if (error instanceof z.ZodError || error instanceof SyntaxError) throw new ClimbingError("Your climbing log could not be read. The saved file has been left untouched.", 500);
       throw error;
     }
+  }
+
+  async function readCloudMedia(): Promise<ClimbingCloudMediaLedger> {
+    try {
+      return climbingCloudMediaLedgerSchema.parse(JSON.parse(await readFile(cloudMediaFile, "utf8")));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return structuredClone(emptyClimbingCloudMedia);
+      if (error instanceof z.ZodError || error instanceof SyntaxError) throw new ClimbingError("Your climbing media sync history could not be read. The saved file has been left untouched.", 500, "cloud_media_state_invalid");
+      throw error;
+    }
+  }
+
+  const cloudMediaView = (state: ClimbingCloudMediaLedger): ClimbingCloudMediaView => ({
+    version: state.version,
+    revision: state.revision,
+    items: state.items,
+  });
+
+  async function mediaDigest(reference: GoalReference) {
+    if (reference.kind === "link" || reference.byteSize === null) throw new ClimbingError("Only uploaded climbing media can be copied to iCloud.", 409, "cloud_media_reference_invalid");
+    const path = join(mediaDirectory, reference.id);
+    const before = await stat(path).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        mediaDigestCache.delete(reference.id);
+        throw new ClimbingError("This goal media is no longer available on the Mac.", 409, "cloud_media_missing");
+      }
+      throw error;
+    });
+    if (!before.isFile() || before.size !== reference.byteSize) {
+      mediaDigestCache.delete(reference.id);
+      throw new ClimbingError("This goal media no longer matches its saved reference.", 409, "cloud_media_inconsistent");
+    }
+    const beforeSignature = `${before.dev}:${before.ino}:${before.size}:${before.mtimeMs}:${before.ctimeMs}`;
+    const cached = mediaDigestCache.get(reference.id);
+    if (cached?.signature === beforeSignature) return cached.sha256;
+    const digest = createHash("sha256");
+    for await (const chunk of createReadStream(path)) digest.update(chunk);
+    const after = await stat(path).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ClimbingError("This goal media changed while Workspace was preparing it for sync.", 409, "cloud_media_changed");
+      throw error;
+    });
+    const afterSignature = `${after.dev}:${after.ino}:${after.size}:${after.mtimeMs}:${after.ctimeMs}`;
+    if (!after.isFile() || afterSignature !== beforeSignature) throw new ClimbingError("This goal media changed while Workspace was preparing it for sync.", 409, "cloud_media_changed");
+    const sha256 = digest.digest("hex");
+    mediaDigestCache.set(reference.id, { signature: afterSignature, sha256 });
+    return sha256;
+  }
+
+  async function reconcileCloudMediaLedger(current: ClimbingState, saved: ClimbingCloudMediaLedger) {
+    const now = new Date().toISOString();
+    const currentFiles = current.goalReferences.filter(reference => reference.kind !== "link");
+    const currentIds = new Set(currentFiles.map(reference => reference.id));
+    for (const referenceId of mediaDigestCache.keys()) if (!currentIds.has(referenceId)) mediaDigestCache.delete(referenceId);
+    const savedById = new Map(saved.items.map(item => [item.referenceId, item]));
+    const items: ClimbingCloudMediaItem[] = [];
+
+    for (const reference of currentFiles) {
+      const sha256 = await mediaDigest(reference);
+      const previous = savedById.get(reference.id);
+      if (previous && previous.operation === "upload" && previous.goalId === reference.goalId && previous.byteSize === reference.byteSize && previous.sha256 === sha256) {
+        items.push(previous);
+        continue;
+      }
+      items.push({
+        referenceId: reference.id,
+        goalId: reference.goalId,
+        operation: "upload",
+        status: "pending",
+        sha256,
+        byteSize: reference.byteSize!,
+        requestedAt: now,
+        updatedAt: now,
+        confirmedAt: null,
+        error: null,
+      });
+    }
+
+    for (const previous of saved.items) {
+      if (currentIds.has(previous.referenceId)) continue;
+      if (previous.operation === "delete") {
+        items.push(previous);
+        continue;
+      }
+      items.push({
+        ...previous,
+        operation: "delete",
+        status: "pending",
+        requestedAt: now,
+        updatedAt: now,
+        confirmedAt: null,
+        error: null,
+      });
+    }
+
+    const confirmedDeletes = items.filter(item => item.operation === "delete" && item.status === "confirmed")
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    const retainedConfirmedDeletes = new Set(confirmedDeletes.slice(0, MAX_CONFIRMED_CLOUD_DELETIONS).map(item => item.referenceId));
+    const boundedItems = items.filter(item => item.operation !== "delete" || item.status !== "confirmed" || retainedConfirmedDeletes.has(item.referenceId));
+    if (JSON.stringify(boundedItems) === JSON.stringify(saved.items)) return saved;
+    return climbingCloudMediaLedgerSchema.parse({ ...saved, revision: saved.revision + 1, items: boundedItems });
+  }
+
+  async function cloudMediaStatus() {
+    return cloudExclusive(async () => {
+      const saved = await readCloudMedia();
+      const reconciled = await reconcileCloudMediaLedger(await read(), saved);
+      if (JSON.stringify(reconciled) !== JSON.stringify(saved)) await writePrivateJson(cloudMediaFile, reconciled);
+      return cloudMediaView(reconciled);
+    });
+  }
+
+  async function recordCloudMediaReceipt(req: IncomingMessage) {
+    const receipt = climbingCloudMediaReceiptSchema.parse(await jsonBody(req, 16_000));
+    const payloadHash = createHash("sha256").update(JSON.stringify(receipt)).digest("hex");
+    return cloudExclusive(async () => {
+      const current = await read();
+      let saved = await readCloudMedia();
+      const reconciled = await reconcileCloudMediaLedger(current, saved);
+      if (JSON.stringify(reconciled) !== JSON.stringify(saved)) {
+        await writePrivateJson(cloudMediaFile, reconciled);
+        saved = reconciled;
+      }
+      const replay = saved.receipts.find(item => item.requestId === receipt.requestId);
+      if (replay) {
+        if (replay.payloadHash !== payloadHash) throw new ClimbingError("This cloud media receipt ID was already used for another result.", 409, "cloud_media_receipt_conflict");
+        return { state: cloudMediaView(saved), replayed: true };
+      }
+
+      const item = saved.items.find(candidate => candidate.referenceId === receipt.referenceId);
+      if (!item || item.operation !== receipt.operation) throw new ClimbingError("This cloud media result no longer matches what the Mac needs.", 409, "cloud_media_operation_conflict");
+      if (item.sha256 !== receipt.sha256 || item.byteSize !== receipt.byteSize) throw new ClimbingError("This cloud media result does not match the saved file.", 409, "cloud_media_digest_conflict");
+      if (item.status === "confirmed" && receipt.status !== "confirmed") throw new ClimbingError("This cloud media operation is already confirmed.", 409, "cloud_media_already_confirmed");
+      if (receipt.operation === "upload" && receipt.status === "confirmed") {
+        const reference = current.goalReferences.find(candidate => candidate.id === receipt.referenceId);
+        if (!reference || reference.kind === "link" || reference.byteSize !== receipt.byteSize || await mediaDigest(reference) !== receipt.sha256) {
+          throw new ClimbingError("The iCloud copy does not match the file currently saved on this Mac.", 409, "cloud_media_digest_conflict");
+        }
+      }
+
+      const now = new Date().toISOString();
+      const nextItem: ClimbingCloudMediaItem = {
+        ...item,
+        status: receipt.status,
+        requestedAt: receipt.status === "pending" && item.status === "error" ? now : item.requestedAt,
+        updatedAt: now,
+        confirmedAt: receipt.status === "confirmed" ? now : null,
+        error: receipt.status === "error" ? { ...receipt.error!, at: now } : null,
+      };
+      const receipts = [...saved.receipts, { requestId: receipt.requestId, payloadHash, recordedAt: now }].slice(-MAX_CLOUD_RECEIPTS);
+      const next = climbingCloudMediaLedgerSchema.parse({
+        ...saved,
+        revision: saved.revision + 1,
+        items: saved.items.map(candidate => candidate.referenceId === item.referenceId ? nextItem : candidate),
+        receipts,
+      });
+      await writePrivateJson(cloudMediaFile, next);
+      return { state: cloudMediaView(next), replayed: false };
+    });
   }
 
   async function fileExists(path: string) {
@@ -443,6 +650,7 @@ export function createClimbingService(directory: string) {
     const temporary = await open(temporaryPath, "wx", 0o600);
     let size = 0;
     let prefix = Buffer.alloc(0);
+    const digest = createHash("sha256");
     let complete = false;
     try {
       for await (const part of req) {
@@ -450,6 +658,7 @@ export function createClimbingService(directory: string) {
         size += value.length;
         if (size > MAX_MEDIA_BYTES) throw new ClimbingError("Choose a photo or video smaller than 200 MB.", 413);
         if (prefix.length < 64) prefix = Buffer.concat([prefix, value.subarray(0, 64 - prefix.length)]);
+        digest.update(value);
         if (size === value.length || size % 8_000_000 < value.length) await ensureUploadSpace(value.length);
         await temporary.write(value);
       }
@@ -457,7 +666,7 @@ export function createClimbingService(directory: string) {
       await temporary.sync();
       await ensureUploadSpace(0);
       complete = true;
-      return { size, prefix };
+      return { size, prefix, sha256: digest.digest("hex") };
     } finally {
       await temporary.close().catch(() => {});
       if (!complete) await unlink(temporaryPath).catch(() => {});
@@ -505,8 +714,11 @@ export function createClimbingService(directory: string) {
             try {
               const info = await stat(finalPath);
               if (!info.isFile() || info.size !== uploaded.size) throw new ClimbingError("This saved media file is inconsistent. Remove the reference and add it again.", 500, "media_inconsistent");
+              if (await mediaDigest(existing) !== uploaded.sha256) throw new ClimbingError("This media reference ID already belongs to different file contents.", 409, "reference_conflict");
             } catch (error) {
               if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+              const tracked = (await readCloudMedia()).items.find(item => item.referenceId === referenceId);
+              if (tracked && tracked.sha256 !== uploaded.sha256) throw new ClimbingError("This media reference ID already belongs to different file contents.", 409, "reference_conflict");
               await link(temporaryPath, finalPath);
             }
             return { state: current, replayed: true };
@@ -654,6 +866,18 @@ export function createClimbingService(directory: string) {
       }
       await ensureMediaReady();
       const path = requestPath(req);
+      if (path === "/media/cloud/status" && req.method === "GET") {
+        const state = await cloudMediaStatus();
+        const etag = `"climbing-cloud-${state.revision}"`;
+        if (req.headers["if-none-match"] === etag) send(res, 304, undefined, { ETag: etag });
+        else send(res, 200, state, { ETag: etag });
+        return;
+      }
+      if (path === "/media/cloud/receipt" && req.method === "POST") {
+        const result = await recordCloudMediaReceipt(req);
+        send(res, 200, result.state, { ETag: `"climbing-cloud-${result.state.revision}"`, ...(result.replayed ? { "X-Idempotent-Replay": "true" } : {}) });
+        return;
+      }
       const mediaMatch = /^\/media\/([0-9a-f-]+)$/i.exec(path);
       if (mediaMatch && (req.method === "GET" || req.method === "HEAD")) {
         await serveMedia(req, res, mediaMatch[1]);
@@ -687,7 +911,7 @@ export function createClimbingService(directory: string) {
       if (req.method === "POST") {
         const result = await exclusive(async () => {
           const current = await read();
-          const input = climbingCommandSchema.parse(preserveCommandGoalFields(raw, current));
+          const input = climbingCommandSchema.parse(preserveCommandAdditiveFields(raw, current));
           const applied = applyCommand(current, input);
           if (!applied.replayed) await writePrivateJson(file, applied.state);
           return applied;
@@ -697,7 +921,7 @@ export function createClimbingService(directory: string) {
       }
       const saved = await exclusive(async () => {
         const current = await read();
-        const input = climbingStateSchema.parse(preserveStateGoalFields(raw, current));
+        const input = climbingStateSchema.parse(preserveStateAdditiveFields(raw, current));
         if (input.revision !== current.revision) throw new ClimbingError("Your climbing log changed in another window. Your open draft is still here; review the latest saved records before trying again.", 409, "revision_conflict");
         const next = climbingStateSchema.parse({ ...input, goalReferences: current.goalReferences, revision: current.revision + 1 });
         await writePrivateJson(file, next);

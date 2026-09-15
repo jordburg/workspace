@@ -1258,6 +1258,7 @@ private struct WeekDayPicker: View {
             HStack {
                 Button { shift(-7) } label: { Image(systemName: "chevron.left") }
                     .frame(width: 44, height: 44)
+                    .buttonStyle(.plain)
                     .accessibilityLabel("Previous week")
                 Spacer()
                 Text(selection.formatted(.dateTime.month(.wide).year()))
@@ -1266,6 +1267,7 @@ private struct WeekDayPicker: View {
                 Spacer()
                 Button { shift(7) } label: { Image(systemName: "chevron.right") }
                     .frame(width: 44, height: 44)
+                    .buttonStyle(.plain)
                     .accessibilityLabel("Next week")
             }
             HStack(spacing: 4) {
@@ -2170,6 +2172,163 @@ private func enumTitle(_ rawValue: String) -> String {
 
 // MARK: - Climbing
 
+private struct ProjectClimbLog: Identifiable {
+    let session: ClimbingSession
+    let climb: Climb
+
+    var id: String { "\(session.id):\(climb.id)" }
+}
+
+private struct ProjectClimbStats {
+    let logs: [ProjectClimbLog]
+
+    var sessionCount: Int { Set(logs.map { $0.session.id }).count }
+    var knownLinkedAttempts: Int { logs.compactMap { $0.climb.attempts }.reduce(0, +) }
+    var uncountedLinkedClimbCount: Int { logs.filter { $0.climb.attempts == nil }.count }
+    var lastWorked: String? { logs.map { $0.session.date }.max() }
+    var sends: [ProjectClimbLog] { logs.filter { isProjectSend($0.climb.outcome) } }
+    var firstCompletion: ProjectClimbLog? { sends.first }
+}
+
+private struct ProjectMetric: Identifiable {
+    let id: String
+    let label: String
+    let accessibilityLabel: String
+    let systemImage: String
+}
+
+private struct ProjectMetricGrid: View {
+    let stats: ProjectClimbStats
+    let manualAttempts: Int
+    let targetDate: String?
+    let referenceCount: Int
+
+    private var metrics: [ProjectMetric] {
+        var result: [ProjectMetric] = []
+        if stats.sessionCount > 0 {
+            let noun = stats.sessionCount == 1 ? "session" : "sessions"
+            result.append(.init(
+                id: "sessions",
+                label: "\(stats.sessionCount) \(noun)",
+                accessibilityLabel: "\(stats.sessionCount) linked \(noun)",
+                systemImage: "figure.climbing"
+            ))
+        }
+        if stats.knownLinkedAttempts > 0 {
+            result.append(.init(
+                id: "linked-attempts",
+                label: "\(stats.knownLinkedAttempts) logged",
+                accessibilityLabel: "\(stats.knownLinkedAttempts) attempts recorded in linked sessions",
+                systemImage: "arrow.counterclockwise"
+            ))
+        }
+        if manualAttempts > 0 {
+            result.append(.init(
+                id: "manual-attempts",
+                label: "\(manualAttempts) manual total",
+                accessibilityLabel: "\(manualAttempts) manual attempt total kept separately",
+                systemImage: "hand.draw"
+            ))
+        }
+        if stats.uncountedLinkedClimbCount > 0 {
+            result.append(.init(
+                id: "uncounted",
+                label: "\(stats.uncountedLinkedClimbCount) uncounted",
+                accessibilityLabel: "\(stats.uncountedLinkedClimbCount) linked climbs without an attempt count",
+                systemImage: "questionmark.circle"
+            ))
+        }
+        if let targetDate {
+            result.append(.init(id: "target", label: targetDate, accessibilityLabel: "Target \(targetDate)", systemImage: "calendar"))
+        }
+        if referenceCount > 0 {
+            result.append(.init(
+                id: "beta",
+                label: "\(referenceCount) beta",
+                accessibilityLabel: "\(referenceCount) beta references",
+                systemImage: "play.rectangle"
+            ))
+        }
+        return result
+    }
+
+    var body: some View {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 108), spacing: 10, alignment: .leading)],
+            alignment: .leading,
+            spacing: 4
+        ) {
+            ForEach(metrics) { metric in
+                Label(metric.label, systemImage: metric.systemImage)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .accessibilityLabel(metric.accessibilityLabel)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+}
+
+private func projectClimbStats(goalId: String, state: ClimbingState) -> ProjectClimbStats {
+    let logs = state.sessions
+        .filter { $0.deletedAt == nil }
+        .flatMap { session in
+            session.climbs.compactMap { climb in
+                climb.projectGoalId == goalId ? ProjectClimbLog(session: session, climb: climb) : nil
+            }
+        }
+        .sorted {
+            if $0.session.date != $1.session.date { return $0.session.date < $1.session.date }
+            return $0.session.createdAt < $1.session.createdAt
+        }
+    return ProjectClimbStats(logs: logs)
+}
+
+private func isProjectSend(_ outcome: ClimbOutcome) -> Bool {
+    switch outcome {
+    case .flash, .onsight, .redpoint, .send: true
+    case .repeatClimb, .attempt: false
+    }
+}
+
+private func gradeSystemFits(_ system: GradeSystem?, discipline: ClimbDiscipline) -> Bool {
+    guard let system else { return true }
+    switch discipline {
+    case .boulder: return ![.yds, .french, .uiaa, .uk].contains(system)
+    case .route: return ![.vScale, .font].contains(system)
+    }
+}
+
+private func projectGoalComesBefore(_ lhs: ClimbingGoal, _ rhs: ClimbingGoal) -> Bool {
+    if (lhs.archivedAt == nil) != (rhs.archivedAt == nil) { return lhs.archivedAt == nil }
+    return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+}
+
+private func projectChoiceTitle(_ goal: ClimbingGoal) -> String {
+    goal.archivedAt == nil ? goal.title : "\(goal.title) · Archived"
+}
+
+private func projectClimbSnapshot(
+    _ goal: ClimbingGoal,
+    fallbackDiscipline: ClimbDiscipline = .boulder
+) -> Climb {
+    let discipline = goal.discipline ?? fallbackDiscipline
+    var climb = Climb.new(discipline: discipline)
+    climb.projectGoalId = goal.id
+    climb.name = prefixByUTF16Units(goal.title, limit: 120)
+    climb.ropeStyle = discipline == .route ? (goal.ropeStyle ?? .topRope) : nil
+    if gradeSystemFits(goal.gradeSystem, discipline: discipline) {
+        climb.gradeSystem = goal.gradeSystem
+        climb.grade = goal.grade
+    } else {
+        climb.gradeSystem = nil
+        climb.grade = nil
+    }
+    climb.attempts = nil
+    return climb
+}
+
 private enum ClimbingSection: String, CaseIterable, Identifiable {
     case sessions = "Sessions"
     case plans = "Plans"
@@ -2260,6 +2419,7 @@ struct ClimbingView: View {
         .task {
             guard store.hasWorkspaceAccess else { return }
             await store.load(.climbing)
+            await store.refreshClimbingCloudIndex()
             await store.load(.integrations)
             await store.load(.health)
         }
@@ -2285,6 +2445,12 @@ struct ClimbingView: View {
                                 Text(shortDay(session.date)).font(.caption).foregroundStyle(.secondary)
                             }
                             Text(sessionDetails(session)).font(.subheadline).foregroundStyle(.secondary)
+                            if let projects = sessionProjectContext(session) {
+                                Label(projects, systemImage: "target")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(WorkspaceBrand.signal)
+                                    .lineLimit(1)
+                            }
                             if session.healthWorkoutId != nil {
                                 Label("Apple Health workout linked", systemImage: "heart.fill")
                                     .font(.caption).foregroundStyle(.pink)
@@ -2355,13 +2521,14 @@ struct ClimbingView: View {
             } else {
                 ForEach(goals) { goal in
                     let referenceCount = store.climbing.goalReferences.filter { $0.goalId == goal.id }.count
+                    let stats = projectClimbStats(goalId: goal.id, state: store.climbing)
                     VStack(alignment: .leading, spacing: 8) {
                         Button { presentExistingGoal(id: goal.id) } label: {
                             VStack(alignment: .leading, spacing: 5) {
                                 HStack {
                                     Text(goal.title).font(.headline).foregroundStyle(.primary)
                                     Spacer()
-                                    Text(goal.kind == .project ? projectStatusLabel(goal) : goalProgress(goal).label)
+                                    Text(goal.kind == .project ? projectStatusLabel(goal, stats: stats) : goalProgress(goal).label)
                                         .font(.caption.weight(.semibold)).foregroundStyle(WorkspaceBrand.signal)
                                 }
                                 if goal.kind == .project {
@@ -2369,18 +2536,21 @@ struct ClimbingView: View {
                                     if !details.isEmpty {
                                         Text(details).font(.subheadline).foregroundStyle(.secondary)
                                     }
-                                    HStack(spacing: 12) {
-                                        if let attempts = goal.attempts {
-                                            Label("\(attempts) \(attempts == 1 ? "attempt" : "attempts")", systemImage: "arrow.counterclockwise")
-                                        }
-                                        if let targetDate = goal.targetDate {
-                                            Label(shortDay(targetDate), systemImage: "calendar")
-                                        }
-                                        if referenceCount > 0 {
-                                            Label("\(referenceCount) beta", systemImage: "play.rectangle")
-                                        }
+                                    ProjectMetricGrid(
+                                        stats: stats,
+                                        manualAttempts: goal.attempts ?? 0,
+                                        targetDate: goal.targetDate.map(shortDay),
+                                        referenceCount: referenceCount
+                                    )
+                                    if let send = stats.firstCompletion {
+                                        Label("Send logged \(shortDay(send.session.date))", systemImage: "checkmark.seal.fill")
+                                            .font(.caption.weight(.medium))
+                                            .foregroundStyle(.green)
+                                    } else if let lastWorked = stats.lastWorked {
+                                        Text("Last worked \(shortDay(lastWorked))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
                                     }
-                                    .font(.caption).foregroundStyle(.secondary)
                                 } else {
                                     ProgressView(value: goalProgress(goal).percent, total: 100).tint(WorkspaceBrand.signal)
                                 }
@@ -2523,6 +2693,16 @@ struct ClimbingView: View {
             .compactMap { $0 }.joined(separator: " · ")
     }
 
+    private func sessionProjectContext(_ session: ClimbingSession) -> String? {
+        let names = session.climbs.compactMap { climb -> String? in
+            guard let goalId = climb.projectGoalId else { return nil }
+            return store.climbing.goals.first(where: { $0.id == goalId })?.title ?? climb.name.nilIfEmpty
+        }
+        guard !names.isEmpty else { return nil }
+        if names.count <= 2 { return names.joined(separator: " · ") }
+        return names.prefix(2).joined(separator: " · ") + " +\(names.count - 2)"
+    }
+
     private func logSession(fromPlanID id: String) {
         let openingState = store.climbing
         guard let plan = openingState.plans.first(where: { $0.id == id && $0.status == .planned }) else {
@@ -2604,8 +2784,9 @@ struct ClimbingView: View {
         return (percent, "\(completed) of \(target) sessions")
     }
 
-    private func projectStatusLabel(_ goal: ClimbingGoal) -> String {
-        switch goal.status {
+    private func projectStatusLabel(_ goal: ClimbingGoal, stats: ProjectClimbStats) -> String {
+        if stats.firstCompletion != nil { return "Sent" }
+        return switch goal.status {
         case .active: "Projecting"
         case .paused: "Paused"
         case .completed: "Sent"
@@ -2703,6 +2884,30 @@ private struct ClimbingSessionEditor: View {
 
     private var isNew: Bool { wasNew }
     private var dirty: Bool { value != original }
+    private var projectLinksAreValid: Bool {
+        let links = value.climbs.compactMap(\.projectGoalId)
+        guard Set(links).count == links.count else { return false }
+        return value.climbs.allSatisfy { climb in
+            guard let goalId = climb.projectGoalId else { return true }
+            return openingState.goals.contains { $0.id == goalId && $0.kind == .project }
+        }
+    }
+    private var availableProjects: [ClimbingGoal] {
+        let linked = Set(value.climbs.compactMap(\.projectGoalId))
+        return openingState.goals
+            .filter { $0.kind == .project && !linked.contains($0.id) }
+            .sorted(by: projectGoalComesBefore)
+    }
+    private var plannedProjectSuggestion: ClimbingGoal? {
+        guard let planId = value.planId,
+              let goalId = openingState.plans.first(where: { $0.id == planId })?.goalId,
+              !value.climbs.contains(where: { $0.projectGoalId == goalId }) else { return nil }
+        return openingState.goals.first { $0.id == goalId && $0.kind == .project }
+    }
+    private var otherAvailableProjects: [ClimbingGoal] {
+        guard let suggestedId = plannedProjectSuggestion?.id else { return availableProjects }
+        return availableProjects.filter { $0.id != suggestedId }
+    }
 
     var body: some View {
         NavigationStack {
@@ -2777,6 +2982,14 @@ private struct ClimbingSessionEditor: View {
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(climb.name.nilIfEmpty ?? "Unnamed climb").foregroundStyle(.primary)
                                         Text(climbDetails(climb)).font(.caption).foregroundStyle(.secondary)
+                                        if let goalId = climb.projectGoalId {
+                                            Label(
+                                                openingState.goals.first(where: { $0.id == goalId })?.title ?? "Linked project",
+                                                systemImage: "target"
+                                            )
+                                            .font(.caption.weight(.medium))
+                                            .foregroundStyle(WorkspaceBrand.signal)
+                                        }
                                     }
                                     Spacer()
                                     Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
@@ -2785,8 +2998,42 @@ private struct ClimbingSessionEditor: View {
                         }
                         .onDelete { value.climbs.remove(atOffsets: $0) }
                     }
+                    if !projectLinksAreValid {
+                        Label("Link each climb project only once per session.", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    if let project = plannedProjectSuggestion {
+                        Button {
+                            let fallback: ClimbDiscipline = value.focus == .routes ? .route : .boulder
+                            climbDraft = projectClimbSnapshot(project, fallbackDiscipline: fallback)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Label("Add planned project", systemImage: "calendar.badge.plus")
+                                    .font(.subheadline.weight(.semibold))
+                                Text(projectChoiceTitle(project))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Text("Optional. Add it only if you worked on this project during the session.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if !otherAvailableProjects.isEmpty {
+                        Menu {
+                            ForEach(otherAvailableProjects) { project in
+                                Button(projectChoiceTitle(project)) {
+                                    let fallback: ClimbDiscipline = value.focus == .routes ? .route : .boulder
+                                    climbDraft = projectClimbSnapshot(project, fallbackDiscipline: fallback)
+                                }
+                            }
+                        } label: {
+                            Label("Add a project climb", systemImage: "target")
+                        }
+                    }
                     Button { climbDraft = .new(discipline: value.focus == .routes ? .route : .boulder) } label: {
-                        Label("Add a climb", systemImage: "plus")
+                        Label("Add another climb", systemImage: "plus")
                     }
                 }
 
@@ -2825,12 +3072,23 @@ private struct ClimbingSessionEditor: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
-                        .disabled(value.venue.nilIfEmpty == nil || store.climbingConflict != nil)
+                        .disabled(value.venue.nilIfEmpty == nil || !projectLinksAreValid || store.climbingConflict != nil)
                 }
             }
             .interactiveDismissDisabled(dirty)
             .sheet(item: $climbDraft) { climb in
-                ClimbEditor(climb: climb) { updated in
+                let reserved = Set(value.climbs.compactMap { existing in
+                    existing.id == climb.id ? nil : existing.projectGoalId
+                })
+                let isPersistedClimb = openingState.sessions
+                    .first(where: { $0.id == value.id })?
+                    .climbs.contains(where: { $0.id == climb.id }) == true
+                ClimbEditor(
+                    climb: climb,
+                    projects: openingState.goals,
+                    reservedProjectGoalIds: reserved,
+                    preserveHistoricalSnapshotWhenLinking: isPersistedClimb
+                ) { updated in
                     if let index = value.climbs.firstIndex(where: { $0.id == updated.id }) { value.climbs[index] = updated }
                     else { value.climbs.append(updated) }
                 }
@@ -2925,16 +3183,65 @@ private struct RoutineExecutionStepRow: View {
 private struct ClimbEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State private var value: Climb
+    let projects: [ClimbingGoal]
+    let reservedProjectGoalIds: Set<String>
+    let preserveHistoricalSnapshotWhenLinking: Bool
     let onSave: (Climb) -> Void
 
-    init(climb: Climb, onSave: @escaping (Climb) -> Void) {
+    init(
+        climb: Climb,
+        projects: [ClimbingGoal],
+        reservedProjectGoalIds: Set<String>,
+        preserveHistoricalSnapshotWhenLinking: Bool,
+        onSave: @escaping (Climb) -> Void
+    ) {
         _value = State(initialValue: climb)
+        self.projects = projects
+        self.reservedProjectGoalIds = reservedProjectGoalIds
+        self.preserveHistoricalSnapshotWhenLinking = preserveHistoricalSnapshotWhenLinking
         self.onSave = onSave
+    }
+
+    private var selectableProjects: [ClimbingGoal] {
+        projects
+            .filter { goal in
+                goal.kind == .project
+                    && (!reservedProjectGoalIds.contains(goal.id) || goal.id == value.projectGoalId)
+            }
+            .sorted(by: projectGoalComesBefore)
     }
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Picker("Project", selection: Binding(
+                        get: { value.projectGoalId ?? "none" },
+                        set: { selectProject($0 == "none" ? nil : $0) }
+                    )) {
+                        Text("No linked project").tag("none")
+                        ForEach(selectableProjects) { goal in
+                            Text(projectChoiceTitle(goal)).tag(goal.id)
+                        }
+                    }
+                    if value.projectGoalId == nil && selectableProjects.isEmpty {
+                        Text("Create a climb project from Goals to link it here.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Project climb")
+                } footer: {
+                    if value.projectGoalId != nil {
+                        Text(
+                            preserveHistoricalSnapshotWhenLinking
+                                ? "Linking preserves this saved climb’s historical details. Changes below describe this session and do not rename the project."
+                                : "The project details were copied into this log. Changes below describe this session and do not rename the project."
+                        )
+                    } else {
+                        Text("Linking this climb lets the project collect its sessions, attempts, and send history.")
+                    }
+                }
                 Section {
                     TextField("Name or problem", text: $value.name)
                     Picker("Discipline", selection: $value.discipline) {
@@ -2962,8 +3269,19 @@ private struct ClimbEditor: View {
                     .onChange(of: value.outcome) { _, outcome in
                         if outcome == .flash || outcome == .onsight { value.attempts = 1 }
                     }
-                    Stepper("Attempts · \(value.attempts ?? 1)", value: Binding(get: { value.attempts ?? 1 }, set: { value.attempts = $0 }), in: 1...99)
-                        .disabled(value.outcome == .flash || value.outcome == .onsight)
+                    Toggle("Record attempt count", isOn: Binding(
+                        get: { value.attempts != nil },
+                        set: { value.attempts = $0 ? 1 : nil }
+                    ))
+                    .disabled(value.outcome == .flash || value.outcome == .onsight)
+                    if value.attempts != nil {
+                        Stepper("Attempts · \(value.attempts ?? 1)", value: Binding(get: { value.attempts ?? 1 }, set: { value.attempts = $0 }), in: 1...99)
+                            .disabled(value.outcome == .flash || value.outcome == .onsight)
+                    } else if value.projectGoalId != nil {
+                        Text("This project climb will be kept in its session history without adding to the counted-attempt total.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     TextField("Notes", text: $value.notes, axis: .vertical).lineLimit(2...8)
                 }
             }
@@ -2974,7 +3292,9 @@ private struct ClimbEditor: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
                         if value.outcome == .flash || value.outcome == .onsight { value.attempts = 1 }
-                        value.attempts = min(99, max(1, value.attempts ?? 1))
+                        if let attempts = value.attempts {
+                            value.attempts = min(99, max(1, attempts))
+                        }
                         onSave(value)
                         dismiss()
                     }
@@ -2987,6 +3307,11 @@ private struct ClimbEditor: View {
     private var climbIsValid: Bool {
         guard value.name.nilIfEmpty != nil else { return false }
         guard (value.gradeSystem == nil) == (value.grade?.nilIfEmpty == nil) else { return false }
+        if let goalId = value.projectGoalId {
+            guard !reservedProjectGoalIds.contains(goalId),
+                  projects.contains(where: { $0.id == goalId && $0.kind == .project }) else { return false }
+        }
+        if let attempts = value.attempts, !(1...99).contains(attempts) { return false }
         if value.discipline == .boulder {
             if value.ropeStyle != nil || value.outcome == .onsight || value.outcome == .redpoint { return false }
             if let grade = value.gradeSystem, [.yds, .french, .uiaa, .uk].contains(grade) { return false }
@@ -2995,6 +3320,29 @@ private struct ClimbEditor: View {
             if let grade = value.gradeSystem, [.vScale, .font].contains(grade) { return false }
         }
         return true
+    }
+
+    private func selectProject(_ goalId: String?) {
+        guard let goalId else {
+            value.projectGoalId = nil
+            return
+        }
+        guard let project = projects.first(where: {
+            $0.id == goalId && $0.kind == .project && !reservedProjectGoalIds.contains($0.id)
+        }) else { return }
+
+        value.projectGoalId = project.id
+        guard !preserveHistoricalSnapshotWhenLinking else { return }
+
+        let snapshot = projectClimbSnapshot(project, fallbackDiscipline: value.discipline)
+        value.name = snapshot.name
+        value.discipline = snapshot.discipline
+        value.ropeStyle = snapshot.ropeStyle
+        value.gradeSystem = snapshot.gradeSystem
+        value.grade = snapshot.grade
+        if value.discipline == .boulder && (value.outcome == .onsight || value.outcome == .redpoint) {
+            value.outcome = .attempt
+        }
     }
 }
 
@@ -3130,8 +3478,8 @@ private struct ClimbingGoalEditor: View {
     @State private var referenceToDelete: ClimbingGoalReference?
     @State private var mediaPreview: ClimbingGoalMediaPreview?
     @State private var linkDraft: ClimbingGoalLinkDraft?
+    @State private var linkedSessionDraft: ClimbingEditorDraft<ClimbingSession>?
     @State private var mediaTask: Task<Void, Never>?
-    @State private var pendingMediaFile: URL?
 
     init(draft: ClimbingEditorDraft<ClimbingGoal>) {
         original = draft.value
@@ -3166,6 +3514,17 @@ private struct ClimbingGoalEditor: View {
     }
     private var referenceLimitReached: Bool { goalReferences.count >= 12 }
     private var mediaTransferInProgress: Bool { addingMedia || loadingReferenceID != nil }
+    private var projectStats: ProjectClimbStats {
+        projectClimbStats(goalId: value.id, state: openingState)
+    }
+    private var hasAnyProjectLinks: Bool {
+        openingState.sessions.contains { session in
+            session.climbs.contains { $0.projectGoalId == value.id }
+        }
+    }
+    private var projectKindLocked: Bool {
+        !isNew && original.kind == .project && hasAnyProjectLinks
+    }
 
     var body: some View {
         NavigationStack {
@@ -3178,13 +3537,26 @@ private struct ClimbingGoalEditor: View {
                     Picker("Type", selection: $value.kind) {
                         ForEach(ClimbingGoalKind.allCases, id: \.self) { Text(goalKindTitle($0)).tag($0) }
                     }
+                    .disabled(projectKindLocked)
                     .onChange(of: value.kind) { _, kind in
                         configure(for: kind)
+                    }
+                    if projectKindLocked {
+                        Label("This remains a climb project because sessions are linked to it.", systemImage: "link")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                     TextField(value.kind == .project ? "Project notes or beta" : "Why it matters or what success looks like", text: $value.description, axis: .vertical)
                         .lineLimit(3...8)
                     Picker("Status", selection: $value.status) {
                         ForEach(ClimbingGoalStatus.allCases, id: \.self) { Text(goalStatusTitle($0)).tag($0) }
+                    }
+                    if value.kind == .project,
+                       projectStats.firstCompletion != nil,
+                       value.status != .completed {
+                        Label("A linked session records a send, so this project is shown as sent in summaries. This setting remains available for your own tracking.", systemImage: "checkmark.seal.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
                     }
                     if value.kind != .consistency && value.kind != .project {
                         Stepper("Progress · \(value.progress)%", value: $value.progress, in: 0...100, step: 5)
@@ -3244,15 +3616,21 @@ private struct ClimbingGoalEditor: View {
                             set: { value.grade = $0.nilIfEmpty }
                         ))
                         .disabled(value.gradeSystem.map { !projectGradeFits($0, discipline: value.discipline) } ?? true)
-                        Stepper(
-                            "Manual attempts · \(value.attempts ?? 0)",
-                            value: Binding(get: { value.attempts ?? 0 }, set: { value.attempts = $0 }),
-                            in: 0...9999
-                        )
+                        Toggle("Manual attempt total", isOn: Binding(
+                            get: { value.attempts != nil },
+                            set: { value.attempts = $0 ? (value.attempts ?? 0) : nil }
+                        ))
+                        if value.attempts != nil {
+                            Stepper(
+                                "Manual total · \(value.attempts ?? 0)",
+                                value: Binding(get: { value.attempts ?? 0 }, set: { value.attempts = $0 }),
+                                in: 0...9999
+                            )
+                        }
                     } header: {
                         Text("Project details")
                     } footer: {
-                        Text("Keep a running count here. Logged climbing sessions do not update it yet.")
+                        Text("This optional manual total stays separate because it may already include work now represented by linked sessions.")
                     }
                     Section("Target") {
                         Toggle("Target date", isOn: Binding(
@@ -3290,6 +3668,9 @@ private struct ClimbingGoalEditor: View {
                         }
                     }
                 }
+                if !isNew && value.kind == .project {
+                    projectActivitySection
+                }
                 if !isNew {
                     betaSection
                 }
@@ -3318,10 +3699,13 @@ private struct ClimbingGoalEditor: View {
                 mediaTask?.cancel()
                 mediaTask = Task { await addMedia(selection) }
             }
-            .sheet(item: $mediaPreview, onDismiss: cleanupPendingMediaFile) {
+            .sheet(item: $mediaPreview) {
                 ClimbingGoalMediaPreviewView(preview: $0)
             }
             .sheet(item: $linkDraft) { ClimbingGoalLinkEditor(draft: $0) }
+            .sheet(item: $linkedSessionDraft, onDismiss: { openingState = store.climbing }) {
+                ClimbingSessionEditor(draft: $0)
+            }
             .onDisappear(perform: cancelMediaTransfer)
             .confirmationDialog(
                 "Remove this reference?",
@@ -3346,6 +3730,78 @@ private struct ClimbingGoalEditor: View {
         }
     }
 
+    @ViewBuilder private var projectActivitySection: some View {
+        Section {
+            LabeledContent("Linked sessions", value: "\(projectStats.sessionCount)")
+            LabeledContent("Attempts in linked sessions", value: "\(projectStats.knownLinkedAttempts)")
+            if projectStats.uncountedLinkedClimbCount > 0 {
+                LabeledContent("Session climbs without a count", value: "\(projectStats.uncountedLinkedClimbCount)")
+            }
+            if let manualAttempts = value.attempts, manualAttempts > 0 {
+                LabeledContent("Manual attempt total", value: "\(manualAttempts)")
+            }
+            if let lastWorked = projectStats.lastWorked {
+                LabeledContent("Last worked", value: shortDay(lastWorked))
+            }
+            if !projectStats.sends.isEmpty {
+                LabeledContent("Sends logged", value: "\(projectStats.sends.count)")
+            }
+
+            if projectStats.logs.isEmpty {
+                Text("Link this project from a session’s climb log to build its history here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(projectStats.logs.reversed())) { log in
+                    Button { presentLinkedSession(id: log.session.id) } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(shortDay(log.session.date))
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                if isProjectSend(log.climb.outcome) {
+                                    Label("Send", systemImage: "checkmark.seal.fill")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.green)
+                                }
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Text([log.session.venue.nilIfEmpty, enumTitle(log.climb.outcome.rawValue), log.climb.attempts.map { "\($0) attempts" }].compactMap { $0 }.joined(separator: " · "))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if log.climb.attempts == nil {
+                                Text("Attempt count not recorded")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+        } header: {
+            Text("Project activity")
+        } footer: {
+            if projectStats.uncountedLinkedClimbCount > 0 {
+                Text("Linked-session attempts exclude climbs whose attempt count was not recorded. The manual total stays separate because it may overlap these sessions.")
+            } else if (value.attempts ?? 0) > 0 {
+                Text("The manual total stays separate from linked-session attempts because the two may overlap.")
+            }
+        }
+    }
+
+    private func presentLinkedSession(id: String) {
+        let state = store.climbing
+        guard let session = state.sessions.first(where: { $0.id == id && $0.deletedAt == nil }) else {
+            store.reportStaleRow("linked climbing session", area: .climbing)
+            return
+        }
+        linkedSessionDraft = ClimbingEditorDraft(value: session, openingState: state, isNew: false)
+    }
+
     @ViewBuilder private var betaSection: some View {
         Section {
             if goalReferences.isEmpty {
@@ -3363,6 +3819,11 @@ private struct ClimbingGoalEditor: View {
                                 Text(referenceDetail(reference))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                if reference.kind != .link {
+                                    Text(store.climbingMediaAvailabilityLabel(reference.id))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                             Spacer()
                             if loadingReferenceID == reference.id {
@@ -3415,7 +3876,7 @@ private struct ClimbingGoalEditor: View {
         } header: {
             Text("Beta")
         } footer: {
-            Text("Choose one photo or video up to 200 MB. Workspace transfers it directly to your paired Mac.")
+            Text("Choose one photo or video up to 200 MB. Workspace saves it to your paired Mac, keeps a protected copy on this device, and can copy it to your private iCloud library.")
         }
     }
 
@@ -3453,18 +3914,13 @@ private struct ClimbingGoalEditor: View {
         }
 
         mediaTask?.cancel()
-        cleanupPendingMediaFile()
         loadingReferenceID = reference.id
         mediaStatus = nil
         mediaTask = Task {
             defer { loadingReferenceID = nil }
             let file = await store.downloadClimbingGoalReference(reference)
             guard let file else { return }
-            guard !Task.isCancelled else {
-                try? FileManager.default.removeItem(at: file)
-                return
-            }
-            pendingMediaFile = file
+            guard !Task.isCancelled else { return }
             mediaPreview = ClimbingGoalMediaPreview(reference: reference, file: file)
         }
     }
@@ -3510,9 +3966,10 @@ private struct ClimbingGoalEditor: View {
             let label = prefixByUTF16Units(mediaLabel.nilIfEmpty ?? defaultLabel, limit: 120)
             let fallbackExtension = type.preferredFilenameExtension ?? (isImage ? "jpg" : "mov")
             let fileName = safeMediaFileName(transfer.fileName, fallbackExtension: fallbackExtension)
+            let referenceId = UUID().uuidString.lowercased()
             let saved = await store.uploadClimbingGoalMedia(
                 goalId: value.id,
-                referenceId: UUID().uuidString.lowercased(),
+                referenceId: referenceId,
                 requestId: UUID().uuidString.lowercased(),
                 label: label,
                 fileName: fileName,
@@ -3522,7 +3979,9 @@ private struct ClimbingGoalEditor: View {
             guard !Task.isCancelled else { return }
             if saved {
                 mediaLabel = ""
-                mediaStatus = "Attachment added."
+                mediaStatus = store.isClimbingMediaAvailableOffline(referenceId)
+                    ? "Attachment added and available offline."
+                    : "Attachment added without an offline copy."
             } else {
                 mediaStatus = "Attachment wasn’t added."
             }
@@ -3545,16 +4004,9 @@ private struct ClimbingGoalEditor: View {
             ?? "climbing-beta.\(fallbackExtension)"
     }
 
-    private func cleanupPendingMediaFile() {
-        guard let pendingMediaFile else { return }
-        try? FileManager.default.removeItem(at: pendingMediaFile)
-        self.pendingMediaFile = nil
-    }
-
     private func cancelMediaTransfer() {
         mediaTask?.cancel()
         mediaTask = nil
-        cleanupPendingMediaFile()
     }
 
     private func goalKindTitle(_ kind: ClimbingGoalKind) -> String {
@@ -3602,7 +4054,6 @@ private struct ClimbingGoalEditor: View {
             hasStartDate = false
             value.environment = value.environment ?? .indoor
             updateProjectDiscipline(value.discipline ?? .boulder)
-            value.attempts = value.attempts ?? 0
         }
     }
 
@@ -3623,7 +4074,6 @@ private struct ClimbingGoalEditor: View {
         if !includesTargetDate { result.targetDate = nil }
         if result.kind != .consistency || !includesSessionTarget { result.sessionTarget = nil }
         if result.kind == .project {
-            result.attempts = result.attempts ?? 0
             result.routineId = nil
             if result.discipline == .boulder {
                 result.ropeStyle = nil
@@ -3659,6 +4109,7 @@ private struct ClimbingGoalEditor: View {
 
     private var goalIsValid: Bool {
         guard value.title.nilIfEmpty != nil else { return false }
+        if projectKindLocked && value.kind != .project { return false }
         guard (value.gradeSystem == nil) == (value.grade?.nilIfEmpty == nil) else { return false }
         if value.kind == .project {
             guard value.environment != nil, value.discipline != nil else { return false }
@@ -3842,7 +4293,6 @@ private struct ClimbingGoalMediaPreviewView: View {
             }
             .onDisappear {
                 player?.pause()
-                try? FileManager.default.removeItem(at: preview.file)
             }
         }
     }
@@ -6442,6 +6892,9 @@ private struct SettingsWorkspaceView: View {
     @State private var showingPicker = false
     @State private var showingHealthImport = false
     @State private var confirmUnpair = false
+    @State private var confirmClearClimbingMedia = false
+    @State private var confirmClimbingCloudSync = false
+    @State private var preparingClimbingCloudSync = false
     @State private var weightToReview: WeightCommand?
     @State private var syncResult: String?
 
@@ -6450,6 +6903,7 @@ private struct SettingsWorkspaceView: View {
             EditorErrorSection(area: .pairing)
             EditorErrorSection(area: .integrations)
             EditorErrorSection(area: .health)
+            EditorErrorSection(area: .climbing)
 
             Section("Connection") {
                 LabeledContent("Status", value: connectionLabel)
@@ -6507,6 +6961,65 @@ private struct SettingsWorkspaceView: View {
                 Text("Sync")
             } footer: {
                 Text("Workspace is designed to stay useful between syncs. Open Workspace on your Mac and keep both devices on the same private Wi-Fi when you want to update this device. The USB cable can keep the devices together, but app data currently travels over the local network.")
+            }
+
+            Section {
+                LabeledContent("Available offline", value: store.cachedClimbingMediaCount.formatted())
+                LabeledContent("Private iCloud", value: store.climbingCloudAccountState.label)
+                if store.cloudClimbingMediaCount > 0 {
+                    LabeledContent("Available on your devices", value: store.cloudClimbingMediaCount.formatted())
+                }
+                if let progress = store.climbingCloudSyncProgress {
+                    ProgressView(value: progress.fraction) {
+                        Text(progress.message)
+                    }
+                }
+                Button {
+                    Task {
+                        preparingClimbingCloudSync = true
+                        let preflight = await store.prepareClimbingCloudSync()
+                        preparingClimbingCloudSync = false
+                        if preflight != nil { confirmClimbingCloudSync = true }
+                    }
+                } label: {
+                    Label(
+                        preparingClimbingCloudSync
+                            ? "Reviewing media…"
+                            : (store.syncingClimbingMediaWithCloud ? "Syncing media…" : "Review iCloud sync"),
+                        systemImage: "icloud.and.arrow.up"
+                    )
+                }
+                .disabled(
+                    store.syncingClimbingMediaWithCloud
+                        || preparingClimbingCloudSync
+                        || store.busy
+                        || !store.hasWorkspaceAccess
+                )
+                if let last = store.lastClimbingCloudSync {
+                    LabeledContent(
+                        "Last iCloud sync",
+                        value: last.formatted(date: .abbreviated, time: .shortened)
+                    )
+                }
+                if let message = store.climbingCloudSyncMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let guidance = store.climbingCloudAccountState.guidance {
+                    Text(guidance)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if store.cachedClimbingMediaCount > 0 {
+                    Button("Remove downloaded media", role: .destructive) {
+                        confirmClearClimbingMedia = true
+                    }
+                    .disabled(store.isLoading(.climbing) || store.syncingClimbingMediaWithCloud)
+                }
+            } header: {
+                Text("Climbing media")
+            } footer: {
+                Text("iCloud copies use your private database and make attachments available to your other Workspace devices. Initial sync stays in the foreground and uses your Mac to verify every original. Removing downloads leaves the references and copies on your Mac and in iCloud.")
             }
 
             if store.managesAppleHealth {
@@ -6598,6 +7111,10 @@ private struct SettingsWorkspaceView: View {
         }
         .navigationTitle("Settings")
         .task {
+            await store.refreshClimbingCloudAccountState()
+            if store.loadedAreas.contains(.climbing) {
+                await store.refreshClimbingCloudIndex()
+            }
             guard store.hasWorkspaceAccess else { return }
             async let integrations = store.load(.integrations)
             async let health = store.load(.health)
@@ -6625,6 +7142,22 @@ private struct SettingsWorkspaceView: View {
         } message: {
             Text("This immediately removes the token and cached data from this device, then asks your Mac to revoke the pairing. If the Mac cannot confirm, Workspace tells you how to invalidate the token there.")
         }
+        .confirmationDialog("Remove downloaded climbing media?", isPresented: $confirmClearClimbingMedia, titleVisibility: .visible) {
+            Button("Remove downloads", role: .destructive) {
+                Task { _ = await store.clearClimbingMediaDownloads() }
+            }
+            Button("Keep downloads", role: .cancel) { }
+        } message: {
+            Text("You can download these photos and videos again from private iCloud or from your Mac. Their goal references stay in Workspace.")
+        }
+        .confirmationDialog("Sync climbing media with iCloud?", isPresented: $confirmClimbingCloudSync, titleVisibility: .visible) {
+            Button(climbingCloudSyncActionLabel) {
+                Task { _ = await store.syncClimbingMediaWithCloud() }
+            }
+            Button("Not now", role: .cancel) { }
+        } message: {
+            Text(climbingCloudSyncConfirmationMessage)
+        }
         .confirmationDialog(
             weightToReview.map { "Save \(weightLabel($0.kg)) to Apple Health?" } ?? "Save this measurement?",
             isPresented: Binding(get: { weightToReview != nil }, set: { if !$0 { weightToReview = nil } }),
@@ -6648,6 +7181,37 @@ private struct SettingsWorkspaceView: View {
         case .goal: return store.climbing.goals.first(where: { $0.id == link.entityId })?.title ?? "Climbing goal"
         case .plan: return store.climbing.plans.first(where: { $0.id == link.entityId })?.title ?? "Climbing plan"
         }
+    }
+
+    private var climbingCloudSyncActionLabel: String {
+        guard let preflight = store.climbingCloudSyncPreflight else { return "Sync now" }
+        if preflight.fileCount == 0 { return "Reconcile now" }
+        return preflight.fileCount == 1 ? "Copy 1 file" : "Copy \(preflight.fileCount) files"
+    }
+
+    private var climbingCloudSyncConfirmationMessage: String {
+        guard let preflight = store.climbingCloudSyncPreflight else {
+            return "Keep Workspace open and your Mac available on the same private Wi-Fi until this foreground sync finishes."
+        }
+        let size = ByteCountFormatter.string(fromByteCount: preflight.byteCount, countStyle: .file)
+        var parts: [String] = []
+        if preflight.fileCount == 0 {
+            parts.append("No new attachment files need to be copied.")
+        } else {
+            let noun = preflight.fileCount == 1 ? "file" : "files"
+            parts.append("Workspace will copy \(preflight.fileCount) \(noun) totaling \(size) from your Mac to your private iCloud database.")
+        }
+        if preflight.deletionCount > 0 {
+            let noun = preflight.deletionCount == 1 ? "deletion" : "deletions"
+            parts.append("It will also reconcile \(preflight.deletionCount) \(noun).")
+        }
+        if preflight.alreadyAvailableCount > 0 {
+            let noun = preflight.alreadyAvailableCount == 1 ? "attachment is" : "attachments are"
+            parts.append("\(preflight.alreadyAvailableCount) \(noun) already available in iCloud.")
+        }
+        parts.append("Keep Workspace open and your Mac available on the same private Wi-Fi until this foreground sync finishes. You can safely run it again if it is interrupted.")
+        parts.append("After this, new and removed climbing attachments will update this private iCloud library automatically when possible while you keep using the same Mac pairing and iCloud account.")
+        return parts.joined(separator: " ")
     }
 
     private var connectionLabel: String {
